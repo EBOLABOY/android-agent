@@ -1,0 +1,16 @@
+{
+  "listen_addr": "0.0.0.0:8765",
+  "bearer_token": "REPLACE_WITH_SECURE_RANDOM_TOKEN",
+  "screenshot_width": 720,
+  "screenshot_jpeg_quality": 70,
+  "guard_packages": [
+    "com.tencent.tmgp.sgame"
+  ],
+  "guard_poll_interval_ms": 2000,
+  "guard_resume_grace_ms": 3000,
+  "cdp_socket": "chrome_devtools_remote",
+  "sys_socket": "agent_sys",
+  "clip_helper_path": "/data/local/tmp/android_agent_cliphelper.jar",
+  "pause_flag_path": "/data/adb/android_agent/paused",
+  "shell_timeout_ms": 10000
+}
