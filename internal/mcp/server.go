@@ -683,16 +683,38 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		}
 		return textJSONResult(map[string]any{"ok": true, "package": pkg}, false)
 
+	case "cdp_list_sockets":
+		return textJSONResult(map[string]any{
+			"sockets": cdp.ListSockets(),
+		}, false)
+
 	case "cdp_status":
-		return textJSONResult(s.cdp.Probe(ctx), false)
+		client, err := s.cdp.ForSocket(getString(args, "socket", ""))
+		if err != nil {
+			return textJSONResult(map[string]any{
+				"available": false,
+				"socket":    getString(args, "socket", s.cdp.SocketDisplay()),
+				"message":   err.Error(),
+			}, false)
+		}
+		return textJSONResult(client.Probe(ctx), false)
 
 	case "cdp_list_targets":
-		targets, err := s.cdp.ListTargets(ctx)
+		client, err := s.cdp.ForSocket(getString(args, "socket", ""))
+		if err != nil {
+			return textJSONResult(map[string]any{
+				"available": false,
+				"socket":    getString(args, "socket", s.cdp.SocketDisplay()),
+				"targets":   []any{},
+				"message":   err.Error(),
+			}, false)
+		}
+		targets, err := client.ListTargets(ctx)
 		if err != nil {
 			if errors.Is(err, cdp.ErrUnavailable) {
 				return textJSONResult(map[string]any{
 					"available": false,
-					"socket":    s.cdp.SocketDisplay(),
+					"socket":    client.SocketDisplay(),
 					"targets":   []any{},
 					"message":   err.Error(),
 				}, false)
@@ -701,23 +723,31 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		}
 		return textJSONResult(map[string]any{
 			"available": true,
-			"socket":    s.cdp.SocketDisplay(),
+			"socket":    client.SocketDisplay(),
 			"targets":   targets,
 		}, false)
 
 	case "cdp_command":
+		client, err := s.cdp.ForSocket(getString(args, "socket", ""))
+		if err != nil {
+			return textJSONResult(map[string]any{
+				"available": false,
+				"socket":    getString(args, "socket", s.cdp.SocketDisplay()),
+				"message":   err.Error(),
+			}, true)
+		}
 		targetID := getString(args, "target_id", "")
 		method := getString(args, "method", "")
 		var params map[string]any
 		if rawParams, ok := args["params"].(map[string]any); ok {
 			params = rawParams
 		}
-		res, err := s.cdp.SendCommand(ctx, targetID, method, params)
+		res, err := client.SendCommand(ctx, targetID, method, params)
 		if err != nil {
 			if errors.Is(err, cdp.ErrUnavailable) {
 				return textJSONResult(map[string]any{
 					"available": false,
-					"socket":    s.cdp.SocketDisplay(),
+					"socket":    client.SocketDisplay(),
 					"message":   err.Error(),
 				}, true)
 			}
@@ -725,6 +755,7 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		}
 		return textJSONResult(map[string]any{
 			"ok":     true,
+			"socket": client.SocketDisplay(),
 			"method": method,
 			"result": json.RawMessage(res),
 		}, false)
@@ -888,22 +919,38 @@ func toolDefinitions() []map[string]any {
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{
+			"name":        "cdp_list_sockets",
+			"description": "List all active *_devtools_remote* abstract Unix sockets (e.g. Edge @chrome_devtools_remote and app WebView @webview_devtools_remote_<pid>) with owning process names.",
+			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
 			"name":        "cdp_status",
-			"description": "Probe local Chrome DevTools abstract Unix socket (@chrome_devtools_remote). Gracefully reports unavailable if Chrome is not installed/running.",
-			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
-		},
-		{
-			"name":        "cdp_list_targets",
-			"description": "List inspectable Chrome tabs/targets via @chrome_devtools_remote (gracefully degrades if unavailable).",
-			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
-		},
-		{
-			"name":        "cdp_command",
-			"description": "Execute a Chrome DevTools Protocol JSON-RPC command (e.g. Page.navigate, Runtime.evaluate) directly over @chrome_devtools_remote.",
+			"description": "Probe a DevTools abstract Unix socket (default @chrome_devtools_remote, or specify socket='webview' / package name / exact socket name).",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"target_id": map[string]any{"type": "string", "description": "Optional Chrome target ID (defaults to first page target)"},
+					"socket": map[string]any{"type": "string", "description": "Optional socket selector: '', 'webview', package substring (e.g. 'com.jingdong.app.mall'), or exact socket name"},
+				},
+			},
+		},
+		{
+			"name":        "cdp_list_targets",
+			"description": "List inspectable browser/WebView targets via a DevTools abstract Unix socket.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"socket": map[string]any{"type": "string", "description": "Optional socket selector (default @chrome_devtools_remote; use 'webview' or package name for App WebViews)"},
+				},
+			},
+		},
+		{
+			"name":        "cdp_command",
+			"description": "Execute a Chrome DevTools Protocol JSON-RPC command (e.g. Page.navigate, Runtime.evaluate, Input.dispatchMouseEvent) over a DevTools abstract Unix socket.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"socket":    map[string]any{"type": "string", "description": "Optional socket selector (default @chrome_devtools_remote; use 'webview' or package name for App WebViews)"},
+					"target_id": map[string]any{"type": "string", "description": "Optional target ID (defaults to first page target)"},
 					"method":    map[string]any{"type": "string", "description": "CDP method name, e.g. Runtime.evaluate"},
 					"params":    map[string]any{"type": "object", "description": "CDP method parameters"},
 				},

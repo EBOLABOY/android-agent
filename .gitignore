@@ -1,5 +1,7 @@
 # Build outputs & local compiled binaries
 build/
+lsposed-webview-debug/build/
+*.keystore
 ksu-module/bin/agentd
 
 # Runtime secrets, logs, and PID files

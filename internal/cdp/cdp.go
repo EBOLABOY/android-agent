@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +24,13 @@ import (
 )
 
 var ErrUnavailable = errors.New("browser devtools abstract socket unavailable")
+
+type SocketInfo struct {
+	Socket  string `json:"socket"`
+	Name    string `json:"name"`
+	PID     int    `json:"pid,omitempty"`
+	Process string `json:"process,omitempty"`
+}
 
 type Client struct {
 	configuredSocket string
@@ -66,6 +75,69 @@ func NewClient(socketName string) *Client {
 			return d.DialContext(ctx, "unix", "\x00"+sock)
 		},
 	}
+}
+
+// ListSockets discovers all active *_devtools_remote* abstract Unix sockets on the device
+// along with their owning process name when a PID suffix is present (e.g. webview_devtools_remote_787).
+func ListSockets() []SocketInfo {
+	names := discoverDevToolsSockets()
+	out := make([]SocketInfo, 0, len(names))
+	for _, name := range names {
+		info := SocketInfo{
+			Socket: "@" + name,
+			Name:   name,
+		}
+		if idx := strings.LastIndexByte(name, '_'); idx > 0 && idx+1 < len(name) {
+			if pid, err := strconv.Atoi(name[idx+1:]); err == nil && pid > 0 {
+				info.PID = pid
+				info.Process = readProcCmdline(pid)
+			}
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
+func readProcCmdline(pid int) string {
+	raw, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
+	if err != nil || len(raw) == 0 {
+		return ""
+	}
+	if i := strings.IndexByte(string(raw), 0); i >= 0 {
+		raw = raw[:i]
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+// ForSocket returns a Client bound to a specific socket selector:
+// - "" -> returns c unchanged (default socket, e.g. @chrome_devtools_remote)
+// - "webview" -> first discovered @webview_devtools_remote* socket
+// - package substring (e.g. "com.jingdong.app.mall" or "jingdong") -> matching PID's webview socket
+// - exact socket name (with or without leading '@') -> that exact socket
+func (c *Client) ForSocket(selector string) (*Client, error) {
+	sel := strings.TrimPrefix(strings.TrimSpace(selector), "@")
+	if sel == "" {
+		return c, nil
+	}
+	if strings.EqualFold(sel, "webview") {
+		for _, s := range ListSockets() {
+			if strings.HasPrefix(s.Name, "webview_devtools_remote") {
+				return NewClient(s.Name), nil
+			}
+		}
+		return nil, fmt.Errorf("%w: no @webview_devtools_remote* socket active", ErrUnavailable)
+	}
+	// If selector looks like a package/process name rather than a devtools socket name, match by owning process
+	if !strings.Contains(sel, "devtools_remote") {
+		low := strings.ToLower(sel)
+		for _, s := range ListSockets() {
+			if s.Process != "" && strings.Contains(strings.ToLower(s.Process), low) {
+				return NewClient(s.Name), nil
+			}
+		}
+		return nil, fmt.Errorf("%w: no devtools socket found for process matching %q", ErrUnavailable, sel)
+	}
+	return NewClient(sel), nil
 }
 
 func (c *Client) SocketDisplay() string {

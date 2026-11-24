@@ -40,10 +40,17 @@
 │   ├── uninstall.sh                   # 卸载清理脚本
 │   ├── config.json.example
 │   └── bin/agentd                     # linux/arm64 静态编译产物（.gitignore 忽略，运行 build.sh 生成）
+├── lsposed-webview-debug/             # 极薄 13KB 零权限 LSPosed 模块（仅为选定 App 开启 WebView CDP）
+│   ├── AndroidManifest.xml
+│   ├── build_apk.sh                   # aapt2 + smali + zipalign + apksigner 一键打包签名
+│   └── smali/com/agent/webviewdebug/
 ├── skills/
-│   └── ms-rewards-daily/              # Microsoft Rewards 每日全自动积分技能（Edge CDP + Bing App）
+│   ├── ms-rewards-daily/              # Microsoft Rewards 每日全自动积分技能（Edge CDP + Bing App）
+│   │   ├── SKILL.md
+│   │   └── scripts/rewards_runner.py
+│   └── jd-daily/                      # 京东每日极速任务技能（WebView CDP 20ms DOM 直控东东农场 + 领京豆）
 │       ├── SKILL.md
-│       └── scripts/rewards_runner.py
+│       └── scripts/jd_runner.py
 ├── scripts/build.sh                   # 一键汇编 cliphelper.jar + go test -race + ARM64 静态交叉编译
 └── README.md
 ```
