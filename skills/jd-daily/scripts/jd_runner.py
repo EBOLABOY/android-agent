@@ -229,14 +229,34 @@ def read_farm_summary(mc: MCPClient, tid: str) -> dict:
           const wm = txt.match(/\\b(\\d+)g\\b/);
           const water = wm ? wm[0] : null;
           const waterNum = wm ? parseInt(wm[1], 10) : null;
-          const stage = (txt.match(/再浇[\\d.]+%[^\\n!！]*[!！]?/) || [null])[0];
+          const stage = (txt.match(/再浇([\\d.]+)%([^\\n!！]*)/) || [null, null, null]);
+          const stageText = stage[0] ? stage[0].trim() : null;
+          const remainPct = stage[1] ? parseFloat(stage[1]) : null;
+          const stageTarget = stage[2] ? stage[2].trim() : "";
+          const nearHarvest = (remainPct !== null && remainPct <= 5.0 && /收获|成熟/.test(stageTarget));
           const needPrize = /请选择奖品|档位奖励示意图/.test(txt);
           const matured = /恭喜成熟|水果已成熟|去兑换奖品|立即兑换奖品|可兑换奖品/.test(txt);
-          return {water, waterNum, stage, needPrize, matured, snippet: txt.slice(0, 400)};
+          return {water, waterNum, stage: stageText, remainPct, nearHarvest, needPrize, matured, snippet: txt.slice(0, 400)};
         })()
         """,
     )
     return res or {}
+
+
+def read_watering_task_status(mc: MCPClient, tid: str) -> dict:
+    """Inspect the currently open task drawer for any '每日累计浇水X次(cur/target)' task."""
+    return mc.eval_js(
+        JD_PKG,
+        tid,
+        """
+        (() => {
+          const txt = (document.body?.innerText || "");
+          const m = txt.match(/每日累计浇水(\\d+)次\\s*[（(](\\d+)\\/(\\d+)[）)]/);
+          if (!m) return {found: false};
+          return {found: true, label: m[0], cur: parseInt(m[2], 10), target: parseInt(m[3], 10)};
+        })()
+        """,
+    ) or {"found": False}
 
 
 def open_task_drawer(mc: MCPClient, tid: str) -> bool:
@@ -444,54 +464,28 @@ def do_safe_browse_tasks(mc: MCPClient, tid: str, max_runs: int = 12, browse_sec
 def do_watering(
     mc: MCPClient,
     tid: str,
-    rounds: int = 120,
-    water_all: bool = True,
+    rounds: int = 30,
+    mode: str = "tasks",
     keep_water: int = 0,
-    claim_every: int = 8,
+    allow_mature: bool = False,
 ) -> dict:
-    """Water continuously via 25ms WebView DOM clicks.
-    When water_all=True (default), keeps watering until water < max(10, keep_water),
-    auto-dismissing lottery/upgrade popups and periodically claiming chained watering milestone tasks.
-    Stops safely (without auto-placing any redemption order) if the tree reaches maturity.
+    """Water via 25ms WebView DOM clicks.
+    - mode="tasks" (default): ONLY waters enough to complete all '每日累计浇水X次' milestone tasks
+      in the task drawer and claim their water rewards, preserving surplus water for steady daily accumulation.
+      Automatically pauses if the tree is about to harvest (<=5% left) so the user can do the final watering.
+    - mode="all": pours all available water down to keep_water (still pausing before harvest unless allow_mature=True).
+    - mode="fixed": clicks watering button up to `rounds` times.
     """
     watered = 0
     red_packets = []
     popups = []
     drawer_claims = 0
-    stop_reason = "rounds_limit"
-    prev_water = None
+    stop_reason = "completed"
     stalled = 0
     min_threshold = max(10, keep_water)
 
-    for idx in range(1, rounds + 1):
-        d = dismiss_popups(mc, tid)
-        if d.get("redPacket"):
-            red_packets.append(d["redPacket"])
-        if d.get("actions"):
-            popups.extend(d["actions"])
-            time.sleep(0.5)
-
-        summary = read_farm_summary(mc, tid)
-        if summary.get("matured"):
-            stop_reason = "tree_matured_ready_to_redeem"
-            break
-        if summary.get("needPrize"):
-            stop_reason = "prize_selection_required"
-            break
-
-        cur_water = summary.get("waterNum")
-        if water_all and cur_water is not None and cur_water < min_threshold:
-            # Check once if task drawer has unclaimed watering milestone drops before finishing
-            if open_task_drawer(mc, tid):
-                c = claim_all_drawer_rewards(mc, tid)
-                drawer_claims += c
-                close_task_drawer(mc, tid)
-                if c > 0:
-                    time.sleep(0.6)
-                    continue
-            stop_reason = f"water_below_{min_threshold}g"
-            break
-
+    def _single_water_click():
+        nonlocal watered
         res = mc.eval_js(
             JD_PKG,
             tid,
@@ -509,36 +503,121 @@ def do_watering(
             """,
         )
         if not res:
-            stop_reason = "water_button_not_found"
-            break
-
+            return None
         watered += 1
         time.sleep(1.8)
-
         d2 = dismiss_popups(mc, tid)
         if d2.get("redPacket"):
             red_packets.append(d2["redPacket"])
         if d2.get("actions"):
             popups.extend(d2["actions"])
             time.sleep(0.5)
+        return res
+
+    if mode == "tasks":
+        # Loop over chained watering tasks (e.g. 10次 -> 20次 -> 30次) until all watering tasks are claimed
+        for _cycle in range(6):
+            if open_task_drawer(mc, tid):
+                drawer_claims += claim_all_drawer_rewards(mc, tid)
+                wt = read_watering_task_status(mc, tid)
+                close_task_drawer(mc, tid)
+            else:
+                stop_reason = "drawer_unavailable"
+                break
+
+            if not wt.get("found"):
+                stop_reason = "all_watering_tasks_done"
+                break
+            rem = wt["target"] - wt["cur"]
+            if rem <= 0:
+                if open_task_drawer(mc, tid):
+                    drawer_claims += claim_all_drawer_rewards(mc, tid)
+                    close_task_drawer(mc, tid)
+                stop_reason = "all_watering_tasks_done"
+                break
+
+            # Estimate clicks needed (5 waterings per '浇5次' click, capped by remaining rounds)
+            need_clicks = min(max(1, (rem + 4) // 5), max(1, rounds - watered))
+            stopped_early = False
+            for _ in range(need_clicks):
+                d = dismiss_popups(mc, tid)
+                if d.get("redPacket"):
+                    red_packets.append(d["redPacket"])
+                if d.get("actions"):
+                    popups.extend(d["actions"])
+                    time.sleep(0.5)
+
+                summary = read_farm_summary(mc, tid)
+                if summary.get("matured"):
+                    stop_reason = "tree_matured_ready_to_redeem"
+                    stopped_early = True
+                    break
+                if not allow_mature and summary.get("nearHarvest"):
+                    stop_reason = "paused_near_harvest_for_user"
+                    stopped_early = True
+                    break
+                cur_w = summary.get("waterNum")
+                if cur_w is not None and cur_w < 10:
+                    stop_reason = "water_insufficient"
+                    stopped_early = True
+                    break
+
+                if not _single_water_click():
+                    stop_reason = "water_button_not_found"
+                    stopped_early = True
+                    break
+            if stopped_early or watered >= rounds:
+                break
+        return {
+            "mode": mode,
+            "rounds_clicked": watered,
+            "stop_reason": stop_reason,
+            "drawer_claims": drawer_claims,
+            "red_packets": red_packets,
+            "popups_dismissed": popups,
+        }
+
+    # mode == "all" or "fixed"
+    for idx in range(1, rounds + 1):
+        d = dismiss_popups(mc, tid)
+        if d.get("redPacket"):
+            red_packets.append(d["redPacket"])
+        if d.get("actions"):
+            popups.extend(d["actions"])
+            time.sleep(0.5)
+
+        summary = read_farm_summary(mc, tid)
+        if summary.get("matured"):
+            stop_reason = "tree_matured_ready_to_redeem"
+            break
+        if not allow_mature and summary.get("nearHarvest"):
+            stop_reason = "paused_near_harvest_for_user"
+            break
+        cur_water = summary.get("waterNum")
+        if mode == "all" and cur_water is not None and cur_water < min_threshold:
+            stop_reason = f"water_below_{min_threshold}g"
+            break
+
+        if not _single_water_click():
+            stop_reason = "water_button_not_found"
+            break
 
         after_w = read_farm_summary(mc, tid).get("waterNum")
-        if cur_water is not None and after_w is not None and after_w >= cur_water and not d2.get("actions"):
+        if cur_water is not None and after_w is not None and after_w >= cur_water:
             stalled += 1
             if stalled >= 4:
                 stop_reason = "water_unchanged_or_daily_limit"
                 break
         else:
             stalled = 0
-        prev_water = after_w
 
-        # Periodically claim chained watering milestone rewards (e.g. 10/20/30/50 waterings)
-        if water_all and claim_every > 0 and (idx % claim_every == 0):
+        if mode == "all" and (idx % 8 == 0):
             if open_task_drawer(mc, tid):
                 drawer_claims += claim_all_drawer_rewards(mc, tid)
                 close_task_drawer(mc, tid)
 
     return {
+        "mode": mode,
         "rounds_clicked": watered,
         "stop_reason": stop_reason,
         "drawer_claims": drawer_claims,
@@ -567,8 +646,9 @@ def cmd_farm_water(mc: MCPClient, args):
         mc,
         tid,
         rounds=args.max_rounds,
-        water_all=not args.fixed_rounds,
+        mode=args.mode,
         keep_water=args.keep_water,
+        allow_mature=args.allow_mature,
     )
     if open_task_drawer(mc, tid):
         wres["final_drawer_claims"] = claim_all_drawer_rewards(mc, tid)
@@ -601,17 +681,18 @@ def cmd_farm_all(mc: MCPClient, args):
     report["signin"] = do_farm_signin(mc, tid)
     dismiss_popups(mc, tid)
 
-    # 3. Safe 6s browse tasks
+    # 3. Safe 6s browse tasks (accumulate continuous water drops)
     if not args.skip_browse:
         report["browse_tasks"] = do_safe_browse_tasks(mc, tid, max_runs=args.max_browse, browse_sec=args.browse_sec)
 
-    # 4. Water ALL available water & complete ALL watering milestone tasks (regardless of maturity progress)
+    # 4. Complete watering milestone tasks ONLY (preserving surplus water & leaving final harvest watering for user)
     report["watering"] = do_watering(
         mc,
         tid,
         rounds=args.max_water_rounds,
-        water_all=not args.fixed_water_rounds,
+        mode=args.water_mode,
         keep_water=args.keep_water,
+        allow_mature=args.allow_mature,
     )
 
     # 5. Final check of task drawer for any newly completed rewards
@@ -660,18 +741,20 @@ def main():
 
     sub.add_parser("status", help="Check daemon, WebView CDP sockets, and 东东农场 summary")
 
-    p_all = sub.add_parser("farm-all", help="Run full 东东农场 daily flow (signin + safe browse + water ALL + claim)")
-    p_all.add_argument("--max-water-rounds", type=int, default=120, help="Safety cap on watering clicks (default 120)")
-    p_all.add_argument("--keep-water", type=int, default=0, help="Minimum water (g) to keep unpoured (default 0 = pour all)")
-    p_all.add_argument("--fixed-water-rounds", action="store_true", help="Only click --max-water-rounds times instead of pouring all water")
+    p_all = sub.add_parser("farm-all", help="Run full 东东农场 daily water-accumulation flow (signin + safe browse + watering tasks)")
+    p_all.add_argument("--water-mode", choices=["tasks", "all", "fixed"], default="tasks", help="tasks (default): only complete watering milestone tasks & save surplus water; all: pour all water; fixed: click --max-water-rounds times")
+    p_all.add_argument("--max-water-rounds", type=int, default=30, help="Safety cap on watering clicks (default 30)")
+    p_all.add_argument("--keep-water", type=int, default=0, help="Minimum water (g) to keep when water-mode=all")
+    p_all.add_argument("--allow-mature", action="store_true", help="Allow watering through final harvest (default pauses <=5%% before harvest for user)")
     p_all.add_argument("--max-browse", type=int, default=12)
     p_all.add_argument("--browse-sec", type=float, default=12.0)
     p_all.add_argument("--skip-browse", action="store_true")
 
-    p_w = sub.add_parser("farm-water", help="Water 东东农场 until water is depleted (or --fixed-rounds) and claim all watering tasks")
-    p_w.add_argument("--max-rounds", type=int, default=120)
+    p_w = sub.add_parser("farm-water", help="Water 东东农场 (default mode=tasks: finish watering milestone tasks only)")
+    p_w.add_argument("--mode", choices=["tasks", "all", "fixed"], default="tasks")
+    p_w.add_argument("--max-rounds", type=int, default=30)
     p_w.add_argument("--keep-water", type=int, default=0)
-    p_w.add_argument("--fixed-rounds", action="store_true")
+    p_w.add_argument("--allow-mature", action="store_true")
 
     sub.add_parser("bean-signin", help="Open 领京豆 H5 inside JD WebView and click daily sign-in")
 
