@@ -1,11 +1,11 @@
 ---
 name: jd-daily
 description: >-
-  小米 13 京东（JD）极速日常任务自动化技能（WebView CDP 20ms DOM 直控）。
-  当用户要求“刷京东农场”、“做京东每日任务”、“浇一下东东农场”、“领京豆签到”时激活此技能。
+  小米 13 京东（JD）极速日常任务与自动优质评价技能（WebView CDP 20ms DOM 直控 + 原生评价页联动）。
+  当用户要求“刷京东农场”、“做京东每日任务”、“浇一下东东农场”、“领京豆签到”、“京东自动评价”、“把待评价商品自动好评领京豆”时激活此技能。
   通过手机端 android-agent MCP Server（192.168.100.100:8765）直连京东 WebView DevTools 抽象 Socket
   （@webview_devtools_remote_<pid>，依赖极薄 LSPosed 模块 Agent WebView Debug），
-  20ms 级读取 DOM 自动完成东东农场每日签到、收树上水滴、6 秒安全浏览任务、浇水 20 次（自动关闭红包/升级弹窗）及领京豆签到。
+  自动完成东东农场每日签到、收树上水滴、6 秒安全浏览任务、阶梯浇水任务、领京豆签到，以及评价中心待评价订单的定制化百字 5 星优质文字好评（不含盗图/私图）。
 ---
 
 # 京东每日极速任务技能（小米 13 · WebView CDP）
@@ -52,9 +52,23 @@ python3 /root/.agents/skills/jd-daily/scripts/jd_runner.py farm-all
 
 > 如只需把当前余水全部浇完并领取全部浇水奖励，也可单独调用 `farm-water`；如需领京豆签到，可调用 `bean-signin`（直跳 `bean.m.jd.com/bean/signIndex.action`）。
 
+### Step 1B：一键自动完成待评价商品优质 5 星文字好评（`review-list` / `review-all`）
+
+```bash
+# 查看评价中心当前待评价商品列表与已获京豆统计
+python3 /root/.agents/skills/jd-daily/scripts/jd_runner.py review-list
+
+# 批量提交优质 5 星文字好评（每条 90~130 字贴合品类特征 + 自动勾选正面标签/尺码印象，默认绝不盗图、不自动上传相册私图）
+python3 /root/.agents/skills/jd-daily/scripts/jd_runner.py review-all --max-count 30 --delay 2.5
+```
+
+- 可选传入 `--reviews-json <path>` 为本次特定商品提供逐条定制评语映射（`{"商品名关键字": "定制百字评语"}`），未命中时自动按商品大类（鞋服、母婴、厨具日用、数码家电、食品、延保服务等）生成差异化真实口吻评语。
+- 自动规避手机右上角 SSH 悬浮窗触摸区域（`dumpsys input` 实时探测 `touchableRegion`，使用 `发布` 按钮顶部安全区点击），遇滑块/人机验证立即中止。
+
 ### Step 2：汇报战果
 
 整理精简战报返回给用户：
 - 东东农场当前阶段（发芽 / 开花 / 结果进度）与最新水滴余额
 - 完成的签到、浏览任务次数、浇水次数及领到的无门槛红包/升级水滴
 - 领京豆签到结果（如执行了 `bean-signin`）
+- 自动评价提交条数、跳过条数及「已写评价 / 已获京豆」前后对比（如执行了 `review-all`）

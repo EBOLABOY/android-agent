@@ -792,6 +792,476 @@ def cmd_bean_signin(mc: MCPClient, _args):
     print(json.dumps(res, ensure_ascii=False, indent=2))
 
 
+# ---------------------------------------------------------------------------
+# JD Automatic High-Quality Product Reviews (评价中心 WebView + CommentFloorActivity)
+# ---------------------------------------------------------------------------
+
+REVIEW_CENTER_URL = "https://comment.m.jd.com/m-rate/rate-center?hideNavi=1&osPlant=jd-android"
+
+
+def find_review_center_target(mc: MCPClient):
+    try:
+        res = mc.call_json("cdp_list_targets", {"socket": JD_PKG})
+    except Exception:
+        return None
+    if not res.get("available"):
+        return None
+    for t in res.get("targets") or []:
+        if t.get("type") == "page" and "rate-center" in (t.get("url") or ""):
+            return t
+    return None
+
+
+def return_to_review_center(mc: MCPClient) -> str:
+    """Press BACK until JD's rate-center WebActivity is in the foreground and return its WebView target_id."""
+    for attempt in range(7):
+        fg = mc.call_json("phone_foreground_app")
+        pkg = fg.get("package") or ""
+        act = fg.get("activity") or ""
+        t = find_review_center_target(mc)
+        if pkg == JD_PKG and "WebActivity" in act and t:
+            time.sleep(0.8)
+            return t["id"]
+        if pkg not in (JD_PKG, "com.server.auditor.ssh.client", ""):
+            mc.call("phone_launch_app", {"package": JD_PKG})
+            time.sleep(1.5)
+        else:
+            mc.call("phone_keyevent", {"keycode": "BACK"})
+            time.sleep(1.6)
+            if attempt == 3:
+                targets = mc.call_json("cdp_list_targets", {"socket": JD_PKG}).get("targets") or []
+                page = next((x for x in targets if x.get("type") == "page"), None)
+                if page:
+                    mc.cdp(JD_PKG, page["id"], "Page.navigate", {"url": REVIEW_CENTER_URL})
+                    time.sleep(3.2)
+    t = find_review_center_target(mc)
+    if t:
+        return t["id"]
+    raise RuntimeError(
+        "评价中心 WebView target not found. Open 京东 -> 我的 -> 待评价 first, or ensure Agent WebView Debug is active."
+    )
+
+
+def reload_review_center(mc: MCPClient, tid: str) -> str:
+    """Safely reload rate-center via CDP Page.reload (avoids eval_js reload race) and return fresh tid."""
+    try:
+        mc.cdp(JD_PKG, tid, "Page.reload", {"ignoreCache": False})
+    except Exception:
+        pass
+    time.sleep(3.2)
+    return return_to_review_center(mc)
+
+
+def read_review_center_state(mc: MCPClient, tid: str) -> dict:
+    last_err = None
+    for attempt in range(3):
+        try:
+            res = mc.eval_js(
+                JD_PKG,
+                tid,
+                """
+                (() => {
+                  const txt = document.body?.innerText || "";
+                  const revM = txt.match(/(\\d+)\\s*(?:\\+\\d+\\s*)?已写评价/);
+                  const beanM = txt.match(/(\\d+)\\s*已获京豆/);
+                  const btns = Array.from(document.querySelectorAll("div, span, button")).filter(e => {
+                    const s = (e.innerText || "").trim();
+                    const r = e.getBoundingClientRect();
+                    return s === "去评价" && r.width > 20 && r.width < 115 && r.height > 15 && r.height < 60;
+                  });
+                  const cards = [];
+                  const seen = new Set();
+                  for (const b of btns) {
+                    let p = b.parentElement;
+                    for (let k = 0; k < 8 && p; k++) {
+                      const r = p.getBoundingClientRect();
+                      const s = (p.innerText || "").trim();
+                      if (r.height > 120 && r.height < 460 && s.length > 30 && !s.includes("已写评价")) break;
+                      p = p.parentElement;
+                    }
+                    if (!p || (p.innerText || "").includes("已写评价")) continue;
+                    const lines = (p.innerText || "").split("\\n").map(x => x.trim()).filter(Boolean);
+                    if (!lines.length || lines[0].includes("限时激励")) continue;
+                    if (seen.has(lines[0])) continue;
+                    seen.add(lines[0]);
+                    cards.push({title: lines[0], meta: lines.slice(1).join(" | ").slice(0, 140)});
+                  }
+                  return {
+                    reviewed: revM ? parseInt(revM[1], 10) : null,
+                    beans: beanM ? parseInt(beanM[1], 10) : null,
+                    cards,
+                    snippet: txt.slice(0, 300),
+                  };
+                })()
+                """,
+            )
+            return res or {"cards": []}
+        except Exception as e:
+            last_err = e
+            time.sleep(2.0)
+            tid = return_to_review_center(mc)
+    raise last_err
+
+
+def click_review_card(mc: MCPClient, tid: str, target_title: str) -> bool:
+    return bool(
+        mc.eval_js(
+            JD_PKG,
+            tid,
+            f"""
+            (() => {{
+              const want = {json.dumps(target_title)};
+              const btns = Array.from(document.querySelectorAll("div, span, button")).filter(e => {{
+                const s = (e.innerText || "").trim();
+                const r = e.getBoundingClientRect();
+                return s === "去评价" && r.width > 20 && r.width < 115 && r.height > 15 && r.height < 60;
+              }});
+              for (const b of btns) {{
+                let p = b.parentElement;
+                for (let k = 0; k < 8 && p; k++) {{
+                  const r = p.getBoundingClientRect();
+                  const s = (p.innerText || "").trim();
+                  if (r.height > 120 && r.height < 460 && s.length > 30 && !s.includes("已写评价")) break;
+                  p = p.parentElement;
+                }}
+                if (!p || (p.innerText || "").includes("已写评价")) continue;
+                const lines = (p.innerText || "").split("\\n").map(x => x.trim()).filter(Boolean);
+                if (lines.length && lines[0] === want) {{
+                  b.scrollIntoView({{block: "center"}});
+                  b.click();
+                  return true;
+                }}
+              }}
+              return false;
+            }})()
+            """,
+        )
+    )
+
+
+def generate_quality_review(title: str, bespoke_map: dict, idx: int = 0) -> str:
+    """Generate a tailored, authentic 90-130 Chinese char 5-star review for the product."""
+    for key, text in (bespoke_map or {}).items():
+        if key and key in title:
+            return text
+
+    # Clean short product label (strip bracketed promo noise)
+    short = re.sub(r"【[^】]*】|\[[^\]]*\]", "", title).strip()
+    short = re.split(r"\s+", short)[0][:18] or title[:16]
+
+    if re.search(r"鞋|袜|运动服|T恤|裤|外套|卫衣", title):
+        variants = [
+            f"这款{short}收到试穿体验很不错，尺码标准按平时码数选刚好合脚，上脚轻便舒适不磨脚。面料做工扎实走线工整，透气排汗效果好，日常通勤和运动都能穿。版型百搭耐看，细节处理到位没有多余线头和异味，京东配送速度快包装完好，整体性价比很高。",
+            f"入手的{short}质感超出预期，裁剪利落穿起来很合身，日常活动伸展自如没有束缚感。用料厚实亲肤，洗后不易变形起球，配色耐看实用。发货及时物流给力，打开检查做工精细无瑕疵，穿了一阵子脚感/体感都很舒服，值得回购推荐。",
+        ]
+    elif re.search(r"宝宝|婴儿|婴幼儿|辅食|米粉|奶粉|母乳|背奶|儿童|维生素|滴剂|尿不湿", title):
+        variants = [
+            f"给宝宝选的这款{short}品质很让人放心，包装密封严实没有破损，生产日期也很新鲜。材质安全无异味，细节设计贴心考虑到了宝宝日常使用习惯，实际用下来宝宝接受度很高，家里大人操作起来也很顺手省心。京东正品渠道有保障，物流送货快，用完还会继续回购。",
+            f"回购的{short}一如既往地靠谱，成分/材质让人安心，拆封后干净卫生没有杂味。给宝宝使用温和贴心，做工细腻没有毛刺和瑕疵，日常带娃能省不少事。快递包装结实次日就送到了，价格结合活动很划算，家里常备母婴好物非常满意。",
+        ]
+    elif re.search(r"锅|碗|杯|壶|厨|洗碗|凝珠|清洁|收纳|毛巾|湿巾|纸", title):
+        variants = [
+            f"这款{short}买回家用了一段时间体验非常不错，材质厚实有分量，做工精细边角打磨光滑，拆开没有刺鼻异味。日常居家使用顺手实用，清洁打理起来也不费劲，确实能明显提升生活便利度。包装防护到位没有磕碰破损，京东送货速度快，性价比挺高。",
+            f"家里日用刚需入手的{short}，实物和详情页介绍一致，用料正规耐用度不错。设计简洁实用，放在家里不占空间而且很耐看，实际使用效果让人满意，省时又省力。快递准时送达外箱完好，日常囤货很合适，下次有需要还会再买。",
+        ]
+    elif re.search(r"手环|手表|手机|耳机|充电|电源|数据线|开关|插座|电脑|键盘|鼠标|路由器", title):
+        variants = [
+            f"这款{short}到手试用非常满意，外观做工精致有质感，边角贴合严密没有廉价感。核心功能响应灵敏稳定，连接和设置过程都很顺畅，日常使用体验流畅省心。续航和散热表现也在预期之内，包装盒完整密封良好，京东发货快售后有保障，物有所值。",
+            f"对比了好几款最后选的{short}，拿到手果然没失望，细节做工扎实，性能稳定可靠，日常高频使用也没出现卡顿或断连。操作界面直观好上手，整体颜值耐看百搭，快递次日达保护得很好，结合优惠入手性价比相当不错。",
+        ]
+    elif re.search(r"牛肉|零食|食品|茶|咖啡|饮|饼干|坚果|面|米|油|酱", title):
+        variants = [
+            f"这款{short}味道很不错，拆开包装香气自然，配料表看着也比较放心。口感扎实新鲜不腻口，咸淡火候掌握得恰到好处，平时当佐餐小菜或者追剧解馋都很合适。独立/密封包装干净卫生，生产日期很新鲜，快递送货快没压坏，吃完会再回购。",
+        ]
+    elif re.search(r"焕新|延保|碎屏|服务|保险|会员", title):
+        variants = [
+            f"下单商品时顺手搭配了{short}服务，生效速度很快，在订单详情里能清晰查看保障内容和有效期。日常使用难免担心意外磕碰或损坏，多一份官方售后保障心里踏实很多，整体费用实惠透明，虽然希望用不上，但有备无患非常让人安心。",
+        ]
+    else:
+        variants = [
+            f"这款{short}收到检查完好无损，实物颜值和质感都挺在线，做工细节处理得比较规整，用料扎实没有廉价感。实际使用下来功能稳定顺手，完全符合日常预期，包装严实保护到位。京东物流一如既往地快，整体购物体验很省心，五星好评推荐。",
+            f"入手的{short}使用体验很满意，设计合理实用性高，拆箱没有异味和瑕疵，拿到手就能直接用上。细节看得出品牌用心，耐用度和手感都不错，日常使用频率很高。快递配送准时服务态度好，价格实惠性价比突出，有需要还会再来。",
+        ]
+    return variants[idx % len(variants)]
+
+
+def dump_ui_xml(adb_serial: str) -> str:
+    return subprocess.check_output(
+        [
+            "adb",
+            "-s",
+            adb_serial,
+            "shell",
+            "su -c 'uiautomator dump /data/local/tmp/ui_rev_auto.xml >/dev/null 2>&1 && cat /data/local/tmp/ui_rev_auto.xml'",
+        ],
+        text=True,
+        timeout=15,
+    )
+
+
+def parse_bounds(b: str):
+    m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", b or "")
+    if not m:
+        return None
+    return tuple(int(x) for x in m.groups())
+
+
+def parse_jd_nodes(xml: str) -> list:
+    nodes = []
+    for m in re.finditer(r"<node [^>]+>", xml):
+        s = m.group(0)
+        pkg = (re.search(r'package="([^"]*)"', s) or [None, ""])[1]
+        if pkg and pkg != JD_PKG:
+            continue
+        txt = (re.search(r'text="([^"]*)"', s) or [None, ""])[1]
+        desc = (re.search(r'content-desc="([^"]*)"', s) or [None, ""])[1]
+        cls = (re.search(r'class="([^"]*)"', s) or [None, ""])[1]
+        b = parse_bounds((re.search(r'bounds="([^"]*)"', s) or [None, ""])[1])
+        if b:
+            nodes.append({"text": txt, "desc": desc, "cls": cls, "bounds": b})
+    return nodes
+
+
+def get_floating_ssh_touch_rect(adb_serial: str):
+    """Return (x1, y1, x2, y2) of the user's floating SSH window if present, else None."""
+    try:
+        out = subprocess.check_output(
+            [
+                "adb",
+                "-s",
+                adb_serial,
+                "shell",
+                "su -c 'dumpsys input | grep -E \"com\\.server\\.auditor.*touchableRegion=\" | head -n 1'",
+            ],
+            text=True,
+            timeout=8,
+        )
+        m = re.search(r"touchableRegion=\[(\d+),(\d+)\]\[(\d+),(\d+)\]", out)
+        if m:
+            return tuple(int(x) for x in m.groups())
+    except Exception:
+        pass
+    return None
+
+
+def point_in_rect(x: int, y: int, rect) -> bool:
+    if not rect:
+        return False
+    return rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]
+
+
+def submit_single_review(mc: MCPClient, adb_serial: str, review_text: str, float_rect) -> dict:
+    """Fill and submit the currently open CommentFloorActivity."""
+    time.sleep(2.2)
+    fg = mc.call_json("phone_foreground_app")
+    if "CommentFloorActivity" not in (fg.get("activity") or ""):
+        return {"ok": False, "reason": f"unexpected_activity:{fg.get('activity')}"}
+
+    xml = dump_ui_xml(adb_serial)
+    check_captcha(xml)
+    nodes = parse_jd_nodes(xml)
+
+    # 1. Optional size chip ('合适') if shown
+    fit_node = next((n for n in nodes if n["text"] == "合适"), None)
+    if fit_node:
+        x1, y1, x2, y2 = fit_node["bounds"]
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        if not point_in_rect(cx, cy, float_rect):
+            mc.call("phone_tap", {"x": cx, "y": cy, "coord_space": "screen"})
+            time.sleep(0.35)
+
+    # 2. Find EditText and paste review via clipboard (avoiding floating window on right)
+    edit_node = next((n for n in nodes if "EditText" in n["cls"]), None)
+    if not edit_node:
+        return {"ok": False, "reason": "no_edittext_found"}
+    ex1, ey1, ex2, ey2 = edit_node["bounds"]
+    tap_x = min((ex1 + ex2) // 2, 460)
+    tap_y = (ey1 + ey2) // 2
+    mc.call("phone_tap", {"x": tap_x, "y": tap_y, "coord_space": "screen"})
+    time.sleep(0.7)
+    mc.call("phone_input_text", {"text": review_text, "method": "clipboard", "submit": False})
+    time.sleep(0.7)
+    # Close soft keyboard
+    mc.call("phone_keyevent", {"keycode": "BACK"})
+    time.sleep(0.7)
+
+    # 3. Scroll gently to reveal positive tag chips & re-dump UI
+    mc.call("phone_swipe", {"x1": 360, "y1": 1220, "x2": 360, "y2": 680, "duration_ms": 260, "coord_space": "image"})
+    time.sleep(0.6)
+    xml2 = dump_ui_xml(adb_serial)
+    check_captcha(xml2)
+    nodes2 = parse_jd_nodes(xml2)
+
+    # Check written character count
+    char_node = next((n for n in nodes2 if re.match(r"已写\d+字", n["text"])), None)
+    char_info = char_node["text"] if char_node else "unknown"
+
+    # Tap up to 3 positive tag chips between '商品评价' and '快递包装'/'匿名评价'
+    rate_node = next((n for n in nodes2 if n["text"] == "商品评价"), None)
+    pack_node = next((n for n in nodes2 if n["text"] in ("快递包装", "送货速度", "匿名评价")), None)
+    tags_tapped = []
+    if rate_node:
+        ry_min = rate_node["bounds"][3] + 10
+        ry_max = (pack_node["bounds"][1] - 10) if pack_node else (ry_min + 260)
+        for n in nodes2:
+            t = n["text"]
+            x1, y1, x2, y2 = n["bounds"]
+            if not t or len(t) < 2 or len(t) > 8:
+                continue
+            if t in (
+                "非常好", "很好", "一般", "差", "非常差", "视频/图", "发布", "写评价", "匿名评价",
+                "商品符合度", "店家服务态度", "快递配送速度", "快递包装", "送货速度", "配送员服务",
+            ):
+                continue
+            if y1 >= ry_min and y2 <= ry_max:
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                if not point_in_rect(cx, cy, float_rect):
+                    mc.call("phone_tap", {"x": cx, "y": cy, "coord_space": "screen"})
+                    tags_tapped.append(t)
+                    time.sleep(0.28)
+                    if len(tags_tapped) >= 3:
+                        break
+
+    # 4. Tap 发布 (safely avoiding floating SSH window if it overlaps top-right)
+    pub_node = next((n for n in nodes2 if n["text"] in ("发布", "提交")), None)
+    if not pub_node:
+        return {"ok": False, "reason": "publish_btn_not_found", "chars": char_info}
+    px1, py1, px2, py2 = pub_node["bounds"]
+    pcx, pcy = (px1 + px2) // 2, (py1 + py2) // 2
+    if point_in_rect(pcx, pcy, float_rect):
+        # Use exposed band strictly above floating window (y < float_rect[1]) and inside publish button [py1..py2]
+        if py1 < float_rect[1] - 2:
+            pcy = max(py1 + 2, float_rect[1] - 5)
+        elif px2 > float_rect[2] + 4:
+            pcx = min(px2 - 2, float_rect[2] + 6)
+        else:
+            return {"ok": False, "reason": "publish_btn_fully_occluded_by_floating_window"}
+
+    mc.call("phone_tap", {"x": pcx, "y": pcy, "coord_space": "screen"})
+    time.sleep(2.4)
+
+    # Handle optional confirmation modal ('确认提交') or photo nag modal ('仍要发布'/'直接发布')
+    fg_after = mc.call_json("phone_foreground_app")
+    if "CommentFloorActivity" in (fg_after.get("activity") or ""):
+        xml3 = dump_ui_xml(adb_serial)
+        check_captcha(xml3)
+        nodes3 = parse_jd_nodes(xml3)
+        for label in ("不再提醒",):
+            nd = next((n for n in nodes3 if n["text"] == label), None)
+            if nd:
+                x1, y1, x2, y2 = nd["bounds"]
+                mc.call("phone_tap", {"x": (x1 + x2) // 2, "y": (y1 + y2) // 2, "coord_space": "screen"})
+                time.sleep(0.35)
+        confirm = next((n for n in nodes3 if n["text"] in ("确认提交", "仍要发布", "直接发布", "继续发布", "确认发布")), None)
+        if confirm:
+            x1, y1, x2, y2 = confirm["bounds"]
+            mc.call("phone_tap", {"x": (x1 + x2) // 2, "y": (y1 + y2) // 2, "coord_space": "screen"})
+            time.sleep(2.6)
+            fg_after = mc.call_json("phone_foreground_app")
+
+    ok = "CommentFloorActivity" not in (fg_after.get("activity") or "")
+    return {
+        "ok": ok,
+        "chars": char_info,
+        "tags": tags_tapped,
+        "after_activity": fg_after.get("activity"),
+    }
+
+
+def cmd_review_list(mc: MCPClient, _args):
+    require_guard_active(mc)
+    tid = return_to_review_center(mc)
+    state = read_review_center_state(mc, tid)
+    print(json.dumps(state, ensure_ascii=False, indent=2))
+
+
+def cmd_review_all(mc: MCPClient, args):
+    require_guard_active(mc)
+    bespoke_map = {}
+    if args.reviews_json and Path(args.reviews_json).exists():
+        bespoke_map = json.loads(Path(args.reviews_json).read_text(encoding="utf-8"))
+
+    float_rect = get_floating_ssh_touch_rect(args.adb)
+    tid = return_to_review_center(mc)
+    tid = reload_review_center(mc, tid)
+    before = read_review_center_state(mc, tid)
+    before_summary = {"reviewed": before.get("reviewed"), "beans": before.get("beans")}
+
+    submitted = []
+    skipped = []
+    attempted = set()
+
+    for idx in range(args.max_count):
+        tid = return_to_review_center(mc)
+        if idx > 0:
+            tid = reload_review_center(mc, tid)
+        state = read_review_center_state(mc, tid)
+        check_captcha(state.get("snippet", ""))
+        cards = [c for c in (state.get("cards") or []) if c["title"] not in attempted]
+        if not cards:
+            # Scroll down once to load more items if any remain below fold
+            mc.call("phone_swipe", {"x1": 360, "y1": 1300, "x2": 360, "y2": 450, "duration_ms": 300, "coord_space": "image"})
+            time.sleep(1.2)
+            state = read_review_center_state(mc, tid)
+            cards = [c for c in (state.get("cards") or []) if c["title"] not in attempted]
+            if not cards:
+                break
+
+        card = cards[0]
+        title = card["title"]
+        attempted.add(title)
+        review_text = generate_quality_review(title, bespoke_map, idx)
+
+        if args.dry_run:
+            submitted.append({"title": title, "chars": len(review_text), "preview": review_text[:40]})
+            continue
+
+        if not click_review_card(mc, tid, title):
+            skipped.append({"title": title, "reason": "click_failed"})
+            continue
+
+        res = submit_single_review(mc, args.adb, review_text, float_rect)
+        entry = {"title": title[:48], "len": len(review_text), **res}
+        if res.get("ok"):
+            submitted.append(entry)
+            print(f"[OK #{len(submitted)}] {title[:40]} ({res.get('chars')}, tags={res.get('tags')})", flush=True)
+        else:
+            skipped.append(entry)
+            print(f"[SKIP] {title[:40]} -> {res.get('reason')}", flush=True)
+            # Back out of CommentFloorActivity cleanly (dismissing any '放弃评价/离开' confirm dialog)
+            mc.call("phone_keyevent", {"keycode": "BACK"})
+            time.sleep(1.0)
+            fg_chk = mc.call_json("phone_foreground_app")
+            if "CommentFloorActivity" in (fg_chk.get("activity") or ""):
+                try:
+                    x_leave = dump_ui_xml(args.adb)
+                    for nd in parse_jd_nodes(x_leave):
+                        if nd["text"] in ("离开", "放弃", "确定离开", "暂不评价", "残忍离开"):
+                            x1, y1, x2, y2 = nd["bounds"]
+                            mc.call("phone_tap", {"x": (x1 + x2) // 2, "y": (y1 + y2) // 2, "coord_space": "screen"})
+                            time.sleep(1.0)
+                            break
+                except Exception:
+                    pass
+
+        time.sleep(max(1.0, args.delay))
+
+    tid = return_to_review_center(mc)
+    tid = reload_review_center(mc, tid)
+    after = read_review_center_state(mc, tid)
+    after_summary = {"reviewed": after.get("reviewed"), "beans": after.get("beans")}
+    report = {
+        "before": before_summary,
+        "after": after_summary,
+        "submitted_count": len(submitted),
+        "skipped_count": len(skipped),
+        "submitted": submitted,
+        "skipped": skipped,
+        "remaining_visible": len(after.get("cards") or []),
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
 def main():
     p = argparse.ArgumentParser(description="Xiaomi 13 JD daily automation via WebView CDP")
     p.add_argument("--host", default=DEFAULT_HOST)
@@ -817,6 +1287,13 @@ def main():
 
     sub.add_parser("bean-signin", help="Open 领京豆 H5 inside JD WebView and click daily sign-in")
 
+    sub.add_parser("review-list", help="List pending JD orders in 评价中心 WebView")
+    p_rev = sub.add_parser("review-all", help="Auto-submit high-quality 5-star text reviews (方案B) for pending JD orders")
+    p_rev.add_argument("--max-count", type=int, default=30, help="Max pending orders to review (default 30)")
+    p_rev.add_argument("--delay", type=float, default=2.5, help="Pause in seconds between reviews (default 2.5)")
+    p_rev.add_argument("--reviews-json", default="", help="Optional JSON file mapping product-title substrings to bespoke review text")
+    p_rev.add_argument("--dry-run", action="store_true", help="Preview generated reviews without submitting")
+
     args = p.parse_args()
     mc = MCPClient(args.host, resolve_token(args.adb))
     {
@@ -824,6 +1301,8 @@ def main():
         "farm-all": cmd_farm_all,
         "farm-water": cmd_farm_water,
         "bean-signin": cmd_bean_signin,
+        "review-list": cmd_review_list,
+        "review-all": cmd_review_all,
     }[args.cmd](mc, args)
 
 

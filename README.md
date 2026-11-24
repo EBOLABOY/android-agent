@@ -48,7 +48,7 @@
 │   ├── ms-rewards-daily/              # Microsoft Rewards 每日全自动积分技能（Edge CDP + Bing App）
 │   │   ├── SKILL.md
 │   │   └── scripts/rewards_runner.py
-│   └── jd-daily/                      # 京东每日极速任务技能（WebView CDP 20ms DOM 直控东东农场 + 领京豆）
+│   └── jd-daily/                      # 京东每日极速任务与自动优质评价技能（WebView CDP 东东农场 + 领京豆 + 百字 5 星自动好评）
 │       ├── SKILL.md
 │       └── scripts/jd_runner.py
 ├── scripts/build.sh                   # 一键汇编 cliphelper.jar + go test -race + ARM64 静态交叉编译
