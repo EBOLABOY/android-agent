@@ -23,15 +23,15 @@ CAPTCHA_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Tasks explicitly forbidden to touch (third-party installs, widgets, follow spam, paid orders)
+# Tasks explicitly forbidden to touch (third-party installs, widgets, follow spam, paid orders, mini-games)
 FORBIDDEN_TASK_RE = re.compile(
-    r"快手|极速版|小组件|关注|邀请|好友|下单|购买|支付|开通|PLUS|金融|借款|白条|信用卡|助力",
+    r"快手|百度|极速版|小组件|关注|邀请|好友|下单|购买|支付|开通PLUS|开通会员|金融|借款|白条|信用卡|助力|通过1关|小游戏|旅行一次",
     re.IGNORECASE,
 )
 
 # Safe browse tasks allowed for automatic 12s view + claim
 SAFE_BROWSE_RE = re.compile(
-    r"浏览\d+秒|读\d+s|精选活动推荐|限时领|逛一逛",
+    r"浏览\d+秒|读\d+s|精选活动推荐|限时领|逛一逛|逛PLUS|逛家电|逛看病|抢爆品|京东直播",
     re.IGNORECASE,
 )
 
@@ -304,10 +304,15 @@ def claim_all_drawer_rewards(mc: MCPClient, tid: str) -> int:
         """
         (() => {
           let n = 0;
+          const clickedParents = new Set();
           for (const el of Array.from(document.querySelectorAll("div, span, button"))) {
             const t = (el.innerText || "").trim();
             const r = el.getBoundingClientRect();
-            if ((t === "去领奖" || t === "领取") && r.width > 20 && r.height > 15 && r.top > 100) {
+            if (/^(去领奖|领奖励|领取)$/.test(t) && r.width > 20 && r.height > 15) {
+              const p = el.parentElement;
+              if (p && clickedParents.has(p)) continue;
+              if (p) clickedParents.add(p);
+              el.scrollIntoView({block: "center"});
               el.click();
               n++;
             }
@@ -317,7 +322,7 @@ def claim_all_drawer_rewards(mc: MCPClient, tid: str) -> int:
         """,
     )
     if claimed:
-        time.sleep(1.0)
+        time.sleep(1.2)
     return int(claimed or 0)
 
 
@@ -374,31 +379,62 @@ def do_farm_signin(mc: MCPClient, tid: str) -> dict:
     return result
 
 
-def do_safe_browse_tasks(mc: MCPClient, tid: str, max_runs: int = 12, browse_sec: float = 12.0) -> dict:
+def return_to_farm_activity(mc: MCPClient) -> str:
+    """Press BACK until JD's 东东农场 BabelActivity is actually back in the foreground,
+    dismissing retention modals (e.g. 看病买药 / 直播 exit popups) that eat hardware BACK.
+    """
+    for attempt in range(6):
+        fg = mc.call_json("phone_foreground_app")
+        pkg = fg.get("package") or ""
+        act = fg.get("activity") or ""
+        if pkg == JD_PKG and "BabelActivity" in act:
+            t = find_farm_target(mc)
+            if t:
+                return t["id"]
+        if pkg not in (JD_PKG, "com.server.auditor.ssh.client", ""):
+            mc.call("phone_launch_app", {"package": JD_PKG})
+            time.sleep(1.5)
+        else:
+            if attempt in (1, 3):
+                # Dismiss common JD center-bottom retention modal 'X' (e.g. 看病买药 5京豆弹窗)
+                mc.call("phone_tap", {"x": 360, "y": 1142, "coord_space": "image"})
+                time.sleep(0.8)
+            mc.call("phone_keyevent", {"keycode": "BACK"})
+            time.sleep(1.4)
+            if attempt in (2, 4):
+                mc.call("phone_tap", {"x": 45, "y": 124, "coord_space": "image"})
+                time.sleep(1.4)
+    return ensure_farm_open(mc)["id"]
+
+
+def do_safe_browse_tasks(mc: MCPClient, tid: str, max_runs: int = 16, browse_sec: float = 12.0) -> dict:
     completed = []
     if not open_task_drawer(mc, tid):
         return {"completed": completed, "claims": 0}
     claims = claim_all_drawer_rewards(mc, tid)
+    tried_counts = {}
 
     for _ in range(max_runs):
-        # Scan visible task cards in DOM and find first SAFE browse task with "去完成" / "逛一逛"
+        # Scan ALL task cards in DOM (even below fold!) and find first SAFE browse task
         cand = mc.eval_js(
             JD_PKG,
             tid,
             """
             (() => {
+              const seen = new Set();
               const rows = [];
               for (const btn of Array.from(document.querySelectorAll("div, span, button"))) {
                 const bt = (btn.innerText || "").trim();
                 const br = btn.getBoundingClientRect();
-                if (!/^(去完成|逛一逛)$/.test(bt) || br.width < 30 || br.height < 18 || br.top < 120) continue;
-                // Climb to row container to read title + description
+                if (!/^(去完成|逛一逛)$/.test(bt) || br.width < 30 || br.height < 18) continue;
                 let row = btn.parentElement;
                 for (let k = 0; k < 4 && row; k++) {
                   if ((row.innerText || "").length > 15 && row.getBoundingClientRect().width > 240) break;
                   row = row.parentElement;
                 }
                 const rtxt = (row ? row.innerText : bt).replace(/\\s+/g, " ").trim();
+                if (seen.has(rtxt)) continue;
+                seen.add(rtxt);
                 rows.push({btnText: bt, rowText: rtxt.slice(0, 100), y: Math.round(br.top)});
               }
               return rows;
@@ -411,30 +447,40 @@ def do_safe_browse_tasks(mc: MCPClient, tid: str, max_runs: int = 12, browse_sec
             rtxt = r["rowText"]
             if FORBIDDEN_TASK_RE.search(rtxt):
                 continue
-            if SAFE_BROWSE_RE.search(rtxt):
-                chosen = r
-                break
+            if not SAFE_BROWSE_RE.search(rtxt):
+                continue
+            # Allow multi-count tasks like 精选活动推荐(0/9) up to target+1 tries; single tasks max 1 try
+            m_prog = re.search(r"[（(](\d+)/(\d+)[）)]", rtxt)
+            max_tries = (int(m_prog.group(2)) + 1) if (m_prog and int(m_prog.group(2)) > 1) else 1
+            key = re.sub(r"[（(]\d+/\d+[）)]", "", rtxt)[:24]
+            if tried_counts.get(key, 0) >= max_tries:
+                continue
+            chosen = (r, key)
+            break
 
         if not chosen:
             break
+        r, key = chosen
+        tried_counts[key] = tried_counts.get(key, 0) + 1
 
-        # Click the chosen row's button via DOM
+        # Scroll into view and click the chosen row's button via DOM
         clicked = mc.eval_js(
             JD_PKG,
             tid,
             f"""
             (() => {{
-              const want = {json.dumps(chosen["rowText"][:24])};
+              const want = {json.dumps(r["rowText"][:24])};
               for (const btn of Array.from(document.querySelectorAll("div, span, button"))) {{
                 const bt = (btn.innerText || "").trim();
                 const br = btn.getBoundingClientRect();
-                if (!/^(去完成|逛一逛)$/.test(bt) || br.width < 30 || br.top < 120) continue;
+                if (!/^(去完成|逛一逛)$/.test(bt) || br.width < 30 || br.height < 18) continue;
                 let row = btn.parentElement;
                 for (let k = 0; k < 4 && row; k++) {{
                   if ((row.innerText || "").length > 15 && row.getBoundingClientRect().width > 240) break;
                   row = row.parentElement;
                 }}
                 if (row && (row.innerText || "").replace(/\\s+/g, " ").includes(want)) {{
+                  btn.scrollIntoView({{block: "center"}});
                   btn.click();
                   return true;
                 }}
@@ -450,15 +496,17 @@ def do_safe_browse_tasks(mc: MCPClient, tid: str, max_runs: int = 12, browse_sec
         time.sleep(3.5)
         mc.call("phone_swipe", {"x1": 360, "y1": 1100, "x2": 360, "y2": 680, "duration_ms": 280, "coord_space": "image"})
         time.sleep(max(1.0, browse_sec - 3.5))
+        # Return to 东东农场 BabelActivity in foreground and refresh WebView target_id
         mc.call("phone_keyevent", {"keycode": "BACK"})
-        time.sleep(1.8)
+        time.sleep(1.6)
+        tid = return_to_farm_activity(mc)
 
         open_task_drawer(mc, tid)
         claims += claim_all_drawer_rewards(mc, tid)
-        completed.append(chosen["rowText"][:60])
+        completed.append(r["rowText"][:60])
 
     close_task_drawer(mc, tid)
-    return {"completed": completed, "claims": claims}
+    return {"completed": completed, "claims": claims, "tid": tid}
 
 
 def do_watering(
@@ -659,8 +707,7 @@ def cmd_farm_water(mc: MCPClient, args):
 
 def cmd_farm_all(mc: MCPClient, args):
     require_guard_active(mc)
-    t = ensure_farm_open(mc)
-    tid = t["id"]
+    tid = return_to_farm_activity(mc)
     report = {"before": read_farm_summary(mc, tid)}
     if report["before"].get("needPrize"):
         report["stopped_reason"] = "prize_selection_required"
@@ -669,23 +716,35 @@ def cmd_farm_all(mc: MCPClient, args):
 
     dismiss_popups(mc, tid)
 
-    # 1. Collect tree floating 10g water bubble if present
+    # 1. Collect tree floating 10g water bubble & left-side "10水滴(领)" entry if present
     mc.eval_js(
         JD_PKG,
         tid,
-        '(() => { const b = document.querySelector(".FixedTaskIcon_fixed_task_img__388lV"); if (b) b.click(); })()',
+        """
+        (() => {
+          const b = document.querySelector(".FixedTaskIcon_fixed_task_img__388lV");
+          if (b) b.click();
+          const left10 = Array.from(document.querySelectorAll(".LeftTaskEntry_task_item__o3Mg-")).find(e => (e.innerText||"").includes("10水滴"));
+          if (left10) left10.click();
+        })()
+        """,
     )
-    time.sleep(0.8)
+    time.sleep(1.0)
+    dismiss_popups(mc, tid)
 
     # 2. Daily sign-in
     report["signin"] = do_farm_signin(mc, tid)
+    tid = ensure_farm_open(mc)["id"]
     dismiss_popups(mc, tid)
 
     # 3. Safe 6s browse tasks (accumulate continuous water drops)
     if not args.skip_browse:
-        report["browse_tasks"] = do_safe_browse_tasks(mc, tid, max_runs=args.max_browse, browse_sec=args.browse_sec)
+        bres = do_safe_browse_tasks(mc, tid, max_runs=args.max_browse, browse_sec=args.browse_sec)
+        tid = bres.pop("tid", tid)
+        report["browse_tasks"] = bres
 
     # 4. Complete watering milestone tasks ONLY (preserving surplus water & leaving final harvest watering for user)
+    tid = ensure_farm_open(mc)["id"]
     report["watering"] = do_watering(
         mc,
         tid,
