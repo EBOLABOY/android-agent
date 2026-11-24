@@ -39,7 +39,7 @@ python3 /root/.agents/skills/jd-daily/scripts/jd_runner.py status
 ### Step 1：一键执行东东农场全套日常（`farm-all`）
 
 ```bash
-python3 /root/.agents/skills/jd-daily/scripts/jd_runner.py farm-all --water-rounds 4
+python3 /root/.agents/skills/jd-daily/scripts/jd_runner.py farm-all
 ```
 
 脚本自动完成（全程 WebView CDP DOM 直控，零大模型看图等待）：
@@ -47,10 +47,10 @@ python3 /root/.agents/skills/jd-daily/scripts/jd_runner.py farm-all --water-roun
 2. 自动关闭进场弹窗、点击树上 `10水滴` 气泡。
 3. 进入「签到」页完成每日签到（`+20g`）。
 4. 打开「领水滴」任务抽屉，按安全白名单完成所有纯 6 秒浏览任务（每次停留 ~12s 防“浏览时长不足”）并自动点 `去领奖`。
-5. 执行 `--water-rounds 4` 轮「浇 5 次」（共 20 次浇水），每次浇水后 25ms 自动检测并关闭红包抽奖 / 升级福利弹窗（`开心收下` / `femlib-lotterymodal` 关闭按钮）。
-6. 再次打开「领水滴」抽屉领取 `每日累计浇水20次 (+40g)` 及剩余 `去领奖` 奖励，输出 JSON 战报（水滴余额、成长进度、中奖红包记录）。
+5. **持续浇完所有水滴并做完所有阶梯浇水任务（不顾虑是否提前成熟）**：自动循环点击 `浇5次` / `浇水` 直至剩余水滴 `< 10g`（默认 `--keep-water 0`，安全上限 `--max-water-rounds 120`），每轮自动 25ms 关闭红包/升级弹窗；每浇 8 轮自动打开任务抽屉领取新增的累计浇水里程碑奖励（如 10/20/30/50 次奖励）并继续浇完；若果树达到成熟可兑换状态会自动安全停住并在报告中标记 `tree_matured_ready_to_redeem`（绝不擅自下单兑换）。
+6. 结束前再次检查任务抽屉领完所有 `去领奖`，输出 JSON 战报（水滴余额、成长进度、中奖红包记录）。
 
-> 如只需快速浇水或单跑签到，也可单独调用 `farm-water --rounds 4` 或 `bean-signin`（直跳 `bean.m.jd.com/bean/signIndex.action` 尝试领京豆签到）。
+> 如只需把当前余水全部浇完并领取全部浇水奖励，也可单独调用 `farm-water`；如需领京豆签到，可调用 `bean-signin`（直跳 `bean.m.jd.com/bean/signIndex.action`）。
 
 ### Step 2：汇报战果
 
