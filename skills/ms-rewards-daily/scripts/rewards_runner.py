@@ -63,14 +63,14 @@ SEARCH_QUERY_POOL = [
 ]
 
 # Mapping from "Explore on Bing" card keywords (Chinese/English) to reliable Bing search queries
+# NOTE: Place specific domain rules (cruise/flights/plans/insurance/loans) BEFORE generic "优惠/deals"!
 EXPLORE_TOPIC_RULES = [
+    (r"邮轮|启航|cruise", "best caribbean cruise deals and destinations"),
     (r"航班|机票|短途旅行|假期|flight|travel|trip|vacation", "flights from Los Angeles to Tokyo"),
     (r"保险|insurance", "best auto and home insurance plans"),
     (r"贷款|loan|mortgage", "compare personal and student loan rates"),
-    (r"购物|优惠|清单|shopping|deals|discount", "best shopping deals on wireless headphones"),
     (r"美容|护发|香氛|护肤|beauty|haircare|fragrance|skincare", "best skincare and fragrance gift sets"),
     (r"手机套餐|通话|短信|cell phone|phone plan|wireless plan", "best unlimited cell phone plans comparison"),
-    (r"邮轮|启航|cruise", "best caribbean cruise deals and destinations"),
     (r"网络套餐|宽带|internet plan|broadband|wifi plan", "compare high speed home internet plans"),
     (r"餐厅|美食|做饭|晚饭|restaurant|dining|dinner|food", "best local restaurants near me"),
     (r"食谱|做菜|recipe|cook", "easy healthy weeknight dinner recipes"),
@@ -85,6 +85,7 @@ EXPLORE_TOPIC_RULES = [
     (r"股市|股票|finance|stock|market", "sp 500 index performance today"),
     (r"健康|症状|health|wellness|vitamin", "daily stretching routine benefits"),
     (r"鞋|服装|fashion|shoes|sneakers", "best running shoes for daily training"),
+    (r"购物|清单|优惠|shopping|deals|discount", "best shopping deals on wireless headphones"),
 ]
 
 CAPTCHA_RE = re.compile(
@@ -406,6 +407,145 @@ def cmd_status(mc: MCPClient, args):
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
+def cdp_click_rect(mc: MCPClient, tid: str, rect: dict):
+    x = rect["x"] + rect["w"] / 2.0
+    y = rect["y"] + rect["h"] / 2.0
+    mc.cdp(tid, "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+    mc.cdp(tid, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1})
+    mc.cdp(tid, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
+
+
+def complete_dashboard_daily_set(mc: MCPClient, tid: str) -> tuple:
+    """Complete today's Daily Set cards on rewards.bing.com/dashboard.
+    Returns (completed_list, interactive_manual_list).
+    - Daily Poll (+10) & retryable 3-question Quiz (+30): auto-completed via real CDP clicks.
+    - Accuracy-scored quizzes like 'This or That' (+50): NOT blind-clicked; returned in
+      interactive_manual_list so the AI agent can answer each question accurately.
+    """
+    done = []
+    manual = []
+    mc.cdp(tid, "Page.navigate", {"url": "https://rewards.bing.com/dashboard"})
+    time.sleep(3.5)
+    cards = mc.eval_js(
+        tid,
+        """
+        (() => {
+          const res = [];
+          for (const a of Array.from(document.querySelectorAll("a"))) {
+            const href = a.getAttribute("href") || "";
+            const txt = (a.innerText || "").replace(/\\s+/g, " ").trim();
+            if (!txt || txt.includes("已完成") || !/\\+\\d+/.test(txt)) continue;
+            if (href.includes("DailySet") || href.includes("RewardsDailyPoll") || href.includes("REWARDSQUIZ")) {
+              res.push({text: txt.slice(0, 120), href});
+            }
+          }
+          return res;
+        })()
+        """,
+    ) or []
+
+    for card in cards:
+        txt = card["text"]
+        href = card["href"]
+        is_this_or_that = bool(re.search(r"this\s*or\s*that|二选一|\+50", txt, re.IGNORECASE)) or "ThisOrThat" in href
+        if is_this_or_that:
+            manual.append({"reason": "accuracy_scored_quiz_requires_ai_reasoning", **card})
+            continue
+
+        is_poll = "Poll" in href or "投票" in txt or "poll" in txt.lower()
+        is_quiz = "Quiz" in href or "QUIZ" in href or "问答" in txt or "测验" in txt
+
+        # Always click from dashboard first so Rewards registers card activation
+        mc.cdp(tid, "Page.navigate", {"url": "https://rewards.bing.com/dashboard"})
+        time.sleep(2.2)
+        hint = txt.split(" ")[0][:12]
+        mc.eval_js(
+            tid,
+            f"""
+            (() => {{
+              const el = Array.from(document.querySelectorAll("a")).find(a => a.innerText && a.innerText.includes({json.dumps(hint)}));
+              if (el) {{ el.scrollIntoView({{block: "center"}}); el.click(); return true; }}
+              return false;
+            }})()
+            """,
+        )
+        time.sleep(3.5)
+
+        if is_poll:
+            pick = mc.eval_js(
+                tid,
+                """
+                (() => {
+                  const opts = Array.from(document.querySelectorAll("acf-button-standard.btom_opt, .btom_opts > *, #btoption0"));
+                  const el = opts[0];
+                  if (!el) return null;
+                  el.scrollIntoView({block: "center"});
+                  const r = el.getBoundingClientRect();
+                  return {text: (el.innerText || "").trim(), x: r.left, y: r.top, w: r.width, h: r.height};
+                })()
+                """,
+            )
+            if pick and pick.get("w", 0) > 0:
+                cdp_click_rect(mc, tid, pick)
+                time.sleep(2.0)
+            done.append({"type": "poll", "card": txt[:60]})
+        elif is_quiz:
+            tried_by_q = {}
+            for _ in range(15):
+                info = mc.eval_js(
+                    tid,
+                    """
+                    (() => {
+                      const box = document.querySelector(".btom_opts")?.closest("li, div.b_ans") || document.body;
+                      const t = (box.innerText || "").slice(0, 600);
+                      if (/30\\/30|干得好|Great job|You've earned|你已获得|获得 30/i.test(t)) return {done: true};
+                      // Check if a "Next / 下一题" button is visible and click it to advance immediately
+                      const nextEl = Array.from(document.querySelectorAll("acf-button-standard, button, a")).find(e => {
+                        const s = (e.innerText || "").trim();
+                        return /^(下一题|下一步|下一个|Next|Next question)$/i.test(s) && e.getBoundingClientRect().width > 0;
+                      });
+                      if (nextEl) {
+                        const r = nextEl.getBoundingClientRect();
+                        return {done: false, nextBtn: {x: r.left, y: r.top, w: r.width, h: r.height}};
+                      }
+                      const opts = Array.from(document.querySelectorAll("acf-button-standard.btom_opt, .btom_opts > *"));
+                      if (!opts.length) return {done: false, empty: true};
+                      opts[0].scrollIntoView({block: "center"});
+                      const items = opts.map(e => {
+                        const r = e.getBoundingClientRect();
+                        return {
+                          text: (e.innerText || "").trim(),
+                          correctAttr: e.getAttribute("iscorrectoption") || "",
+                          x: r.left, y: r.top, w: r.width, h: r.height
+                        };
+                      });
+                      const qKey = t.split("\\n").slice(0, 3).join("|");
+                      return {done: false, qKey, items};
+                    })()
+                    """,
+                )
+                if info.get("done") or info.get("empty"):
+                    break
+                if info.get("nextBtn"):
+                    cdp_click_rect(mc, tid, info["nextBtn"])
+                    time.sleep(1.2)
+                    continue
+                items = info.get("items") or []
+                tried = tried_by_q.setdefault(info.get("qKey", ""), set())
+                pick = next((it for it in items if it.get("correctAttr", "").lower() == "true" and it["w"] > 0), None)
+                if not pick:
+                    pick = next((it for it in items if it["text"] not in tried and it["w"] > 0), items[0] if items else None)
+                if not pick:
+                    break
+                tried.add(pick["text"])
+                cdp_click_rect(mc, tid, pick)
+                time.sleep(1.5)
+            done.append({"type": "quiz", "card": txt[:60]})
+        else:
+            done.append({"type": "click", "card": txt[:60]})
+    return done, manual
+
+
 def cmd_edge_all(mc: MCPClient, args):
     st = require_guard_active(mc)
     battery = get_battery_level(args.adb)
@@ -413,6 +553,7 @@ def cmd_edge_all(mc: MCPClient, args):
     report = {
         "battery_percent": battery,
         "target_id": tid,
+        "dashboard_daily_set": [],
         "daily_clicked": [],
         "interactive_tasks": [],
         "explore_done": [],
@@ -432,6 +573,13 @@ def cmd_edge_all(mc: MCPClient, args):
         report["stopped_reason"] = "captcha_or_login_required"
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
+
+    # 0. Complete Dashboard Daily Set (3 cards: offer + mobile Shadow-DOM quiz + daily poll)
+    ds_done, ds_manual = complete_dashboard_daily_set(mc, tid)
+    report["dashboard_daily_set"] = ds_done
+    report["interactive_tasks"].extend(ds_manual)
+    mc.cdp(tid, "Page.navigate", {"url": "https://rewards.bing.com/earn"})
+    time.sleep(3.0)
 
     # 1. Click non-interactive daily cards (+5/+10/+15)
     interactive_re = re.compile(r"问答|测验|quiz|poll|投票|选择", re.IGNORECASE)
@@ -574,41 +722,53 @@ def cmd_bing_checkin(mc: MCPClient, args):
     print(json.dumps({"screenshot": str(p)}, ensure_ascii=False, indent=2))
 
 
+def scroll_article_to_bottom(mc: MCPClient, flings: int = 3):
+    """Fast-fling to the very bottom of a Bing news article so Read-to-Earn (+3) triggers reliably."""
+    for _ in range(flings):
+        mc.call("phone_swipe", {"x1": 260, "y1": 1340, "x2": 260, "y2": 200, "duration_ms": 140, "coord_space": "image"})
+        time.sleep(0.35)
+    time.sleep(0.8)
+
+
 def cmd_bing_read(mc: MCPClient, args):
     require_guard_active(mc)
     out_dir = Path(args.out_dir)
-    # First make sure we enter the Read-to-Earn feed from the Bing Rewards lower view
-    open_bing_rewards_and_capture(mc, out_dir, "bing_read_before")
-    # Tap the "阅读以赚取" card (~y=675-740 in lower screenshot)
-    mc.call("phone_tap", {"x": 300, "y": 700, "coord_space": "image"})
-    time.sleep(2.5)
+    ensure_bing_app(mc)
+    # Jump cleanly to Bing Home top and swipe into news feed (independent of Rewards layout)
+    mc.call("phone_tap", {"x": 86, "y": 1515, "coord_space": "image"})
+    time.sleep(0.8)
+    mc.call("phone_tap", {"x": 86, "y": 1515, "coord_space": "image"})
+    time.sleep(1.0)
+    mc.call("phone_swipe", {"x1": 260, "y1": 1350, "x2": 260, "y2": 320, "duration_ms": 240, "coord_space": "image"})
+    time.sleep(0.8)
 
     for _ in range(args.skip):
-        mc.call("phone_swipe", {"x1": 260, "y1": 1350, "x2": 260, "y2": 280, "duration_ms": 210, "coord_space": "image"})
-        time.sleep(0.45)
+        mc.call("phone_swipe", {"x1": 260, "y1": 1350, "x2": 260, "y2": 280, "duration_ms": 190, "coord_space": "image"})
+        time.sleep(0.4)
 
     read_ok = 0
     external_skips = 0
     for i in range(1, args.count + 1):
-        ensure_bing_app(mc)
-        mc.call("phone_swipe", {"x1": 260, "y1": 1320, "x2": 260, "y2": 360, "duration_ms": 280, "coord_space": "image"})
-        time.sleep(0.9)
+        mc.call("phone_swipe", {"x1": 260, "y1": 1350, "x2": 260, "y2": 300, "duration_ms": 230, "coord_space": "image"})
+        time.sleep(0.7)
         mc.call("phone_tap", {"x": 260, "y": 810, "coord_space": "image"})
-        time.sleep(3.2)
+        time.sleep(1.8)
 
         fg = mc.call_json("phone_foreground_app")
-        if fg.get("package") != "com.microsoft.bing":
+        pkg = fg.get("package") or ""
+        # Ignore user's floating SSH client window; only bounce back from actual ad/external redirects
+        if pkg not in ("com.microsoft.bing", "com.server.auditor.ssh.client", ""):
             external_skips += 1
             mc.call("phone_keyevent", {"keycode": "BACK"})
-            time.sleep(0.8)
+            time.sleep(0.7)
             ensure_bing_app(mc)
             continue
 
-        mc.call("phone_swipe", {"x1": 260, "y1": 1100, "x2": 260, "y2": 680, "duration_ms": 250, "coord_space": "image"})
-        time.sleep(1.2)
+        # Bing Read-to-Earn requires scrolling all the way to the bottom of the article!
+        scroll_article_to_bottom(mc, flings=args.flings)
         read_ok += 1
         mc.call("phone_keyevent", {"keycode": "BACK"})
-        time.sleep(1.0)
+        time.sleep(0.75)
 
     after = open_bing_rewards_and_capture(mc, out_dir, "bing_read_after")
     print(
@@ -644,12 +804,61 @@ def cmd_bing_tap_article(mc: MCPClient, args):
     require_guard_active(mc)
     ensure_bing_app(mc)
     mc.call("phone_tap", {"x": args.x, "y": args.y, "coord_space": "image"})
-    time.sleep(3.5)
-    mc.call("phone_swipe", {"x1": 260, "y1": 1100, "x2": 260, "y2": 650, "duration_ms": 260, "coord_space": "image"})
-    time.sleep(1.5)
+    time.sleep(1.8)
+    scroll_article_to_bottom(mc, flings=args.flings)
     mc.call("phone_keyevent", {"keycode": "BACK"})
-    time.sleep(1.0)
-    print(json.dumps({"ok": True, "tapped": [args.x, args.y]}))
+    time.sleep(0.8)
+    print(json.dumps({"ok": True, "tapped": [args.x, args.y], "flings": args.flings}))
+
+
+def cmd_edge_quiz_inspect(mc: MCPClient, args):
+    require_guard_active(mc)
+    tid = ensure_edge_target(mc)
+    if args.url:
+        mc.cdp(tid, "Page.navigate", {"url": args.url})
+        time.sleep(3.5)
+    info = mc.eval_js(
+        tid,
+        """
+        (() => {
+          const opts = Array.from(document.querySelectorAll("acf-button-standard.btom_opt, .btom_opts > *, [id^=rqAnswerOption], .btOptionCard"));
+          return {
+            url: location.href,
+            title: document.title,
+            snippet: (document.body ? document.body.innerText : "").slice(0, 800),
+            options: opts.map(e => {
+              const r = e.getBoundingClientRect();
+              return {text: (e.innerText || "").trim(), x: r.left, y: r.top, w: r.width, h: r.height};
+            })
+          };
+        })()
+        """,
+    )
+    print(json.dumps(info, ensure_ascii=False, indent=2))
+
+
+def cmd_edge_quiz_click(mc: MCPClient, args):
+    require_guard_active(mc)
+    tid = ensure_edge_target(mc)
+    pick = mc.eval_js(
+        tid,
+        f"""
+        (() => {{
+          const target = {json.dumps(args.text)}.toLowerCase();
+          const opts = Array.from(document.querySelectorAll("acf-button-standard.btom_opt, .btom_opts > *, [id^=rqAnswerOption], .btOptionCard, acf-button-standard, button"));
+          const el = opts.find(e => (e.innerText || "").toLowerCase().includes(target) && e.getBoundingClientRect().width > 0);
+          if (!el) return null;
+          el.scrollIntoView({{block: "center"}});
+          const r = el.getBoundingClientRect();
+          return {{text: (el.innerText || "").trim(), x: r.left, y: r.top, w: r.width, h: r.height}};
+        }})()
+        """,
+    )
+    if not pick:
+        raise RuntimeError(f"Option containing {args.text!r} not found")
+    cdp_click_rect(mc, tid, pick)
+    time.sleep(1.8)
+    print(json.dumps({"clicked": pick["text"], "ok": True}, ensure_ascii=False))
 
 
 def main():
@@ -667,16 +876,24 @@ def main():
     sub.add_parser("bing-check", help="Open Bing App Rewards panel and save screenshots")
     sub.add_parser("bing-checkin", help="Tap Bing App daily check-in and screenshot")
 
-    p_read = sub.add_parser("bing-read", help="Read news articles in Bing App for Read to Earn (30/30)")
-    p_read.add_argument("--count", type=int, default=12)
+    p_read = sub.add_parser("bing-read", help="Read news articles in Bing App (fast-fling to bottom for 30/30)")
+    p_read.add_argument("--count", type=int, default=11)
     p_read.add_argument("--skip", type=int, default=0)
+    p_read.add_argument("--flings", type=int, default=3, help="Fast downward flings per article to reach bottom")
 
     p_feed = sub.add_parser("bing-feed-shot", help="Scroll Bing news feed and capture screenshot")
     p_feed.add_argument("--swipes", type=int, default=3)
 
-    p_tap = sub.add_parser("bing-tap-article", help="Tap specific article (image coords), scroll, return")
+    p_tap = sub.add_parser("bing-tap-article", help="Tap specific article (image coords), fling to bottom, return")
     p_tap.add_argument("--x", type=int, required=True)
     p_tap.add_argument("--y", type=int, required=True)
+    p_tap.add_argument("--flings", type=int, default=3)
+
+    p_qi = sub.add_parser("edge-quiz-inspect", help="Inspect current/target quiz question and options in Edge")
+    p_qi.add_argument("--url", default="")
+
+    p_qc = sub.add_parser("edge-quiz-click", help="Click a specific quiz option by text via real CDP mouse event")
+    p_qc.add_argument("--text", required=True)
 
     args = p.parse_args()
     token = resolve_token(args.adb)
@@ -690,6 +907,8 @@ def main():
         "bing-read": cmd_bing_read,
         "bing-feed-shot": cmd_bing_feed_shot,
         "bing-tap-article": cmd_bing_tap_article,
+        "edge-quiz-inspect": cmd_edge_quiz_inspect,
+        "edge-quiz-click": cmd_edge_quiz_click,
     }
     dispatch[args.cmd](mc, args)
 
