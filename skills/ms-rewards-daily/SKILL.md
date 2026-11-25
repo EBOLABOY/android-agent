@@ -49,7 +49,8 @@ python3 /root/.agents/skills/ms-rewards-daily/scripts/rewards_runner.py edge-all
 1. **`rewards.bing.com/dashboard` 每日三件套（Daily Set）**：点击链接卡（+10）、真实 CDP 坐标穿透 Shadow DOM 完成每日投票（+10）与 3 题极速问答（+30）；若遇到计对错的 `This or That (+50)` 会暂停并输出到 `interactive_tasks` 交由 Agent 审题作答。
 2. **`rewards.bing.com/earn` 日常任务**：自动点击未完成的日常任务卡片。
 3. **「在必应上浏览」**：动态识别所有 `已激活` 卡片并按高优先级领域词典精准搜索（邮轮/航班/保险/贷款/套餐等优先于通用词）。
-4. **每日必应搜索（`100/100`）**：按日期轮换多样化搜索词、7.5s 自然间隔补满 `100/100`（遇 15 分钟冷却自动安全停止）。
+4. **每日必应搜索（`100/100`，动态热词 + 随机抖动）**：抓取当日 Bing News 实时热点标题切词 + 84 条中英文日常词库打乱组合（避免重复搜固定词触发兑换风控），配合 `5.7~8.6s` 随机间隔与 `7~10` 条随机批大小（遇 15 分钟冷却自动安全停止）。
+5. **避开右上角悬浮窗**：用户在手机上常开悬浮窗，Bing App 触控与滑动统一在安全中区执行且每次附带 `±18px / ±35ms` 类人随机抖动。
 
 > 若 `interactive_tasks` 中出现 `This or That` 等计对错测验，使用 `edge-quiz-inspect` 查看题目和选项，再由 Agent 判断正确答案并用 `edge-quiz-click --text "<正确选项>"` 逐题作答。
 

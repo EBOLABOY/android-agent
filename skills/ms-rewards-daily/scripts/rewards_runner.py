@@ -10,6 +10,7 @@ import datetime
 import hashlib
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -23,7 +24,7 @@ DEFAULT_ADB = os.environ.get("AGENT_ADB_SERIAL", "192.168.100.100:5555")
 DEFAULT_OUT = "/tmp/ms-rewards-shots"
 BING_PKG = "com.microsoft.bing"
 
-# Diverse pool of natural daily search queries (rotated deterministically by date)
+# Diverse pool of 84+ natural English & Chinese everyday queries (supplemented by live Bing News headlines)
 SEARCH_QUERY_POOL = [
     "xiaomi 13 camera sensor size",
     "kyoto autumn foliage peak dates",
@@ -61,6 +62,54 @@ SEARCH_QUERY_POOL = [
     "how geothermal heat pumps work",
     "camera aperture depth of field chart",
     "portable ssd sequential read speeds",
+    "how heat pump dryers save electricity",
+    "difference between arabica and robusta beans",
+    "best ergonomic office chair lumbar support",
+    "titanium vs stainless steel cookware",
+    "how polarized sunglasses block glare",
+    "best air purifier hepa filter rating",
+    "beginners guide to astrophotography settings",
+    "why airplanes fly at 35000 feet",
+    "how induction cooktops heat pans",
+    "minimalist capsule wardrobe essentials",
+    "best marathon recovery stretching routine",
+    "difference between nvme gen4 and gen5",
+    "how lithium iron phosphate batteries age",
+    "classic neapolitan pizza dough fermentation",
+    "best waterproof trail running shoes",
+    "understanding photography histogram exposure",
+    "how active noise cancellation filters bass",
+    "top botanical gardens to visit in spring",
+    "healthy high protein breakfast recipes",
+    "how optical image stabilization works",
+    "home espresso grinder burr types",
+    "best travel backpack carry on dimensions",
+    "benefits of sleeping in a cool room",
+    "how tidal energy turbines generate power",
+    "手冲咖啡水温与研磨度推荐",
+    "京都红叶季自由行攻略路线",
+    "316L不锈钢与304材质区别对比",
+    "运动跑鞋缓震中底材料科普",
+    "固态电池量产进展与优势分析",
+    "洗碗机软水盐与亮碟剂作用",
+    "机械键盘茶轴与红轴手感区别",
+    "显示器护眼低蓝光认证标准",
+    "婴儿高铁米粉冲调水温建议",
+    "家用空气炸锅和烤箱哪个实用",
+    "Switch健身环大冒险热量消耗",
+    "公路车轮胎胎压与滚阻关系",
+    "单反相机光圈快门ISO入门",
+    "高铁选座靠窗还是过道视野好",
+    "家用全屋WiFi7路由器组网方案",
+    "无线蓝牙耳机LDAC与AAC音质差异",
+    "地中海饮食一周健康食谱搭配",
+    "空调一级能效和三级能效耗电对比",
+    "冬季室内加湿器使用注意事项",
+    "如何挑选耐用的双肩通勤背包",
+    "家庭储能电源功率计算方法",
+    "维生素AD与D3每日补充区别",
+    "跑完半马后如何科学拉伸恢复",
+    "电饭煲柴火饭和快煮模式区别",
 ]
 
 # Mapping from "Explore on Bing" card keywords (Chinese/English) to reliable Bing search queries
@@ -345,7 +394,69 @@ def map_explore_query(card_text: str) -> str:
     return cleaned[:48] if cleaned else "popular travel destinations"
 
 
-def do_bing_search(mc: MCPClient, tid: str, query: str, wait_sec: float = 7.5) -> dict:
+def jitter_swipe(mc: MCPClient, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 220):
+    """Execute a swipe with human-like ±18px / ±35ms jitter, keeping x inside safe middle band [140..440]."""
+    jx1 = max(140, min(440, x1 + random.randint(-18, 18)))
+    jx2 = max(140, min(440, x2 + random.randint(-18, 18)))
+    jy1 = max(180, min(1420, y1 + random.randint(-18, 18)))
+    jy2 = max(150, min(1380, y2 + random.randint(-18, 18)))
+    dur = max(90, duration_ms + random.randint(-35, 35))
+    return mc.call("phone_swipe", {"x1": jx1, "y1": jy1, "x2": jx2, "y2": jy2, "duration_ms": dur, "coord_space": "image"})
+
+
+def clean_headline_to_query(text: str) -> str:
+    """Turn a raw news headline into a clean, natural 3-7 word search phrase (6..42 chars)."""
+    s = re.sub(r"[\"'“”‘’()\[\]{}【】<>《》|｜—–·•:：;；!?！？,，.。]+", " ", text or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return ""
+    if " " in s:
+        words = s.split(" ")[:7]
+        s = " ".join(words)
+    if len(s) > 42:
+        s = s[:42].rsplit(" ", 1)[0] if " " in s[:42] else s[:42]
+    return s.strip() if 6 <= len(s) <= 42 else ""
+
+
+def build_fresh_search_queries(mc: MCPClient, tid: str, count: int = 28) -> list:
+    """Fetch today's live Bing News headlines as fresh non-repeating search queries,
+    shuffled and supplemented with the expanded SEARCH_QUERY_POOL.
+    """
+    live_queries = []
+    seen = set()
+    try:
+        mc.cdp(tid, "Page.navigate", {"url": "https://www.bing.com/news"})
+        time.sleep(random.uniform(2.3, 3.1))
+        raw = mc.eval_js(
+            tid,
+            """
+            (() => {
+              const out = [];
+              for (const a of Array.from(document.querySelectorAll("a.title, .news-card a, [class*=trending] a, h2 a, h3 a"))) {
+                const t = (a.innerText || "").replace(/\\s+/g, " ").trim();
+                if (t.length >= 12 && t.length <= 120) out.push(t);
+                if (out.length >= 40) break;
+              }
+              return out;
+            })()
+            """,
+        ) or []
+        for h in raw:
+            q = clean_headline_to_query(h)
+            if q and q.lower() not in seen:
+                seen.add(q.lower())
+                live_queries.append(q)
+    except Exception:
+        pass
+
+    random.shuffle(live_queries)
+    pool_copy = [q for q in SEARCH_QUERY_POOL if q.lower() not in seen]
+    random.shuffle(pool_copy)
+    combined = live_queries + pool_copy
+    return combined[:count]
+
+
+def do_bing_search(mc: MCPClient, tid: str, query: str, wait_sec: float = 6.0) -> dict:
     mode = mc.eval_js(
         tid,
         f"""
@@ -365,7 +476,7 @@ def do_bing_search(mc: MCPClient, tid: str, query: str, wait_sec: float = 7.5) -
         }})()
         """,
     )
-    time.sleep(wait_sec)
+    time.sleep(random.uniform(max(5.5, wait_sec - 0.3), wait_sec + 2.6))
     chk = mc.eval_js(
         tid,
         f"""
@@ -638,12 +749,13 @@ def cmd_edge_all(mc: MCPClient, args):
     cur = mid.get("bingSearchCurrent")
     cap = mid.get("bingSearchCap") or 100
     if cur is not None and cur < cap:
-        pool = daily_rotated_queries(len(SEARCH_QUERY_POOL))
+        pool = build_fresh_search_queries(mc, tid, count=28)
         pool_idx = 0
         report["search_status"] = "in_progress"
         while cur < cap and pool_idx < len(pool):
             remaining_pts = cap - cur
-            batch_n = min(max(1, (remaining_pts + 4) // 5), 10, len(pool) - pool_idx)
+            batch_cap = random.randint(7, 10)
+            batch_n = min(max(1, (remaining_pts + 4) // 5), batch_cap, len(pool) - pool_idx)
             mc.cdp(tid, "Page.navigate", {"url": "https://www.bing.com/"})
             time.sleep(2.5)
             for _ in range(batch_n):
@@ -887,11 +999,11 @@ def cmd_bing_checkin(mc: MCPClient, args):
 
 
 def scroll_article_to_bottom(mc: MCPClient, flings: int = 3):
-    """Fast-fling to the very bottom of a Bing news article so Read-to-Earn (+3) triggers reliably."""
+    """Fast-fling to the very bottom of a Bing news article with human-like gesture jitter."""
     for _ in range(flings):
-        mc.call("phone_swipe", {"x1": 260, "y1": 1340, "x2": 260, "y2": 200, "duration_ms": 120, "coord_space": "image"})
-        time.sleep(0.28)
-    time.sleep(0.55)
+        jitter_swipe(mc, 260, 1340, 260, 200, duration_ms=125)
+        time.sleep(random.uniform(0.22, 0.42))
+    time.sleep(random.uniform(0.45, 0.90))
 
 
 def find_text_article_tap_ys(img_path: Path) -> list:
@@ -1011,8 +1123,8 @@ def read_bing_via_cdp(mc: MCPClient, feed_tid: str, count: int, flings: int) -> 
 
         batch = [it for it in items if it["key"] not in seen_hrefs]
         if not batch:
-            mc.call("phone_swipe", {"x1": 260, "y1": 1350, "x2": 260, "y2": 260, "duration_ms": 220, "coord_space": "image"})
-            time.sleep(0.9)
+            jitter_swipe(mc, 260, 1350, 260, 260, duration_ms=220)
+            time.sleep(random.uniform(0.75, 1.15))
             continue
 
         for it in batch:
@@ -1046,7 +1158,7 @@ def read_bing_via_cdp(mc: MCPClient, feed_tid: str, count: int, flings: int) -> 
             )
             if not clicked:
                 continue
-            time.sleep(1.7)
+            time.sleep(random.uniform(1.5, 2.2))
 
             fg = mc.call_json("phone_foreground_app")
             pkg = fg.get("package") or ""
@@ -1060,7 +1172,7 @@ def read_bing_via_cdp(mc: MCPClient, feed_tid: str, count: int, flings: int) -> 
             scroll_article_to_bottom(mc, flings=flings)
             read_titles.append(it["title"])
             mc.call("phone_keyevent", {"keycode": "BACK"})
-            time.sleep(0.75)
+            time.sleep(random.uniform(0.6, 1.1))
 
     return {"read_ok": len(read_titles), "read_titles": read_titles, "external_skips": external_skips}
 

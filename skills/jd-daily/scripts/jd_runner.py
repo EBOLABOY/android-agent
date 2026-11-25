@@ -7,6 +7,7 @@ Pure Python 3 standard library (zero external dependencies).
 import argparse
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -451,6 +452,16 @@ def return_to_farm_activity(mc: MCPClient) -> str:
     return ensure_farm_open(mc)["id"]
 
 
+def jitter_swipe(mc: MCPClient, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 220):
+    """Execute a swipe with human-like ±20px / ±40ms jitter inside safe middle region [160..520] x [350..1300]."""
+    jx1 = max(160, min(520, x1 + random.randint(-20, 20)))
+    jx2 = max(160, min(520, x2 + random.randint(-20, 20)))
+    jy1 = max(350, min(1300, y1 + random.randint(-20, 20)))
+    jy2 = max(350, min(1300, y2 + random.randint(-20, 20)))
+    dur = max(110, duration_ms + random.randint(-40, 40))
+    return mc.call("phone_swipe", {"x1": jx1, "y1": jy1, "x2": jx2, "y2": jy2, "duration_ms": dur, "coord_space": "image"})
+
+
 def wait_farm_ready(mc: MCPClient, tid: str, timeout: float = 14.0) -> dict:
     """Poll 东东农场 WebView DOM until React SPA hydrates (waterNum or stage visible)."""
     deadline = time.time() + timeout
@@ -560,16 +571,20 @@ def do_safe_browse_tasks(mc: MCPClient, tid: str, max_runs: int = 24, browse_sec
         if not clicked:
             break
 
-        # Wait for JD 6s countdown with gentle scroll interactions (compact 8.5s total by default)
-        time.sleep(2.0)
-        mc.call("phone_swipe", {"x1": 360, "y1": 1100, "x2": 360, "y2": 680, "duration_ms": 220, "coord_space": "image"})
-        time.sleep(3.0)
-        mc.call("phone_swipe", {"x1": 360, "y1": 1000, "x2": 360, "y2": 720, "duration_ms": 200, "coord_space": "image"})
-        time.sleep(max(1.2, browse_sec - 5.0))
+        # Wait for JD 6s countdown with human-like randomized dwell & jittered micro-scrolls
+        target_sec = random.uniform(max(7.8, browse_sec - 0.4), browse_sec + 2.0)
+        t1 = random.uniform(1.8, 2.7)
+        t2 = random.uniform(2.5, 3.6)
+        rem = max(1.0, target_sec - t1 - t2)
+        time.sleep(t1)
+        jitter_swipe(mc, 360, 1100, 360, 680, duration_ms=220)
+        time.sleep(t2)
+        jitter_swipe(mc, 360, 1000, 360, 720, duration_ms=200)
+        time.sleep(rem)
 
         # Return to 东东农场 BabelActivity in foreground and refresh WebView target_id
         mc.call("phone_keyevent", {"keycode": "BACK"})
-        time.sleep(1.0)
+        time.sleep(random.uniform(0.85, 1.35))
         tid = return_to_farm_activity(mc)
 
         open_task_drawer(mc, tid)
@@ -624,7 +639,7 @@ def do_watering(
         if not res:
             return None
         watered += 1
-        time.sleep(1.8)
+        time.sleep(random.uniform(1.5, 2.3))
         d2 = dismiss_popups(mc, tid)
         if d2.get("redPacket"):
             red_packets.append(d2["redPacket"])
