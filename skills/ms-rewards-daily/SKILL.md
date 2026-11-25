@@ -20,8 +20,8 @@ description: >-
    - **每日投票（Daily Poll, +10）**：无对错，任选一项即得 10 分（脚本自动完成）。
    - **极速问答（Supersonic / Warpspeed / Lightspeed Quiz, +30）**：答错不扣分，但需点中正确选项过关拿满 30 分（脚本自动检测并点击“下一题”推进，拿满即止）。
    - **二选一测验（This or That, +50）**：**每答对 1 题 +5 分，答错 0 分且不可重选！** 脚本检测到 `This or That` 时绝不盲点，会列入 `interactive_tasks`，由 Agent 审题后使用 `edge-quiz-step` 精准点击正确答案。
-4. **阅读新闻触发积分要点（必须纯图文、避开视频）**：Bing App「阅读以赚取（30/30）」**仅支持纯文字新闻**，视频卡片（含 `▶` 播放图标）不计分！脚本 `bing-read` 已内置基于本地 `PIL+numpy` 的视频 `▶` 图标过滤与安全滑底（`--flings 4`），自动跳过视频卡片并点击纯文字新闻；若需排查，仍可用 `bing-feed-shot` + `bing-tap-article` 手工补齐。
-5. **自动下拉刷新面板**：`bing-check` 与 `bing-checkin` 会先下拉刷新 Bing Rewards 面板（避免显示 `上次更新时间：1日前` 的旧缓存），`bing-checkin` 会自动识别第 1~7 天待签入金币位置。
+4. **阅读新闻触发积分要点（0 截屏 WebView CDP 直控）**：Bing App「阅读以赚取（30/30）」**仅支持纯文字新闻**，视频卡片（`/vi-` / 含 `▶` 图标）不计分！若已将 `必应 (com.microsoft.bing)` 加入 `Agent WebView Debug` 作用域，脚本 `bing-read` 自动通过 `@webview_devtools_remote_<pid>` 递归穿透 MSN Shadow DOM，只挑 `a.heading[href*="/ar-"]` 纯文字新闻点击并滑底（**彻底 0 截屏、0 视频误触**）；未开启时自动回退到本地 `PIL+numpy` 像素识图过滤。
+5. **0 截屏面板读写与签入**：`bing-check` 与 `bing-checkin` 在 Bing WebView CDP 就绪时直接通过 20ms DOM 读取积分、`阅读以赚取` 进度并点击 `.check-in-card` 签入（先自动左区下拉刷新防缓存旧数据）；也可直接用仓库一键串联脚本 `python3 /root/android-agent/scripts/daily_all.py` 在 ~4.5 分钟内跑完微软 + 京东全套。
 5. **避开右上角悬浮窗**：用户在手机上常开右上角悬浮窗（`720x1600` 图坐标 `x > 490, y < 420`），Bing App 触控与滑动统一使用中左区域（`x = 260`），且忽略 `com.server.auditor.ssh.client` 焦点。
 6. **不擅自激活第三方促销**（Discord Nitro、盗贼之海等），**绝不执行 `reboot` 或重启 `system_server`**。
 

@@ -320,7 +320,7 @@ def open_task_drawer(mc: MCPClient, tid: str) -> bool:
         """,
     )
     if res:
-        time.sleep(1.2)
+        time.sleep(0.7)
         return True
     return False
 
@@ -338,7 +338,7 @@ def close_task_drawer(mc: MCPClient, tid: str):
         })()
         """,
     )
-    time.sleep(0.8)
+    time.sleep(0.5)
 
 
 def claim_all_drawer_rewards(mc: MCPClient, tid: str) -> int:
@@ -366,7 +366,7 @@ def claim_all_drawer_rewards(mc: MCPClient, tid: str) -> int:
         """,
     )
     if claimed:
-        time.sleep(1.2)
+        time.sleep(0.7)
     return int(claimed or 0)
 
 
@@ -444,10 +444,10 @@ def return_to_farm_activity(mc: MCPClient) -> str:
                 mc.call("phone_tap", {"x": 360, "y": 1142, "coord_space": "image"})
                 time.sleep(0.8)
             mc.call("phone_keyevent", {"keycode": "BACK"})
-            time.sleep(1.4)
+            time.sleep(1.0)
             if attempt in (2, 4):
                 mc.call("phone_tap", {"x": 45, "y": 124, "coord_space": "image"})
-                time.sleep(1.4)
+                time.sleep(1.0)
     return ensure_farm_open(mc)["id"]
 
 
@@ -464,7 +464,7 @@ def wait_farm_ready(mc: MCPClient, tid: str, timeout: float = 14.0) -> dict:
     return last
 
 
-def do_safe_browse_tasks(mc: MCPClient, tid: str, max_runs: int = 24, browse_sec: float = 12.5) -> dict:
+def do_safe_browse_tasks(mc: MCPClient, tid: str, max_runs: int = 24, browse_sec: float = 8.5) -> dict:
     completed = []
     if not open_task_drawer(mc, tid):
         return {"completed": completed, "claims": 0}
@@ -560,16 +560,16 @@ def do_safe_browse_tasks(mc: MCPClient, tid: str, max_runs: int = 24, browse_sec
         if not clicked:
             break
 
-        # Wait for JD 6s countdown with gentle scroll interactions (some pages start timer only after scroll)
-        time.sleep(3.5)
-        mc.call("phone_swipe", {"x1": 360, "y1": 1100, "x2": 360, "y2": 680, "duration_ms": 280, "coord_space": "image"})
-        time.sleep(3.5)
-        mc.call("phone_swipe", {"x1": 360, "y1": 1000, "x2": 360, "y2": 720, "duration_ms": 240, "coord_space": "image"})
-        time.sleep(max(1.5, browse_sec - 7.0))
+        # Wait for JD 6s countdown with gentle scroll interactions (compact 8.5s total by default)
+        time.sleep(2.0)
+        mc.call("phone_swipe", {"x1": 360, "y1": 1100, "x2": 360, "y2": 680, "duration_ms": 220, "coord_space": "image"})
+        time.sleep(3.0)
+        mc.call("phone_swipe", {"x1": 360, "y1": 1000, "x2": 360, "y2": 720, "duration_ms": 200, "coord_space": "image"})
+        time.sleep(max(1.2, browse_sec - 5.0))
 
         # Return to 东东农场 BabelActivity in foreground and refresh WebView target_id
         mc.call("phone_keyevent", {"keycode": "BACK"})
-        time.sleep(1.6)
+        time.sleep(1.0)
         tid = return_to_farm_activity(mc)
 
         open_task_drawer(mc, tid)
@@ -1435,7 +1435,7 @@ def main():
     p_all.add_argument("--keep-water", type=int, default=0, help="Minimum water (g) to keep when water-mode=all")
     p_all.add_argument("--allow-mature", action="store_true", help="Allow watering through final harvest (default pauses <=5%% before harvest for user)")
     p_all.add_argument("--max-browse", type=int, default=24)
-    p_all.add_argument("--browse-sec", type=float, default=12.5)
+    p_all.add_argument("--browse-sec", type=float, default=8.5)
     p_all.add_argument("--skip-browse", action="store_true")
 
     p_w = sub.add_parser("farm-water", help="Water 东东农场 (default mode=tasks: finish watering milestone tasks only)")

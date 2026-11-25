@@ -21,6 +21,7 @@ from pathlib import Path
 DEFAULT_HOST = os.environ.get("AGENT_HOST", "http://192.168.100.100:8765")
 DEFAULT_ADB = os.environ.get("AGENT_ADB_SERIAL", "192.168.100.100:5555")
 DEFAULT_OUT = "/tmp/ms-rewards-shots"
+BING_PKG = "com.microsoft.bing"
 
 # Diverse pool of natural daily search queries (rotated deterministically by date)
 SEARCH_QUERY_POOL = [
@@ -194,19 +195,21 @@ class MCPClient:
         res = self.call(name, args)
         return json.loads(res["content"][0]["text"])
 
-    def cdp(self, target_id: str, method: str, params: dict = None) -> dict:
+    def cdp(self, target_id: str, method: str, params: dict = None, socket: str = None) -> dict:
         args = {"method": method}
+        if socket:
+            args["socket"] = socket
         if target_id:
             args["target_id"] = target_id
         if params is not None:
             args["params"] = params
         return self.call_json("cdp_command", args)["result"]
 
-    def eval_js(self, target_id: str, expr: str, await_promise: bool = False):
+    def eval_js(self, target_id: str, expr: str, await_promise: bool = False, socket: str = None):
         params = {"expression": expr, "returnByValue": True}
         if await_promise:
             params["awaitPromise"] = True
-        r = self.cdp(target_id, "Runtime.evaluate", params)
+        r = self.cdp(target_id, "Runtime.evaluate", params, socket=socket)
         if "exceptionDetails" in r:
             raise RuntimeError(f"JS exception: {json.dumps(r['exceptionDetails'], ensure_ascii=False)}")
         return r.get("result", {}).get("value")
@@ -640,7 +643,7 @@ def cmd_edge_all(mc: MCPClient, args):
         report["search_status"] = "in_progress"
         while cur < cap and pool_idx < len(pool):
             remaining_pts = cap - cur
-            batch_n = min(max(1, (remaining_pts + 4) // 5), 6, len(pool) - pool_idx)
+            batch_n = min(max(1, (remaining_pts + 4) // 5), 10, len(pool) - pool_idx)
             mc.cdp(tid, "Page.navigate", {"url": "https://www.bing.com/"})
             time.sleep(2.5)
             for _ in range(batch_n):
@@ -684,17 +687,94 @@ def ensure_bing_app(mc: MCPClient):
         time.sleep(2.2)
 
 
-def open_bing_rewards_and_capture(mc: MCPClient, out_dir: Path, prefix: str) -> dict:
+def find_bing_webview_targets(mc: MCPClient) -> dict:
+    """Return {'feed': tid_or_None, 'rewards': tid_or_None} from Bing WebView CDP (@webview_devtools_remote_<pid>)."""
+    out = {"feed": None, "rewards": None}
+    try:
+        res = mc.call_json("cdp_list_targets", {"socket": BING_PKG})
+    except Exception:
+        return out
+    if not res.get("available"):
+        return out
+    for t in res.get("targets") or []:
+        if t.get("type") != "page":
+            continue
+        url = t.get("url") or ""
+        title = t.get("title") or ""
+        if "superapp.msn.com/homepagefeed" in url:
+            out["feed"] = t["id"]
+        elif title == "Rewards" or "miniapps" in url:
+            out["rewards"] = t["id"]
+    return out
+
+
+def ensure_bing_rewards_webview(mc: MCPClient) -> str:
+    """Open Bing App Rewards panel and return its WebView target_id if LSPosed WebView Debug is active, else None."""
     ensure_bing_app(mc)
-    # Tap Home twice to jump to top of Bing Home
+    tgts = find_bing_webview_targets(mc)
+    if tgts["rewards"]:
+        return tgts["rewards"]
+    # Tap Home twice -> bottom-left Rewards card
+    mc.call("phone_tap", {"x": 86, "y": 1515, "coord_space": "image"})
+    time.sleep(0.6)
+    mc.call("phone_tap", {"x": 86, "y": 1515, "coord_space": "image"})
+    time.sleep(0.8)
+    mc.call("phone_tap", {"x": 150, "y": 1270, "coord_space": "image"})
+    for _ in range(8):
+        time.sleep(0.6)
+        tgts = find_bing_webview_targets(mc)
+        if tgts["rewards"]:
+            return tgts["rewards"]
+    return None
+
+
+def read_bing_rewards_dom(mc: MCPClient, r_tid: str, refresh: bool = True) -> dict:
+    """Read live Bing Rewards miniapp points, check-in status, and Read-to-Earn progress in ~20ms (0 screenshots)."""
+    if refresh:
+        # Left-side pull-to-refresh or reload clears any stale 1-day-old cache cleanly
+        mc.call("phone_swipe", {"x1": 260, "y1": 460, "x2": 260, "y2": 1150, "duration_ms": 220, "coord_space": "image"})
+        time.sleep(2.2)
+    return mc.eval_js(
+        r_tid,
+        """
+        (() => {
+          const txt = (document.body?.innerText || "");
+          const ptsM = txt.match(/([\\d,]+)\\s*\\n\\s*积分/);
+          const todayM = txt.match(/今日积分\\s*\\n\\s*(\\d+\\/\\d+)/);
+          const readM = txt.match(/阅读以赚取[\\s\\S]{0,60}?(\\d+(?:\\s*\\/\\s*30)?)/);
+          const checkinM = txt.match(/签入\\s*\\n\\s*(\\d+)/);
+          const days = Array.from(document.querySelectorAll(".check-in-card")).slice(0, 7).map(c => ({
+            text: (c.innerText || "").replace(/\\s+/g, " ").trim(),
+            inactive: !!c.querySelector(".inActive"),
+          }));
+          return {
+            cdp_mode: true,
+            points: ptsM ? ptsM[1] : null,
+            todayProgress: todayM ? todayM[1] : null,
+            readToEarn: readM ? readM[1].replace(/\\s+/g, "") : null,
+            checkinReward: checkinM ? checkinM[1] : null,
+            days,
+            snippet: txt.slice(0, 350),
+          };
+        })()
+        """,
+        socket=BING_PKG,
+    ) or {"cdp_mode": True}
+
+
+def open_bing_rewards_and_capture(mc: MCPClient, out_dir: Path, prefix: str) -> dict:
+    r_tid = ensure_bing_rewards_webview(mc)
+    if r_tid:
+        return read_bing_rewards_dom(mc, r_tid, refresh=True)
+
+    # Fallback: screenshot mode when Bing WebView Debug is not enabled
+    ensure_bing_app(mc)
     mc.call("phone_tap", {"x": 86, "y": 1515, "coord_space": "image"})
     time.sleep(0.8)
     mc.call("phone_tap", {"x": 86, "y": 1515, "coord_space": "image"})
     time.sleep(1.2)
-    # Tap bottom-left Rewards card
     mc.call("phone_tap", {"x": 150, "y": 1270, "coord_space": "image"})
     time.sleep(2.5)
-    # Pull-to-refresh on the left side so Bing App never displays stale "1日前" cached points
     mc.call("phone_swipe", {"x1": 260, "y1": 460, "x2": 260, "y2": 1150, "duration_ms": 260, "coord_space": "image"})
     time.sleep(2.8)
 
@@ -704,7 +784,7 @@ def open_bing_rewards_and_capture(mc: MCPClient, out_dir: Path, prefix: str) -> 
     mc.call("phone_swipe", {"x1": 260, "y1": 1200, "x2": 260, "y2": 500, "duration_ms": 300, "coord_space": "image"})
     time.sleep(1.0)
     mc.screenshot(p2)
-    return {"top_screenshot": str(p1), "lower_screenshot": str(p2)}
+    return {"cdp_mode": False, "top_screenshot": str(p1), "lower_screenshot": str(p2)}
 
 
 def cmd_bing_check(mc: MCPClient, args):
@@ -715,7 +795,7 @@ def cmd_bing_check(mc: MCPClient, args):
 
 
 def detect_checkin_day_x(img_path: Path) -> int:
-    """Scan the 7 day-coin slots at y=916 in 720x1600 Rewards panel to find the active claimable Day coin."""
+    """Fallback pixel scan: 7 day-coin slots at y=916 in 720x1600 Rewards panel."""
     slots = [88, 178, 270, 360, 450, 540, 630]
     try:
         from PIL import Image
@@ -724,7 +804,6 @@ def detect_checkin_day_x(img_path: Path) -> int:
         arr = np.asarray(Image.open(img_path).convert("RGB"), dtype=np.float32)
         for sx in slots:
             patch = arr[896:936, sx - 20 : sx + 20]
-            # Claimable today's coin has a thin outer ring / light warm gold fill (higher brightness than solid orange checked)
             r, g, b = patch[:, :, 0], patch[:, :, 1], patch[:, :, 2]
             pale_gold = np.mean((r > 235) & (g > 205) & (g < 245) & (b > 130) & (b < 200))
             if pale_gold > 0.25:
@@ -737,8 +816,47 @@ def detect_checkin_day_x(img_path: Path) -> int:
 def cmd_bing_checkin(mc: MCPClient, args):
     require_guard_active(mc)
     out_dir = Path(args.out_dir)
+
+    # 0-screenshot CDP path if Bing Rewards WebView is active
+    r_tid = ensure_bing_rewards_webview(mc)
+    if r_tid:
+        dom_before = read_bing_rewards_dom(mc, r_tid, refresh=True)
+        # Click active unclaimed day card via DOM (or expand 签入 row first)
+        clicked = mc.eval_js(
+            r_tid,
+            f"""
+            (() => {{
+              const dayArg = {int(getattr(args, "day", 0) or 0)};
+              const title = Array.from(document.querySelectorAll(".title, div, span")).find(e => (e.innerText || "").trim() === "签入");
+              let cards = Array.from(document.querySelectorAll(".check-in-card")).filter(c => c.getBoundingClientRect().width > 0);
+              if (!cards.length && title) {{
+                title.scrollIntoView({{block: "center"}});
+                title.click();
+              }}
+              cards = Array.from(document.querySelectorAll(".check-in-card"));
+              let target = null;
+              if (dayArg >= 1 && dayArg <= 7 && cards[dayArg - 1]) {{
+                target = cards[dayArg - 1];
+              }} else {{
+                // Last non-inactive check-in card is today's active Day slot
+                const active = cards.filter(c => !c.querySelector(".inActive"));
+                if (active.length) target = active[active.length - 1];
+              }}
+              if (!target) return null;
+              target.scrollIntoView({{block: "center"}});
+              target.click();
+              return (target.innerText || "").replace(/\\s+/g, " ").trim();
+            }})()
+            """,
+            socket=BING_PKG,
+        )
+        time.sleep(2.0)
+        dom_after = read_bing_rewards_dom(mc, r_tid, refresh=False)
+        print(json.dumps({"cdp_mode": True, "clicked": clicked, "before_points": dom_before.get("points"), "after": dom_after}, ensure_ascii=False, indent=2))
+        return
+
+    # Fallback: screenshot mode
     ensure_bing_app(mc)
-    # Navigate to top of refreshed Rewards panel
     mc.call("phone_tap", {"x": 86, "y": 1515, "coord_space": "image"})
     time.sleep(0.8)
     mc.call("phone_tap", {"x": 86, "y": 1515, "coord_space": "image"})
@@ -756,7 +874,6 @@ def cmd_bing_checkin(mc: MCPClient, args):
     else:
         day_x = detect_checkin_day_x(pre)
         if not day_x:
-            # Expand 签入 row first, then re-detect
             mc.call("phone_tap", {"x": 260, "y": 805, "coord_space": "image"})
             time.sleep(1.0)
             mc.screenshot(pre)
@@ -766,15 +883,15 @@ def cmd_bing_checkin(mc: MCPClient, args):
     time.sleep(2.2)
     p = out_dir / "bing_checkin_after.jpg"
     mc.screenshot(p)
-    print(json.dumps({"screenshot": str(p), "tapped_x": day_x}, ensure_ascii=False, indent=2))
+    print(json.dumps({"cdp_mode": False, "screenshot": str(p), "tapped_x": day_x}, ensure_ascii=False, indent=2))
 
 
-def scroll_article_to_bottom(mc: MCPClient, flings: int = 4):
+def scroll_article_to_bottom(mc: MCPClient, flings: int = 3):
     """Fast-fling to the very bottom of a Bing news article so Read-to-Earn (+3) triggers reliably."""
     for _ in range(flings):
-        mc.call("phone_swipe", {"x1": 260, "y1": 1340, "x2": 260, "y2": 200, "duration_ms": 140, "coord_space": "image"})
-        time.sleep(0.35)
-    time.sleep(0.8)
+        mc.call("phone_swipe", {"x1": 260, "y1": 1340, "x2": 260, "y2": 200, "duration_ms": 120, "coord_space": "image"})
+        time.sleep(0.28)
+    time.sleep(0.55)
 
 
 def find_text_article_tap_ys(img_path: Path) -> list:
@@ -852,22 +969,140 @@ def find_text_article_tap_ys(img_path: Path) -> list:
     return tap_ys
 
 
+def read_bing_via_cdp(mc: MCPClient, feed_tid: str, count: int, flings: int) -> dict:
+    """0-screenshot Shadow-DOM text-only Bing Read-to-Earn: walks MSN homepagefeed WebView,
+    selects only pure-text a.heading[href*='/ar-'] links (never /vi- videos or ad-slugs),
+    clicks each distinct article, flings to bottom, and returns cleanly.
+    """
+    seen_hrefs = set()
+    read_titles = []
+    external_skips = 0
+    max_scrolls = max(12, count * 2)
+
+    for _ in range(max_scrolls):
+        if len(read_titles) >= count:
+            break
+        items = mc.eval_js(
+            feed_tid,
+            """
+            (() => {
+              const out = [];
+              function walk(root, depth) {
+                if (!root || depth > 8) return;
+                for (const el of (root.querySelectorAll ? root.querySelectorAll("*") : [])) {
+                  if (el.tagName === "A") {
+                    const href = el.getAttribute("href") || "";
+                    const cls = (el.className || "");
+                    const txt = (el.innerText || "").replace(/\\s+/g, " ").trim();
+                    if (cls.includes("heading") && href.includes("msn.com/") && href.includes("/ar-") && !href.includes("/vi-") && txt.length > 8) {
+                      const key = href.split("?")[0];
+                      if (!out.some(x => x.key === key)) out.push({key, title: txt.slice(0, 70)});
+                    }
+                  }
+                  if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+                }
+              }
+              walk(document, 0);
+              return out;
+            })()
+            """,
+            socket=BING_PKG,
+        ) or []
+
+        batch = [it for it in items if it["key"] not in seen_hrefs]
+        if not batch:
+            mc.call("phone_swipe", {"x1": 260, "y1": 1350, "x2": 260, "y2": 260, "duration_ms": 220, "coord_space": "image"})
+            time.sleep(0.9)
+            continue
+
+        for it in batch:
+            if len(read_titles) >= count:
+                break
+            seen_hrefs.add(it["key"])
+            clicked = mc.eval_js(
+                feed_tid,
+                f"""
+                (() => {{
+                  const want = {json.dumps(it["key"])};
+                  let found = null;
+                  function walk(root, depth) {{
+                    if (!root || depth > 8 || found) return;
+                    for (const el of (root.querySelectorAll ? root.querySelectorAll("*") : [])) {{
+                      if (el.tagName === "A") {{
+                        const href = el.getAttribute("href") || "";
+                        if (href.split("?")[0] === want) {{ found = el; return; }}
+                      }}
+                      if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+                    }}
+                  }}
+                  walk(document, 0);
+                  if (!found) return false;
+                  found.scrollIntoView({{block: "center"}});
+                  found.click();
+                  return true;
+                }})()
+                """,
+                socket=BING_PKG,
+            )
+            if not clicked:
+                continue
+            time.sleep(1.7)
+
+            fg = mc.call_json("phone_foreground_app")
+            pkg = fg.get("package") or ""
+            if pkg not in (BING_PKG, "com.server.auditor.ssh.client", ""):
+                external_skips += 1
+                mc.call("phone_keyevent", {"keycode": "BACK"})
+                time.sleep(0.6)
+                ensure_bing_app(mc)
+                continue
+
+            scroll_article_to_bottom(mc, flings=flings)
+            read_titles.append(it["title"])
+            mc.call("phone_keyevent", {"keycode": "BACK"})
+            time.sleep(0.75)
+
+    return {"read_ok": len(read_titles), "read_titles": read_titles, "external_skips": external_skips}
+
+
 def cmd_bing_read(mc: MCPClient, args):
     require_guard_active(mc)
     out_dir = Path(args.out_dir)
     ensure_bing_app(mc)
-    # Jump cleanly to Bing Home top and swipe into news feed
+    # Jump cleanly to Bing Home top and swipe once into news feed
     mc.call("phone_tap", {"x": 86, "y": 1515, "coord_space": "image"})
-    time.sleep(0.8)
+    time.sleep(0.7)
     mc.call("phone_tap", {"x": 86, "y": 1515, "coord_space": "image"})
-    time.sleep(1.0)
-    mc.call("phone_swipe", {"x1": 260, "y1": 1350, "x2": 260, "y2": 320, "duration_ms": 240, "coord_space": "image"})
+    time.sleep(0.9)
+    mc.call("phone_swipe", {"x1": 260, "y1": 1350, "x2": 260, "y2": 320, "duration_ms": 220, "coord_space": "image"})
     time.sleep(0.8)
 
     for _ in range(args.skip):
         mc.call("phone_swipe", {"x1": 260, "y1": 1350, "x2": 260, "y2": 280, "duration_ms": 190, "coord_space": "image"})
         time.sleep(0.4)
 
+    tgts = find_bing_webview_targets(mc)
+    if tgts["feed"]:
+        res = read_bing_via_cdp(mc, tgts["feed"], count=args.count, flings=args.flings)
+        after = open_bing_rewards_and_capture(mc, out_dir, "bing_read_after")
+        print(
+            json.dumps(
+                {
+                    "cdp_mode": True,
+                    "attempted": args.count,
+                    "read_ok": res["read_ok"],
+                    "external_skips": res["external_skips"],
+                    "read_titles": res["read_titles"][:12],
+                    "battery_percent": get_battery_level(args.adb),
+                    "after": after,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    # Fallback: PIL+numpy local pixel filter (when Bing WebView Debug is not enabled)
     read_ok = 0
     video_or_empty_scrolls = 0
     external_skips = 0
@@ -909,6 +1144,7 @@ def cmd_bing_read(mc: MCPClient, args):
     print(
         json.dumps(
             {
+                "cdp_mode": False,
                 "attempted": args.count,
                 "read_ok": read_ok,
                 "video_or_empty_scrolls": video_or_empty_scrolls,
@@ -1007,16 +1243,16 @@ def main():
     sub.add_parser("status", help="Check daemon, guard, battery, and Rewards summary")
 
     p_edge = sub.add_parser("edge-all", help="Run all Edge CDP Rewards tasks (daily + explore + search)")
-    p_edge.add_argument("--search-interval", type=float, default=7.5)
+    p_edge.add_argument("--search-interval", type=float, default=6.0)
 
-    sub.add_parser("bing-check", help="Open Bing App Rewards panel and save screenshots")
-    p_ci = sub.add_parser("bing-checkin", help="Tap Bing App daily check-in and screenshot")
+    sub.add_parser("bing-check", help="Check Bing App Rewards panel (0-screenshot CDP when live, else screenshots)")
+    p_ci = sub.add_parser("bing-checkin", help="Tap Bing App daily check-in (0-screenshot CDP when live)")
     p_ci.add_argument("--day", type=int, default=0, help="Optional Day 1-7 slot override (0=auto detect)")
 
-    p_read = sub.add_parser("bing-read", help="Read text-only news articles in Bing App (filters out video cards)")
-    p_read.add_argument("--count", type=int, default=11)
+    p_read = sub.add_parser("bing-read", help="Read text-only news articles in Bing App (0-screenshot WebView CDP when live, else PIL filter)")
+    p_read.add_argument("--count", type=int, default=10)
     p_read.add_argument("--skip", type=int, default=0)
-    p_read.add_argument("--flings", type=int, default=4, help="Fast downward flings per article to reach bottom")
+    p_read.add_argument("--flings", type=int, default=3, help="Fast downward flings per article to reach bottom")
 
     p_feed = sub.add_parser("bing-feed-shot", help="Scroll Bing news feed and capture screenshot")
     p_feed.add_argument("--swipes", type=int, default=3)

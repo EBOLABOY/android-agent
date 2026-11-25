@@ -45,13 +45,15 @@
 │   ├── build_apk.sh                   # aapt2 + smali + zipalign + apksigner 一键打包签名
 │   └── smali/com/agent/webviewdebug/
 ├── skills/
-│   ├── ms-rewards-daily/              # Microsoft Rewards 每日全自动积分技能（Edge CDP + Bing App）
+│   ├── ms-rewards-daily/              # Microsoft Rewards 每日全自动积分技能（Edge CDP + Bing WebView CDP 0截屏）
 │   │   ├── SKILL.md
 │   │   └── scripts/rewards_runner.py
 │   └── jd-daily/                      # 京东每日极速任务与自动优质评价技能（WebView CDP 东东农场 + 领京豆 + 百字 5 星自动好评）
 │       ├── SKILL.md
 │       └── scripts/jd_runner.py
-├── scripts/build.sh                   # 一键汇编 cliphelper.jar + go test -race + ARM64 静态交叉编译
+├── scripts/
+│   ├── build.sh                       # 一键汇编 cliphelper.jar + go test -race + ARM64 静态交叉编译
+│   └── daily_all.py                   # 一键串联每日微软积分 + 京东全套任务（全链路 WebView CDP，~4.5 分钟）
 └── README.md
 ```
 
