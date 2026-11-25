@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -154,19 +155,62 @@ def find_farm_target(mc: MCPClient):
     return None
 
 
-def ensure_farm_open(mc: MCPClient) -> dict:
+def open_jd_h5_deeplink(adb_serial: str, url: str) -> bool:
+    """Jump directly to a JD Babel/H5 activity via JD's openapp.jdmobile:// deep link."""
+    try:
+        params = urllib.parse.quote(json.dumps({"category": "jump", "des": "m", "url": url}, separators=(",", ":")))
+        uri = f"openapp.jdmobile://virtual?params={params}"
+        subprocess.run(
+            ["adb", "-s", adb_serial, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", uri, JD_PKG],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def ensure_farm_open(mc: MCPClient, adb_serial: str = DEFAULT_ADB) -> dict:
     """Bring JD foreground and ensure 东东农场 WebView target is live."""
     mc.call("phone_launch_app", {"package": JD_PKG})
-    time.sleep(2.5)
+    time.sleep(1.8)
     t = find_farm_target(mc)
     if t:
         return t
 
-    # Open 东东农场 via JD search bar using Chinese clipboard input
+    # Primary: direct JD deep link to 东东农场 (works regardless of active bottom tab!)
+    if open_jd_h5_deeplink(adb_serial, "https://pro.m.jd.com/mall/active/42HV4J3Q87B2xFQMJk81PCc1mEs3/index.html"):
+        for _ in range(8):
+            time.sleep(1.0)
+            t = find_farm_target(mc)
+            if t:
+                return t
+
+    # Fallback: return to MainFrameActivity, tap real 首页 tab (155, 1515; 东东 mascot is at far-left 0..68), then search
+    for _ in range(5):
+        fg = mc.call_json("phone_foreground_app")
+        if fg.get("package") == JD_PKG and "MainFrameActivity" in (fg.get("activity") or ""):
+            break
+        if fg.get("package") not in (JD_PKG, "com.server.auditor.ssh.client", ""):
+            mc.call("phone_launch_app", {"package": JD_PKG})
+            time.sleep(1.5)
+        else:
+            mc.call("phone_keyevent", {"keycode": "BACK"})
+            time.sleep(1.2)
+        t = find_farm_target(mc)
+        if t:
+            return t
+
+    mc.call("phone_tap", {"x": 155, "y": 1515, "coord_space": "image"})
+    time.sleep(0.8)
+    mc.call("phone_tap", {"x": 155, "y": 1515, "coord_space": "image"})
+    time.sleep(1.0)
+
     mc.call("phone_tap", {"x": 300, "y": 200, "coord_space": "image"})
     time.sleep(1.2)
     mc.call("phone_input_text", {"text": "东东农场", "method": "clipboard", "submit": True})
-    for _ in range(10):
+    for _ in range(12):
         time.sleep(1.0)
         t = find_farm_target(mc)
         if t:
@@ -407,14 +451,31 @@ def return_to_farm_activity(mc: MCPClient) -> str:
     return ensure_farm_open(mc)["id"]
 
 
-def do_safe_browse_tasks(mc: MCPClient, tid: str, max_runs: int = 16, browse_sec: float = 12.0) -> dict:
+def wait_farm_ready(mc: MCPClient, tid: str, timeout: float = 14.0) -> dict:
+    """Poll 东东农场 WebView DOM until React SPA hydrates (waterNum or stage visible)."""
+    deadline = time.time() + timeout
+    last = {}
+    while time.time() < deadline:
+        last = read_farm_summary(mc, tid)
+        snip = last.get("snippet") or ""
+        if last.get("waterNum") is not None or last.get("needPrize") or last.get("matured") or re.search(r"再浇|浇水|浇5次", snip):
+            return last
+        time.sleep(1.0)
+    return last
+
+
+def do_safe_browse_tasks(mc: MCPClient, tid: str, max_runs: int = 24, browse_sec: float = 12.5) -> dict:
     completed = []
     if not open_task_drawer(mc, tid):
         return {"completed": completed, "claims": 0}
     claims = claim_all_drawer_rewards(mc, tid)
     tried_counts = {}
+    stalled_progress = {}
 
     for _ in range(max_runs):
+        # Always claim completed step rewards first so (cur/target) advances cleanly
+        claims += claim_all_drawer_rewards(mc, tid)
+
         # Scan ALL task cards in DOM (even below fold!) and find first SAFE browse task
         cand = mc.eval_js(
             JD_PKG,
@@ -449,19 +510,26 @@ def do_safe_browse_tasks(mc: MCPClient, tid: str, max_runs: int = 16, browse_sec
                 continue
             if not SAFE_BROWSE_RE.search(rtxt):
                 continue
-            # Allow multi-count tasks like 精选活动推荐(0/9) up to target+1 tries; single tasks max 1 try
             m_prog = re.search(r"[（(](\d+)/(\d+)[）)]", rtxt)
-            max_tries = (int(m_prog.group(2)) + 1) if (m_prog and int(m_prog.group(2)) > 1) else 1
+            cur_n = int(m_prog.group(1)) if m_prog else 0
+            tgt_n = int(m_prog.group(2)) if m_prog else 1
             key = re.sub(r"[（(]\d+/\d+[）)]", "", rtxt)[:24]
+            max_tries = (tgt_n + 6) if tgt_n > 1 else 2
             if tried_counts.get(key, 0) >= max_tries:
                 continue
-            chosen = (r, key)
+            # Also stop retrying if stuck at exact same cur_n 3 times in a row
+            prev_cur, same_cnt = stalled_progress.get(key, (-1, 0))
+            if cur_n == prev_cur and same_cnt >= 3:
+                continue
+            chosen = (r, key, cur_n)
             break
 
         if not chosen:
             break
-        r, key = chosen
+        r, key, cur_n = chosen
         tried_counts[key] = tried_counts.get(key, 0) + 1
+        prev_cur, same_cnt = stalled_progress.get(key, (-1, 0))
+        stalled_progress[key] = (cur_n, (same_cnt + 1) if cur_n == prev_cur else 1)
 
         # Scroll into view and click the chosen row's button via DOM
         clicked = mc.eval_js(
@@ -492,10 +560,13 @@ def do_safe_browse_tasks(mc: MCPClient, tid: str, max_runs: int = 16, browse_sec
         if not clicked:
             break
 
-        # Wait for JD 6s countdown (3.5s load + gentle scroll + remainder)
+        # Wait for JD 6s countdown with gentle scroll interactions (some pages start timer only after scroll)
         time.sleep(3.5)
         mc.call("phone_swipe", {"x1": 360, "y1": 1100, "x2": 360, "y2": 680, "duration_ms": 280, "coord_space": "image"})
-        time.sleep(max(1.0, browse_sec - 3.5))
+        time.sleep(3.5)
+        mc.call("phone_swipe", {"x1": 360, "y1": 1000, "x2": 360, "y2": 720, "duration_ms": 240, "coord_space": "image"})
+        time.sleep(max(1.5, browse_sec - 7.0))
+
         # Return to 东东农场 BabelActivity in foreground and refresh WebView target_id
         mc.call("phone_keyevent", {"keycode": "BACK"})
         time.sleep(1.6)
@@ -708,7 +779,8 @@ def cmd_farm_water(mc: MCPClient, args):
 def cmd_farm_all(mc: MCPClient, args):
     require_guard_active(mc)
     tid = return_to_farm_activity(mc)
-    report = {"before": read_farm_summary(mc, tid)}
+    before = wait_farm_ready(mc, tid, timeout=14.0)
+    report = {"before": before}
     if report["before"].get("needPrize"):
         report["stopped_reason"] = "prize_selection_required"
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -717,24 +789,28 @@ def cmd_farm_all(mc: MCPClient, args):
     dismiss_popups(mc, tid)
 
     # 1. Collect tree floating 10g water bubble & left-side "10水滴(领)" entry if present
-    mc.eval_js(
+    bubble_res = mc.eval_js(
         JD_PKG,
         tid,
         """
         (() => {
+          const hits = [];
           const b = document.querySelector(".FixedTaskIcon_fixed_task_img__388lV");
-          if (b) b.click();
+          if (b) { b.click(); hits.push("tree_bubble"); }
           const left10 = Array.from(document.querySelectorAll(".LeftTaskEntry_task_item__o3Mg-")).find(e => (e.innerText||"").includes("10水滴"));
-          if (left10) left10.click();
+          if (left10) { left10.click(); hits.push("left_10g"); }
+          return hits;
         })()
         """,
     )
+    report["bubbles_clicked"] = bubble_res or []
     time.sleep(1.0)
     dismiss_popups(mc, tid)
 
     # 2. Daily sign-in
     report["signin"] = do_farm_signin(mc, tid)
     tid = ensure_farm_open(mc)["id"]
+    wait_farm_ready(mc, tid, timeout=10.0)
     dismiss_popups(mc, tid)
 
     # 3. Safe 6s browse tasks (accumulate continuous water drops)
@@ -745,6 +821,7 @@ def cmd_farm_all(mc: MCPClient, args):
 
     # 4. Complete watering milestone tasks ONLY (preserving surplus water & leaving final harvest watering for user)
     tid = ensure_farm_open(mc)["id"]
+    wait_farm_ready(mc, tid, timeout=10.0)
     report["watering"] = do_watering(
         mc,
         tid,
@@ -763,33 +840,115 @@ def cmd_farm_all(mc: MCPClient, args):
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
-def cmd_bean_signin(mc: MCPClient, _args):
+def find_bean_target(mc: MCPClient):
+    try:
+        res = mc.call_json("cdp_list_targets", {"socket": JD_PKG})
+    except Exception:
+        return None
+    for t in res.get("targets") or []:
+        if t.get("type") == "page" and "4E1fFrgX1eGtWTc5KBNFzXMrh6xn" in (t.get("url") or ""):
+            return t
+    return None
+
+
+def cmd_bean_signin(mc: MCPClient, args):
+    """Open JD 领京豆 (天天刮京豆 Babel activity) via native search (avoids broken bean.m.jd.com JFE 52)
+    and trigger real tap on '立即刮卡'.
+    """
     require_guard_active(mc)
-    t = ensure_farm_open(mc)
+    float_rect = get_floating_ssh_touch_rect(args.adb)
+    t = find_bean_target(mc)
+    if not t:
+        if open_jd_h5_deeplink(args.adb, "https://pro.m.jd.com/mall/active/4E1fFrgX1eGtWTc5KBNFzXMrh6xn/index.html"):
+            for _ in range(7):
+                time.sleep(1.0)
+                t = find_bean_target(mc)
+                if t:
+                    break
+    if not t:
+        for _ in range(5):
+            fg = mc.call_json("phone_foreground_app")
+            if fg.get("package") == JD_PKG and "MainFrameActivity" in (fg.get("activity") or ""):
+                break
+            mc.call("phone_keyevent", {"keycode": "BACK"})
+            time.sleep(1.2)
+        mc.call("phone_launch_app", {"package": JD_PKG})
+        time.sleep(1.5)
+        mc.call("phone_tap", {"x": 155, "y": 1515, "coord_space": "image"})
+        time.sleep(0.8)
+        mc.call("phone_tap", {"x": 155, "y": 1515, "coord_space": "image"})
+        time.sleep(1.0)
+        mc.call("phone_tap", {"x": 300, "y": 200, "coord_space": "image"})
+        time.sleep(1.1)
+        mc.call("phone_input_text", {"text": "领京豆", "method": "clipboard", "submit": True})
+        time.sleep(3.2)
+
+        # Find and tap red '进入' button safely avoiding floating SSH window
+        xml = dump_ui_xml(args.adb)
+        check_captcha(xml)
+        nodes = parse_jd_nodes(xml)
+        enter_nd = next((n for n in nodes if n["text"] in ("进入", "领88豆")), None)
+        if enter_nd:
+            x1, y1, x2, y2 = enter_nd["bounds"]
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            if not point_in_rect(cx, cy, float_rect):
+                mc.call("phone_tap", {"x": cx, "y": cy, "coord_space": "screen"})
+            else:
+                mc.call("phone_tap", {"x": 625, "y": 305, "coord_space": "image"})
+        else:
+            mc.call("phone_tap", {"x": 625, "y": 305, "coord_space": "image"})
+        for _ in range(8):
+            time.sleep(1.0)
+            t = find_bean_target(mc)
+            if t:
+                break
+
+    if not t:
+        raise RuntimeError("领京豆 WebView target (4E1fFrgX1eGtWTc5KBNFzXMrh6xn) not found.")
+
     tid = t["id"]
-    orig_url = t["url"]
-    mc.cdp(JD_PKG, tid, "Page.navigate", {"url": "https://bean.m.jd.com/bean/signIndex.action"})
-    time.sleep(3.5)
-    res = mc.eval_js(
+    time.sleep(1.5)
+    info = mc.eval_js(
         JD_PKG,
         tid,
         """
         (() => {
-          const txt = (document.body?.innerText || "").slice(0, 700);
-          let clicked = null;
-          const btn = Array.from(document.querySelectorAll("div, span, button, a")).find(e => {
+          const txt = (document.body?.innerText || "");
+          const btn = Array.from(document.querySelectorAll("div, span, button")).find(e => {
             const s = (e.innerText || "").trim();
             const r = e.getBoundingClientRect();
-            return /^(签到领京豆|立即签到|点击签到|签到)$/.test(s) && r.width > 20 && r.height > 15;
+            return /^(立即刮卡|明日再来|今日已刮)$/.test(s) && r.width > 40 && r.height > 15;
           });
-          if (btn) { btn.click(); clicked = btn.innerText.trim(); }
-          return {title: document.title, url: location.href, clicked, snippet: txt};
+          let rect = null;
+          if (btn) {
+            const r = btn.getBoundingClientRect();
+            rect = {text: btn.innerText.trim(), x: r.left + r.width / 2, y: r.top + r.height / 2, vw: window.innerWidth, vh: window.innerHeight};
+          }
+          const worth = (txt.match(/可抵[\\d.]+元/) || [null])[0];
+          return {worth, rect, snippet: txt.slice(0, 400)};
         })()
         """,
-    )
-    time.sleep(1.5)
-    mc.cdp(JD_PKG, tid, "Page.navigate", {"url": orig_url})
-    print(json.dumps(res, ensure_ascii=False, indent=2))
+    ) or {}
+    check_captcha(info.get("snippet", ""))
+
+    action = "no_scratch_button"
+    rect = info.get("rect")
+    if rect and rect.get("text") == "立即刮卡":
+        # Convert CSS viewport coords -> 720x1600 image coords if vw available, else safe (360, 535)
+        vw = rect.get("vw") or 393
+        tx = int(round(rect["x"] * 720.0 / vw))
+        ty = int(round(rect["y"] * 720.0 / vw))
+        if not (200 <= ty <= 900):
+            tx, ty = 360, 535
+        mc.call("phone_tap", {"x": tx, "y": ty, "coord_space": "image"})
+        action = f"tapped_scratch_card({tx},{ty})"
+        time.sleep(2.5)
+    elif rect:
+        action = f"already_done:{rect.get('text')}"
+
+    after_txt = mc.eval_js(JD_PKG, tid, "(document.body?.innerText || '').slice(0, 400)") or ""
+    worth_after = (re.search(r"可抵[\d.]+元", after_txt) or [None])[0]
+    print(json.dumps({"action": action, "worth_before": info.get("worth"), "worth_after": worth_after}, ensure_ascii=False, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -1275,8 +1434,8 @@ def main():
     p_all.add_argument("--max-water-rounds", type=int, default=30, help="Safety cap on watering clicks (default 30)")
     p_all.add_argument("--keep-water", type=int, default=0, help="Minimum water (g) to keep when water-mode=all")
     p_all.add_argument("--allow-mature", action="store_true", help="Allow watering through final harvest (default pauses <=5%% before harvest for user)")
-    p_all.add_argument("--max-browse", type=int, default=12)
-    p_all.add_argument("--browse-sec", type=float, default=12.0)
+    p_all.add_argument("--max-browse", type=int, default=24)
+    p_all.add_argument("--browse-sec", type=float, default=12.5)
     p_all.add_argument("--skip-browse", action="store_true")
 
     p_w = sub.add_parser("farm-water", help="Water 东东农场 (default mode=tasks: finish watering milestone tasks only)")

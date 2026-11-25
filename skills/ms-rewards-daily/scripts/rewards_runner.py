@@ -80,7 +80,7 @@ EXPLORE_TOPIC_RULES = [
     (r"电影|影院|movie|cinema|showtime", "top rated movies playing in theaters"),
     (r"工作|求职|简历|job|career|resume", "remote software engineer jobs"),
     (r"健身|锻炼|workout|fitness|exercise", "home strength training workout routine"),
-    (r"歌词|歌曲|音乐|lyrics|song|music", "classic rock songs lyrics"),
+    (r"歌词|歌曲|音乐|lyrics|song|music", "Shape of You Ed Sheeran lyrics"),
     (r"翻译|translate", "translate good morning to japanese"),
     (r"股市|股票|finance|stock|market", "sp 500 index performance today"),
     (r"健康|症状|health|wellness|vitamin", "daily stretching routine benefits"),
@@ -610,7 +610,7 @@ def cmd_edge_all(mc: MCPClient, args):
             time.sleep(5.5)
             report["daily_clicked"].append(txt[:60])
 
-    # 2. Complete activated "Explore on Bing" cards
+    # 2. Complete activated "Explore on Bing" cards (with secondary retry if still uncompleted)
     if before["exploreCards"]:
         mc.cdp(
             tid,
@@ -622,6 +622,13 @@ def cmd_edge_all(mc: MCPClient, args):
             q = map_explore_query(card["text"])
             res = do_bing_search(mc, tid, q, wait_sec=args.search_interval)
             report["explore_done"].append({"card": card["text"][:60], "query": q, "title": res["title"][:40]})
+
+        retry_chk = parse_earn_snapshot(mc, tid, open_modal=False)
+        for card in retry_chk.get("exploreCards") or []:
+            txt_c = card["text"]
+            alt_q = "周杰伦 稻香 歌词" if re.search(r"歌词|lyrics|song", txt_c, re.I) else (txt_c.split(" ")[0] + " official")
+            res = do_bing_search(mc, tid, alt_q, wait_sec=args.search_interval)
+            report["explore_done"].append({"card": txt_c[:60], "query": alt_q, "retry": True, "title": res["title"][:40]})
 
     # 3. Check Bing Search cap and finish remaining searches in safe batches (with cooldown detection)
     mid = parse_earn_snapshot(mc, tid, open_modal=True)
@@ -686,7 +693,10 @@ def open_bing_rewards_and_capture(mc: MCPClient, out_dir: Path, prefix: str) -> 
     time.sleep(1.2)
     # Tap bottom-left Rewards card
     mc.call("phone_tap", {"x": 150, "y": 1270, "coord_space": "image"})
-    time.sleep(3.2)
+    time.sleep(2.5)
+    # Pull-to-refresh on the left side so Bing App never displays stale "1日前" cached points
+    mc.call("phone_swipe", {"x1": 260, "y1": 460, "x2": 260, "y2": 1150, "duration_ms": 260, "coord_space": "image"})
+    time.sleep(2.8)
 
     p1 = out_dir / f"{prefix}_1.jpg"
     p2 = out_dir / f"{prefix}_2.jpg"
@@ -704,25 +714,62 @@ def cmd_bing_check(mc: MCPClient, args):
     print(json.dumps(res, ensure_ascii=False, indent=2))
 
 
+def detect_checkin_day_x(img_path: Path) -> int:
+    """Scan the 7 day-coin slots at y=916 in 720x1600 Rewards panel to find the active claimable Day coin."""
+    slots = [88, 178, 270, 360, 450, 540, 630]
+    try:
+        from PIL import Image
+        import numpy as np
+
+        arr = np.asarray(Image.open(img_path).convert("RGB"), dtype=np.float32)
+        for sx in slots:
+            patch = arr[896:936, sx - 20 : sx + 20]
+            # Claimable today's coin has a thin outer ring / light warm gold fill (higher brightness than solid orange checked)
+            r, g, b = patch[:, :, 0], patch[:, :, 1], patch[:, :, 2]
+            pale_gold = np.mean((r > 235) & (g > 205) & (g < 245) & (b > 130) & (b < 200))
+            if pale_gold > 0.25:
+                return sx
+    except Exception:
+        pass
+    return 0
+
+
 def cmd_bing_checkin(mc: MCPClient, args):
     require_guard_active(mc)
     out_dir = Path(args.out_dir)
     ensure_bing_app(mc)
-    # Navigate to top of Rewards panel, tap "签入" row (~y=800)
+    # Navigate to top of refreshed Rewards panel
     mc.call("phone_tap", {"x": 86, "y": 1515, "coord_space": "image"})
     time.sleep(0.8)
     mc.call("phone_tap", {"x": 86, "y": 1515, "coord_space": "image"})
     time.sleep(1.0)
     mc.call("phone_tap", {"x": 150, "y": 1270, "coord_space": "image"})
-    time.sleep(3.0)
-    mc.call("phone_tap", {"x": 260, "y": 805, "coord_space": "image"})
     time.sleep(2.5)
+    mc.call("phone_swipe", {"x1": 260, "y1": 460, "x2": 260, "y2": 1150, "duration_ms": 260, "coord_space": "image"})
+    time.sleep(2.6)
+
+    pre = out_dir / "bing_checkin_pre.jpg"
+    mc.screenshot(pre)
+    day_x = 0
+    if getattr(args, "day", 0) and 1 <= args.day <= 7:
+        day_x = [88, 178, 270, 360, 450, 540, 630][args.day - 1]
+    else:
+        day_x = detect_checkin_day_x(pre)
+        if not day_x:
+            # Expand 签入 row first, then re-detect
+            mc.call("phone_tap", {"x": 260, "y": 805, "coord_space": "image"})
+            time.sleep(1.0)
+            mc.screenshot(pre)
+            day_x = detect_checkin_day_x(pre) or 260
+
+    mc.call("phone_tap", {"x": day_x, "y": 916, "coord_space": "image"})
+    time.sleep(2.2)
     p = out_dir / "bing_checkin_after.jpg"
     mc.screenshot(p)
-    print(json.dumps({"screenshot": str(p)}, ensure_ascii=False, indent=2))
+    print(json.dumps({"screenshot": str(p), "tapped_x": day_x}, ensure_ascii=False, indent=2))
 
 
-def scroll_article_to_bottom(mc: MCPClient, flings: int = 3):
+def scroll_article_to_bottom(mc: MCPClient, flings: int = 4):
     """Fast-fling to the very bottom of a Bing news article so Read-to-Earn (+3) triggers reliably."""
     for _ in range(flings):
         mc.call("phone_swipe", {"x1": 260, "y1": 1340, "x2": 260, "y2": 200, "duration_ms": 140, "coord_space": "image"})
@@ -730,11 +777,86 @@ def scroll_article_to_bottom(mc: MCPClient, flings: int = 3):
     time.sleep(0.8)
 
 
+def find_text_article_tap_ys(img_path: Path) -> list:
+    """Detect visible pure-text news article tap Y-coords in a 720x1600 Bing feed screenshot,
+    excluding video cards (white play triangle inside dark translucent circle) and partially scrolled-off top cards.
+    """
+    try:
+        from PIL import Image
+        import numpy as np
+    except ImportError:
+        return [810]
+
+    arr = np.asarray(Image.open(img_path).convert("RGB"), dtype=np.float32)
+    h, w, _ = arr.shape
+    if h < 1450 or w < 700:
+        return [810]
+    gray = arr.mean(axis=2)
+
+    # 1. Detect all video ▶ play-icon centers near x=360
+    play_ys = []
+    for y in range(240, min(1430, h - 56), 10):
+        core = arr[y - 10 : y + 11, 348:368]
+        white_ratio = float(np.mean((core.min(axis=2) > 220) & ((core.max(axis=2) - core.min(axis=2)) < 25)))
+        if white_ratio < 0.72:
+            continue
+        yy, xx = np.ogrid[y - 55 : y + 56, 360 - 55 : 360 + 56]
+        dist2 = (yy - y) ** 2 + (xx - 360) ** 2
+        ring_mask = (dist2 >= 36**2) & (dist2 <= 52**2)
+        ring = gray[y - 55 : y + 56, 360 - 55 : 360 + 56][ring_mask]
+        ring_dark = float(np.mean(ring < 135))
+        left_dark = float(np.mean(gray[y - 12 : y + 13, 322:338] < 135))
+        if ring_dark > 0.65 and left_dark > 0.75:
+            if not play_ys or y - play_ys[-1] > 60:
+                play_ys.append(y)
+
+    # 2. Detect contiguous thumbnail blocks across x=60..660, y=240..1420
+    row_slice = arr[240:1420, 60:660]
+    row_gray = row_slice.mean(axis=2)
+    # Thumbnail rows have wide photo/artwork variation across columns (higher horizontal std or darker than #F5F6F8 feed bg)
+    is_thumb_row = (row_gray.mean(axis=1) < 236) & (row_gray.std(axis=1) > 16)
+    blocks = []
+    in_blk = False
+    start = 0
+    gap = 0
+    for idx, flag in enumerate(is_thumb_row):
+        y = 240 + idx
+        if flag:
+            if not in_blk:
+                in_blk = True
+                start = y
+            gap = 0
+        elif in_blk:
+            gap += 1
+            if gap > 14:
+                end = y - gap
+                if 180 <= (end - start) <= 520:
+                    blocks.append((start, end))
+                in_blk = False
+    if in_blk:
+        end = 1420
+        if 180 <= (end - start) <= 520:
+            blocks.append((start, end))
+
+    # 3. Keep only full-thumbnail non-video cards (block_y1 >= 255 ensures ▶ wasn't clipped above top edge)
+    tap_ys = []
+    for by1, by2 in blocks:
+        if by1 < 255:
+            continue
+        if any((by1 - 25) <= py <= (by2 + 25) for py in play_ys):
+            continue
+        # Tap headline right below thumbnail if visible, else center of thumbnail (x=260 avoids floating SSH)
+        tap_y = (by2 + 75) if (by2 + 115 <= 1400) else ((by1 + by2) // 2)
+        if 320 <= tap_y <= 1360:
+            tap_ys.append(int(tap_y))
+    return tap_ys
+
+
 def cmd_bing_read(mc: MCPClient, args):
     require_guard_active(mc)
     out_dir = Path(args.out_dir)
     ensure_bing_app(mc)
-    # Jump cleanly to Bing Home top and swipe into news feed (independent of Rewards layout)
+    # Jump cleanly to Bing Home top and swipe into news feed
     mc.call("phone_tap", {"x": 86, "y": 1515, "coord_space": "image"})
     time.sleep(0.8)
     mc.call("phone_tap", {"x": 86, "y": 1515, "coord_space": "image"})
@@ -747,28 +869,41 @@ def cmd_bing_read(mc: MCPClient, args):
         time.sleep(0.4)
 
     read_ok = 0
+    video_or_empty_scrolls = 0
     external_skips = 0
-    for i in range(1, args.count + 1):
-        mc.call("phone_swipe", {"x1": 260, "y1": 1350, "x2": 260, "y2": 300, "duration_ms": 230, "coord_space": "image"})
-        time.sleep(0.7)
-        mc.call("phone_tap", {"x": 260, "y": 810, "coord_space": "image"})
-        time.sleep(1.8)
+    max_scrolls = max(18, args.count * 3)
+    feed_shot = out_dir / "bing_read_scan.jpg"
 
-        fg = mc.call_json("phone_foreground_app")
-        pkg = fg.get("package") or ""
-        # Ignore user's floating SSH client window; only bounce back from actual ad/external redirects
-        if pkg not in ("com.microsoft.bing", "com.server.auditor.ssh.client", ""):
-            external_skips += 1
+    for _ in range(max_scrolls):
+        if read_ok >= args.count:
+            break
+        mc.screenshot(feed_shot)
+        candidates = find_text_article_tap_ys(feed_shot)
+        if not candidates:
+            video_or_empty_scrolls += 1
+        for tap_y in candidates:
+            if read_ok >= args.count:
+                break
+            mc.call("phone_tap", {"x": 260, "y": tap_y, "coord_space": "image"})
+            time.sleep(2.1)
+
+            fg = mc.call_json("phone_foreground_app")
+            pkg = fg.get("package") or ""
+            if pkg not in ("com.microsoft.bing", "com.server.auditor.ssh.client", ""):
+                external_skips += 1
+                mc.call("phone_keyevent", {"keycode": "BACK"})
+                time.sleep(0.7)
+                ensure_bing_app(mc)
+                continue
+
+            scroll_article_to_bottom(mc, flings=args.flings)
+            read_ok += 1
             mc.call("phone_keyevent", {"keycode": "BACK"})
-            time.sleep(0.7)
-            ensure_bing_app(mc)
-            continue
+            time.sleep(0.9)
 
-        # Bing Read-to-Earn requires scrolling all the way to the bottom of the article!
-        scroll_article_to_bottom(mc, flings=args.flings)
-        read_ok += 1
-        mc.call("phone_keyevent", {"keycode": "BACK"})
-        time.sleep(0.75)
+        if read_ok < args.count:
+            mc.call("phone_swipe", {"x1": 260, "y1": 1340, "x2": 260, "y2": 220, "duration_ms": 230, "coord_space": "image"})
+            time.sleep(0.8)
 
     after = open_bing_rewards_and_capture(mc, out_dir, "bing_read_after")
     print(
@@ -776,6 +911,7 @@ def cmd_bing_read(mc: MCPClient, args):
             {
                 "attempted": args.count,
                 "read_ok": read_ok,
+                "video_or_empty_scrolls": video_or_empty_scrolls,
                 "external_skips": external_skips,
                 "battery_percent": get_battery_level(args.adb),
                 **after,
@@ -874,12 +1010,13 @@ def main():
     p_edge.add_argument("--search-interval", type=float, default=7.5)
 
     sub.add_parser("bing-check", help="Open Bing App Rewards panel and save screenshots")
-    sub.add_parser("bing-checkin", help="Tap Bing App daily check-in and screenshot")
+    p_ci = sub.add_parser("bing-checkin", help="Tap Bing App daily check-in and screenshot")
+    p_ci.add_argument("--day", type=int, default=0, help="Optional Day 1-7 slot override (0=auto detect)")
 
-    p_read = sub.add_parser("bing-read", help="Read news articles in Bing App (fast-fling to bottom for 30/30)")
+    p_read = sub.add_parser("bing-read", help="Read text-only news articles in Bing App (filters out video cards)")
     p_read.add_argument("--count", type=int, default=11)
     p_read.add_argument("--skip", type=int, default=0)
-    p_read.add_argument("--flings", type=int, default=3, help="Fast downward flings per article to reach bottom")
+    p_read.add_argument("--flings", type=int, default=4, help="Fast downward flings per article to reach bottom")
 
     p_feed = sub.add_parser("bing-feed-shot", help="Scroll Bing news feed and capture screenshot")
     p_feed.add_argument("--swipes", type=int, default=3)
