@@ -38,4 +38,6 @@ type DeviceBackend interface {
 	GetClipboard(ctx context.Context) (string, error)
 	ForegroundApp(ctx context.Context) (ForegroundInfo, error)
 	LaunchApp(ctx context.Context, pkg string) error
+	OpenDeepLink(ctx context.Context, uri, pkg string) error
+	PostNotification(ctx context.Context, tag, title, text string) error
 }

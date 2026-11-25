@@ -425,3 +425,47 @@ func (b *ShellBackend) LaunchApp(ctx context.Context, pkg string) error {
 	}
 	return nil
 }
+
+func (b *ShellBackend) OpenDeepLink(ctx context.Context, uri, pkg string) error {
+	uri = strings.TrimSpace(uri)
+	if !strings.HasPrefix(uri, "openapp.jdmobile://") && !strings.HasPrefix(uri, "https://") && !strings.HasPrefix(uri, "http://") {
+		return fmt.Errorf("unsupported deep link scheme: %q", uri)
+	}
+	args := []string{"start", "-a", "android.intent.action.VIEW", "-d", uri}
+	pkg = strings.TrimSpace(pkg)
+	if pkg != "" {
+		if !safePkgRe.MatchString(pkg) {
+			return fmt.Errorf("invalid package name: %q", pkg)
+		}
+		args = append(args, pkg)
+	}
+	cctx, cancel := b.withTimeout(ctx)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, "/system/bin/am", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("open deeplink failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func (b *ShellBackend) PostNotification(ctx context.Context, tag, title, text string) error {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		tag = "android_agent"
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = "Android Agent"
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return errors.New("notification text is empty")
+	}
+	cctx, cancel := b.withTimeout(ctx)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, "/system/bin/cmd", "notification", "post", "-S", "bigtext", "-t", title, tag, text).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("post notification failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}

@@ -12,5 +12,13 @@
   "sys_socket": "agent_sys",
   "clip_helper_path": "/data/local/tmp/android_agent_cliphelper.jar",
   "pause_flag_path": "/data/adb/android_agent/paused",
-  "shell_timeout_ms": 10000
+  "shell_timeout_ms": 10000,
+  "llm": {
+    "provider": "openai",
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key": "",
+    "model": "deepseek-chat",
+    "max_steps": 20,
+    "timeout_sec": 60
+  }
 }

@@ -8,8 +8,10 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"io"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -84,7 +86,9 @@ func (f *fakeBackend) GetClipboard(_ context.Context) (string, error) {
 func (f *fakeBackend) ForegroundApp(_ context.Context) (backend.ForegroundInfo, error) {
 	return backend.ForegroundInfo{Package: "com.miui.home", Activity: ".launcher.Launcher"}, nil
 }
-func (f *fakeBackend) LaunchApp(_ context.Context, _ string) error { return nil }
+func (f *fakeBackend) LaunchApp(_ context.Context, _ string) error                   { return nil }
+func (f *fakeBackend) OpenDeepLink(_ context.Context, _, _ string) error             { return nil }
+func (f *fakeBackend) PostNotification(_ context.Context, _, _, _ string) error      { return nil }
 
 type testDetector struct {
 	mu  sync.Mutex
@@ -299,5 +303,85 @@ func TestMCPAuthToolsAndGameGuardListenerShutdown(t *testing.T) {
 	r, _ = postMCP(cfg.BearerToken, sid, map[string]any{"jsonrpc": "2.0", "id": 10, "method": "ping"})
 	if r.StatusCode != http.StatusOK {
 		t.Fatalf("expected ping 200 after resume, got %d", r.StatusCode)
+	}
+}
+
+func TestWebUIAuthAndLLMConfigPersistence(t *testing.T) {
+	tmpCfgPath := filepath.Join(t.TempDir(), "config.json")
+	cfg := config.Default()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.BearerToken = "tok-ui-test-123456"
+	cfg.PauseFlagPath = ""
+	cfg.CDPSocket = "nonexistent_test_cdp_socket_888"
+
+	det := &testDetector{}
+	g := guard.New(guard.Options{Packages: []string{"com.tencent.tmgp.sgame"}, PollInterval: time.Second, ResumeGrace: 10 * time.Millisecond, Detector: det})
+	srv := NewServer(cfg, &fakeBackend{}, g, cdp.NewClient(cfg.CDPSocket), nil)
+	srv.SetConfigPath(tmpCfgPath)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	defer srv.Close()
+	baseURL := "http://" + srv.Addr()
+
+	// 1. GET /ui returns HTML shell without exposing token or API keys
+	rUI, err := http.Get(baseURL + "/ui")
+	if err != nil {
+		t.Fatalf("GET /ui: %v", err)
+	}
+	uiBytes, _ := io.ReadAll(rUI.Body)
+	rUI.Body.Close()
+	if rUI.StatusCode != http.StatusOK || !strings.Contains(string(uiBytes), "Xiaomi 13 Agent") {
+		t.Fatalf("unexpected /ui status=%d", rUI.StatusCode)
+	}
+	if strings.Contains(string(uiBytes), cfg.BearerToken) {
+		t.Fatal("/ui must never embed bearer token")
+	}
+
+	// 2. Protected v0.2 endpoints must reject unauthenticated requests
+	for _, path := range []string{"/api/v1/llm/config", "/api/v1/jobs/current"} {
+		resp, err := http.Get(baseURL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("expected 401 on %s, got %d", path, resp.StatusCode)
+		}
+	}
+
+	// 3. Save LLM config via authenticated POST and verify masking + persistence
+	payload, _ := json.Marshal(map[string]any{
+		"provider": "openai",
+		"base_url": "https://api.deepseek.com/v1",
+		"api_key":  "sk-abcdef1234567890wxyz",
+		"model":    "deepseek-chat",
+	})
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/llm/config", bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	req.Header.Set("Content-Type", "application/json")
+	postResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /api/v1/llm/config: %v", err)
+	}
+	postResp.Body.Close()
+	if postResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on POST /api/v1/llm/config, got %d", postResp.StatusCode)
+	}
+
+	getReq, _ := http.NewRequest(http.MethodGet, baseURL+"/api/v1/llm/config", nil)
+	getReq.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
+		t.Fatalf("GET /api/v1/llm/config: %v", err)
+	}
+	defer getResp.Body.Close()
+	var llmOut map[string]any
+	_ = json.NewDecoder(getResp.Body).Decode(&llmOut)
+	if llmOut["api_key_masked"] != "sk-a...wxyz" || llmOut["configured"] != true {
+		t.Fatalf("unexpected llm config response: %+v", llmOut)
+	}
+	if _, err := config.Load(tmpCfgPath, false); err != nil {
+		t.Fatalf("persisted config load failed: %v", err)
 	}
 }

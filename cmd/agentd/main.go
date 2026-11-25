@@ -2,11 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -34,6 +39,7 @@ func main() {
 	logf := func(format string, args ...any) {
 		log.Printf(format, args...)
 	}
+	initAndroidCACerts(logf)
 
 	cfg, err := config.Load(*configPath, *initConfig)
 	if err != nil {
@@ -63,6 +69,7 @@ func main() {
 	})
 
 	srv := mcp.NewServer(cfg, be, g, cdpClient, logf)
+	srv.SetConfigPath(*configPath)
 	g.SetListener(srv)
 
 	// Run initial guard check before opening port 8765 so we never bind while a guarded game is already foreground
@@ -92,5 +99,72 @@ func main() {
 			srv.Close()
 			return
 		}
+	}
+}
+
+// initAndroidCACerts loads Android's Conscrypt/system root CA certificates into
+// http.DefaultTransport when running as a static linux/arm64 binary on Android.
+func initAndroidCACerts(logf func(string, ...any)) {
+	candidates := []string{
+		"/apex/com.android.conscrypt/cacerts",
+		"/system/etc/security/cacerts",
+		"/data/misc/user/0/cacerts-added",
+	}
+	var existingDirs []string
+	var systemLoaded bool
+	var certFiles []string
+
+	for _, dir := range candidates {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		existingDirs = append(existingDirs, dir)
+		isSystemDir := dir != "/data/misc/user/0/cacerts-added"
+		if isSystemDir && systemLoaded {
+			continue
+		}
+		dirCount := 0
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			certFiles = append(certFiles, filepath.Join(dir, e.Name()))
+			dirCount++
+		}
+		if isSystemDir && dirCount > 0 {
+			systemLoaded = true
+		}
+	}
+
+	if len(existingDirs) == 0 {
+		return
+	}
+	if os.Getenv("SSL_CERT_DIR") == "" {
+		_ = os.Setenv("SSL_CERT_DIR", strings.Join(existingDirs, ":"))
+	}
+
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	loaded := 0
+	for _, p := range certFiles {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if pool.AppendCertsFromPEM(b) {
+			loaded++
+		}
+	}
+	if loaded > 0 {
+		if tr, ok := http.DefaultTransport.(*http.Transport); ok {
+			if tr.TLSClientConfig == nil {
+				tr.TLSClientConfig = &tls.Config{}
+			}
+			tr.TLSClientConfig.RootCAs = pool
+		}
+		logf("tls: loaded %d Android root CAs", loaded)
 	}
 }

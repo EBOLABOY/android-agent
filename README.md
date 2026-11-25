@@ -2,8 +2,8 @@
 
 小米 13（`fuxi` / Android 16 / API 36 / HyperOS 3.0 / KernelSU 3.3.1）原生低延迟 AI Agent 底座。
 
-- **当前状态**：**阶段 1（Go ARM64 Daemon + KernelSU 模块 + Edge/Chrome CDP + Android 16 中文剪贴板）已上线稳定运行**，满足日常低延迟操作需求；为保持系统稳定与降低游戏风控，**暂缓阶段 2（LSPosed `system_server` Hook）**。
-- **架构亮点**：零外部 Go 依赖静态单文件（`7.0 MB`），内置标准 **MCP Streamable HTTP (`2025-03-26`)** 服务端（`0.0.0.0:8765/mcp`），全路由强制 `Authorization: Bearer <token>` 鉴权。
+- **当前状态**：**`v0.2.0-ondevice` 已内置手机端自闭环大脑（0-Token 原生日常引擎 + 双协议 LLM API 大脑 + 移动 Web 控制台 `/ui`）**，不再强依赖宿主机或电脑即可直接在小米 13 本机完成每日任务与自然语言交互；同时保留完整 MCP 服务端与游戏防风控熔断。
+- **架构亮点**：零外部 Go 依赖静态单文件，内置标准 **MCP Streamable HTTP (`2025-03-26`)** 服务端（`20` 个工具）、OpenAI/Gemini 双协议 Function-Calling 大脑与 `//go:embed` 移动 PWA 控制台（`http://127.0.0.1:8765/ui`）。
 
 ---
 
@@ -29,8 +29,18 @@
 │   ├── cdp/
 │   │   ├── cdp.go                     # 直连抽象 Unix Socket (@chrome_devtools_remote + 自动探测 *_devtools_remote*)
 │   │   └── cdp_test.go
+│   ├── workflows/                     # 0-Token 原生日常工作流引擎（Edge/Bing 0截屏 CDP + 京东深链农场/刮京豆）
+│   │   ├── workflows.go
+│   │   └── workflows_test.go
+│   ├── brain/                         # 本机内置 LLM 大脑（OpenAI/Gemini 双协议 + 进程内 ToolExecutor + JobManager）
+│   │   ├── llm.go
+│   │   ├── agent.go
+│   │   └── brain_test.go
+│   ├── webui/                         # 手机端暗黑模式移动 Web 控制台（//go:embed ui.html，支持添加到桌面）
+│   │   ├── webui.go
+│   │   └── ui.html
 │   └── mcp/
-│       ├── server.go                  # 标准 MCP Streamable HTTP (2025-03-26) + Bearer 鉴权 + 16 个工具 + REST 控制接口
+│       ├── server.go                  # 标准 MCP Streamable HTTP (2025-03-26) + /ui + /api/v1/jobs/* + /api/v1/chat + /api/v1/llm/config
 │       └── server_test.go
 ├── cliphelper/AgentClip.smali         # 适配 Android 16 IClipboard 签名的剪贴板助手 Smali 源码
 ├── ksu-module/                        # KernelSU 模块打包目录

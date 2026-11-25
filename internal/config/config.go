@@ -12,19 +12,29 @@ import (
 	"strings"
 )
 
+type LLMConfig struct {
+	Provider   string `json:"provider"`    // "openai" (OpenAI/DeepSeek/OpenRouter/OneAPI) or "gemini"
+	BaseURL    string `json:"base_url"`    // e.g. "https://api.deepseek.com/v1" or "https://generativelanguage.googleapis.com/v1beta"
+	APIKey     string `json:"api_key"`
+	Model      string `json:"model"`
+	MaxSteps   int    `json:"max_steps"`
+	TimeoutSec int    `json:"timeout_sec"`
+}
+
 type Config struct {
-	ListenAddr            string   `json:"listen_addr"`
-	BearerToken           string   `json:"bearer_token"`
-	ScreenshotWidth       int      `json:"screenshot_width"`
-	ScreenshotJPEGQuality int      `json:"screenshot_jpeg_quality"`
-	GuardPackages         []string `json:"guard_packages"`
-	GuardPollIntervalMs   int      `json:"guard_poll_interval_ms"`
-	GuardResumeGraceMs    int      `json:"guard_resume_grace_ms"`
-	CDPSocket             string   `json:"cdp_socket"`
-	SysSocket             string   `json:"sys_socket"`
-	ClipHelperPath        string   `json:"clip_helper_path"`
-	PauseFlagPath         string   `json:"pause_flag_path"`
-	ShellTimeoutMs        int      `json:"shell_timeout_ms"`
+	ListenAddr            string    `json:"listen_addr"`
+	BearerToken           string    `json:"bearer_token"`
+	ScreenshotWidth       int       `json:"screenshot_width"`
+	ScreenshotJPEGQuality int       `json:"screenshot_jpeg_quality"`
+	GuardPackages         []string  `json:"guard_packages"`
+	GuardPollIntervalMs   int       `json:"guard_poll_interval_ms"`
+	GuardResumeGraceMs    int       `json:"guard_resume_grace_ms"`
+	CDPSocket             string    `json:"cdp_socket"`
+	SysSocket             string    `json:"sys_socket"`
+	ClipHelperPath        string    `json:"clip_helper_path"`
+	PauseFlagPath         string    `json:"pause_flag_path"`
+	ShellTimeoutMs        int       `json:"shell_timeout_ms"`
+	LLM                   LLMConfig `json:"llm,omitempty"`
 }
 
 func Default() *Config {
@@ -41,7 +51,24 @@ func Default() *Config {
 		ClipHelperPath:        "/data/local/tmp/android_agent_cliphelper.jar",
 		PauseFlagPath:         "/data/adb/android_agent/paused",
 		ShellTimeoutMs:        10000,
+		LLM: LLMConfig{
+			Provider:   "openai",
+			MaxSteps:   20,
+			TimeoutSec: 60,
+		},
 	}
+}
+
+// MaskSecret returns a safe masked preview (e.g. "sk-a...wxyz") for HTTP APIs and logs.
+func MaskSecret(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if len(s) <= 8 {
+		return strings.Repeat("*", len(s))
+	}
+	return s[:4] + "..." + s[len(s)-4:]
 }
 
 func GenerateToken() (string, error) {
@@ -133,6 +160,18 @@ func applyEnv(cfg *Config) {
 	if v := strings.TrimSpace(os.Getenv("AGENT_CLIP_HELPER_PATH")); v != "" {
 		cfg.ClipHelperPath = v
 	}
+	if v := strings.TrimSpace(os.Getenv("AGENT_LLM_PROVIDER")); v != "" {
+		cfg.LLM.Provider = strings.ToLower(v)
+	}
+	if v := strings.TrimSpace(os.Getenv("AGENT_LLM_BASE_URL")); v != "" {
+		cfg.LLM.BaseURL = v
+	}
+	if v := strings.TrimSpace(os.Getenv("AGENT_LLM_API_KEY")); v != "" {
+		cfg.LLM.APIKey = v
+	}
+	if v := strings.TrimSpace(os.Getenv("AGENT_LLM_MODEL")); v != "" {
+		cfg.LLM.Model = v
+	}
 }
 
 func applyDefaults(cfg *Config) {
@@ -163,5 +202,16 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.ShellTimeoutMs <= 0 {
 		cfg.ShellTimeoutMs = def.ShellTimeoutMs
+	}
+	if strings.TrimSpace(cfg.LLM.Provider) == "" {
+		cfg.LLM.Provider = def.LLM.Provider
+	} else {
+		cfg.LLM.Provider = strings.ToLower(strings.TrimSpace(cfg.LLM.Provider))
+	}
+	if cfg.LLM.MaxSteps <= 0 {
+		cfg.LLM.MaxSteps = def.LLM.MaxSteps
+	}
+	if cfg.LLM.TimeoutSec <= 0 {
+		cfg.LLM.TimeoutSec = def.LLM.TimeoutSec
 	}
 }

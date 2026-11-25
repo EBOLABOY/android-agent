@@ -18,27 +18,35 @@ import (
 	"time"
 
 	"android-agent/internal/backend"
+	"android-agent/internal/brain"
 	"android-agent/internal/cdp"
 	"android-agent/internal/config"
 	"android-agent/internal/guard"
+	"android-agent/internal/webui"
+	"android-agent/internal/workflows"
 )
 
 const (
 	ServerName          = "android-agent"
-	ServerVersion       = "0.1.0-phase1"
+	ServerVersion       = "0.2.0-ondevice"
 	DefaultProtoVersion = "2025-03-26"
 )
 
 type Server struct {
-	cfg     *config.Config
-	backend backend.DeviceBackend
-	guard   *guard.Guard
-	cdp     *cdp.Client
-	started time.Time
-	logger  func(format string, args ...any)
+	cfg        *config.Config
+	configPath string
+	backend    backend.DeviceBackend
+	guard      *guard.Guard
+	cdp        *cdp.Client
+	runner     *workflows.Runner
+	agent      *brain.Agent
+	jobs       *brain.JobManager
+	started    time.Time
+	logger     func(format string, args ...any)
 
 	handler http.Handler
 
+	cfgMu    sync.RWMutex
 	sessMu   sync.RWMutex
 	sessions map[string]time.Time
 
@@ -63,21 +71,50 @@ func NewServer(cfg *config.Config, be backend.DeviceBackend, g *guard.Guard, cdp
 		backend:    be,
 		guard:      g,
 		cdp:        cdpClient,
+		jobs:       brain.NewJobManager(),
 		started:    time.Now(),
 		logger:     logger,
 		sessions:   make(map[string]time.Time),
 		sseCancels: make(map[int]context.CancelFunc),
 	}
+	s.runner = workflows.NewRunner(be, cdpClient, g, cfg.ScreenshotWidth, func(line string) {
+		logger("workflow: %s", line)
+	})
+	s.agent = brain.NewAgent(cfg.LLM, s, g)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/mcp", s.handleMCP)
-	mux.HandleFunc("/health", s.handleStatus)
-	mux.HandleFunc("/api/v1/status", s.handleStatus)
-	mux.HandleFunc("/api/v1/pause", s.handlePause)
-	mux.HandleFunc("/api/v1/resume", s.handleResume)
+	apiMux := http.NewServeMux()
+	apiMux.HandleFunc("/mcp", s.handleMCP)
+	apiMux.HandleFunc("/health", s.handleStatus)
+	apiMux.HandleFunc("/api/v1/status", s.handleStatus)
+	apiMux.HandleFunc("/api/v1/pause", s.handlePause)
+	apiMux.HandleFunc("/api/v1/resume", s.handleResume)
+	apiMux.HandleFunc("/api/v1/jobs/current", s.handleJobCurrent)
+	apiMux.HandleFunc("/api/v1/jobs/run", s.handleJobRun)
+	apiMux.HandleFunc("/api/v1/jobs/cancel", s.handleJobCancel)
+	apiMux.HandleFunc("/api/v1/chat", s.handleChat)
+	apiMux.HandleFunc("/api/v1/chat/history", s.handleChatHistory)
+	apiMux.HandleFunc("/api/v1/chat/clear", s.handleChatClear)
+	apiMux.HandleFunc("/api/v1/llm/config", s.handleLLMConfig)
 
-	s.handler = s.authMiddleware(mux)
+	authedAPI := s.authMiddleware(apiMux)
+	rootMux := http.NewServeMux()
+	rootMux.HandleFunc("/ui", webui.HandleUI)
+	rootMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.Redirect(w, r, "/ui", http.StatusFound)
+			return
+		}
+		authedAPI.ServeHTTP(w, r)
+	})
+
+	s.handler = rootMux
 	return s
+}
+
+func (s *Server) SetConfigPath(path string) {
+	s.cfgMu.Lock()
+	s.configPath = path
+	s.cfgMu.Unlock()
 }
 
 // Start binds the TCP listener and begins serving HTTP requests.
@@ -117,6 +154,9 @@ func (s *Server) Start() error {
 // StopForGuard completely closes the TCP listener and terminates active SSE streams
 // while a guarded game (e.g. com.tencent.tmgp.sgame) is in the foreground.
 func (s *Server) StopForGuard(reason string) {
+	if s.jobs != nil {
+		s.jobs.Cancel("guard blocked: " + reason)
+	}
 	s.cancelAllSSE()
 	s.srvMu.Lock()
 	hs := s.httpServer
@@ -265,6 +305,173 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 	}
 	st := s.guard.ResumeManual()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "guard": st})
+}
+
+func (s *Server) handleJobCurrent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.jobs.Status())
+}
+
+func (s *Server) handleJobRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if blocked, reason := s.guard.IsActionBlocked(); blocked {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": reason})
+		return
+	}
+	var body struct {
+		Job string `json:"job"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+		return
+	}
+	jobName := strings.TrimSpace(body.Job)
+	st, err := s.jobs.Start(jobName, func(ctx context.Context, logFn func(string)) (any, error) {
+		rnr := workflows.NewRunner(s.backend, s.cdp, s.guard, s.cfg.ScreenshotWidth, logFn)
+		switch jobName {
+		case "daily_all":
+			return rnr.RunDailyAll(ctx)
+		case "ms_rewards":
+			return rnr.RunMSRewards(ctx, workflows.MSRewardsOptions{SearchIntervalSec: 6.0, ReadCount: 10})
+		case "jd_daily":
+			return rnr.RunJDDaily(ctx, workflows.JDDailyOptions{BrowseSec: 8.5, MaxBrowse: 24, WaterMode: "tasks"})
+		default:
+			return nil, fmt.Errorf("unknown job %q (use daily_all, ms_rewards, or jd_daily)", jobName)
+		}
+	})
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "job": st})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, st)
+}
+
+func (s *Server) handleJobCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	cancelled := s.jobs.Cancel("manual UI cancel")
+	writeJSON(w, http.StatusOK, map[string]any{"cancelled": cancelled, "job": s.jobs.Status()})
+}
+
+func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+		return
+	}
+	res, err := s.agent.Chat(r.Context(), body.Message)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleChatHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"messages": s.agent.History()})
+}
+
+func (s *Server) handleChatClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	s.agent.ClearHistory()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleLLMConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		c := s.agent.GetConfig()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"provider":       c.Provider,
+			"base_url":       c.BaseURL,
+			"api_key_masked": config.MaskSecret(c.APIKey),
+			"configured":     strings.TrimSpace(c.APIKey) != "" && strings.TrimSpace(c.Model) != "",
+			"model":          c.Model,
+			"max_steps":      c.MaxSteps,
+			"timeout_sec":    c.TimeoutSec,
+		})
+	case http.MethodPost:
+		var body struct {
+			Provider   *string `json:"provider"`
+			BaseURL    *string `json:"base_url"`
+			APIKey     *string `json:"api_key"`
+			Model      *string `json:"model"`
+			MaxSteps   *int    `json:"max_steps"`
+			TimeoutSec *int    `json:"timeout_sec"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 16*1024)).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+			return
+		}
+		s.cfgMu.Lock()
+		llm := s.cfg.LLM
+		if body.Provider != nil {
+			p := strings.ToLower(strings.TrimSpace(*body.Provider))
+			if p != "openai" && p != "gemini" {
+				s.cfgMu.Unlock()
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider must be openai or gemini"})
+				return
+			}
+			llm.Provider = p
+		}
+		if body.BaseURL != nil {
+			llm.BaseURL = strings.TrimSpace(*body.BaseURL)
+		}
+		if body.APIKey != nil && strings.TrimSpace(*body.APIKey) != "" {
+			llm.APIKey = strings.TrimSpace(*body.APIKey)
+		}
+		if body.Model != nil {
+			llm.Model = strings.TrimSpace(*body.Model)
+		}
+		if body.MaxSteps != nil && *body.MaxSteps > 0 {
+			llm.MaxSteps = *body.MaxSteps
+		}
+		if body.TimeoutSec != nil && *body.TimeoutSec > 0 {
+			llm.TimeoutSec = *body.TimeoutSec
+		}
+		s.cfg.LLM = llm
+		cfgPath := s.configPath
+		var saveErr error
+		if cfgPath != "" {
+			saveErr = config.Save(cfgPath, s.cfg)
+		}
+		s.cfgMu.Unlock()
+		s.agent.UpdateConfig(llm)
+		if saveErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": saveErr.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":             true,
+			"provider":       llm.Provider,
+			"base_url":       llm.BaseURL,
+			"api_key_masked": config.MaskSecret(llm.APIKey),
+			"model":          llm.Model,
+		})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 }
 
 // --- Standard MCP Streamable HTTP (2025-03-26) ---
@@ -760,8 +967,82 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 			"result": json.RawMessage(res),
 		}, false)
 
+	case "run_daily_all":
+		rep, err := s.runner.RunDailyAll(ctx)
+		if err != nil {
+			return textJSONResult(map[string]any{"error": err.Error(), "report": rep}, true)
+		}
+		return textJSONResult(rep, false)
+
+	case "run_ms_rewards":
+		rep, err := s.runner.RunMSRewards(ctx, workflows.MSRewardsOptions{SearchIntervalSec: 6.0, ReadCount: 10})
+		if err != nil {
+			return textJSONResult(map[string]any{"error": err.Error(), "report": rep}, true)
+		}
+		return textJSONResult(rep, false)
+
+	case "run_jd_daily":
+		rep, err := s.runner.RunJDDaily(ctx, workflows.JDDailyOptions{BrowseSec: 8.5, MaxBrowse: 24, WaterMode: "tasks"})
+		if err != nil {
+			return textJSONResult(map[string]any{"error": err.Error(), "report": rep}, true)
+		}
+		return textJSONResult(rep, false)
+
+	case "post_notification":
+		tag := getString(args, "tag", "android_agent")
+		title := getString(args, "title", "Android Agent")
+		text := getString(args, "text", "")
+		if err := s.backend.PostNotification(ctx, tag, title, text); err != nil {
+			return textErrorResult(err.Error())
+		}
+		return textJSONResult(map[string]any{"ok": true}, false)
+
 	default:
 		return textErrorResult(fmt.Sprintf("unknown tool: %s", name))
+	}
+}
+
+// ToolSpecs implements brain.ToolExecutor for in-process zero-HTTP LLM tool calls.
+func (s *Server) ToolSpecs() []brain.ToolSpec {
+	defs := toolDefinitions()
+	specs := make([]brain.ToolSpec, 0, len(defs))
+	for _, d := range defs {
+		name, _ := d["name"].(string)
+		desc, _ := d["description"].(string)
+		schema, _ := d["inputSchema"].(map[string]any)
+		specs = append(specs, brain.ToolSpec{
+			Name:        name,
+			Description: desc,
+			Parameters:  schema,
+		})
+	}
+	return specs
+}
+
+// ExecuteTool implements brain.ToolExecutor for direct in-process tool dispatch.
+func (s *Server) ExecuteTool(ctx context.Context, name string, args map[string]any) brain.ToolOutput {
+	res := s.callTool(ctx, name, args)
+	isErr, _ := res["isError"].(bool)
+	var texts []string
+	var imgBytes []byte
+	if parts, ok := res["content"].([]map[string]any); ok {
+		for _, p := range parts {
+			tp, _ := p["type"].(string)
+			if tp == "text" {
+				if t, ok := p["text"].(string); ok {
+					texts = append(texts, t)
+				}
+			} else if tp == "image" {
+				if b64, ok := p["data"].(string); ok {
+					imgBytes, _ = base64.StdEncoding.DecodeString(b64)
+				}
+			}
+		}
+	}
+	return brain.ToolOutput{
+		Text:      strings.Join(texts, "\n"),
+		ImageJPEG: imgBytes,
+		IsError:   isErr,
 	}
 }
 
@@ -955,6 +1236,34 @@ func toolDefinitions() []map[string]any {
 					"params":    map[string]any{"type": "object", "description": "CDP method parameters"},
 				},
 				"required": []string{"method"},
+			},
+		},
+		{
+			"name":        "run_daily_all",
+			"description": "Run complete 0-Token daily automation on Xiaomi 13 (Microsoft Rewards Edge+Bing CDP and JD Farm+Bean scratch) and post an Android notification.",
+			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			"name":        "run_ms_rewards",
+			"description": "Run 0-Token Microsoft Rewards automation (Edge CDP Daily Set + trending searches 100/100 + Bing App WebView check-in and 30/30 text news read).",
+			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			"name":        "run_jd_daily",
+			"description": "Run 0-Token JD Daily automation (东东农场 sign-in, water bubbles, 6s browse tasks, milestone watering tasks only, plus 天天刮京豆).",
+			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			"name":        "post_notification",
+			"description": "Post a summary notification to the Android system notification shade.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"title": map[string]any{"type": "string"},
+					"text":  map[string]any{"type": "string"},
+					"tag":   map[string]any{"type": "string"},
+				},
+				"required": []string{"text"},
 			},
 		},
 	}
