@@ -3,96 +3,1169 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
-<meta name="theme-color" content="#0f172a">
-<title>小米13 Agent</title>
-<link rel="stylesheet" href="/internal/insets.css">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#09090b">
+<title>Xiaomi 13 Agent</title>
+<script>
+if (typeof window.ksu?.exec === 'function') {
+  const l = document.createElement('link');
+  l.rel = 'stylesheet';
+  l.href = '/internal/insets.css';
+  document.head.appendChild(l);
+}
+</script>
 <style>
-:root{--bg:#0f172a;--card:#1e293b;--border:#334155;--text:#f1f5f9;--muted:#94a3b8;--accent:#38bdf8;--green:#22c55e;--red:#ef4444;--amber:#f59e0b}
-*{box-sizing:border-box}
-body{margin:0;padding-top:var(--window-inset-top,0px);padding-bottom:var(--window-inset-bottom,0px);font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);display:flex;flex-direction:column;height:100dvh}
-header{padding:10px 14px;background:var(--card);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:8px}
-.brand{font-weight:700;font-size:15px;display:flex;align-items:center;gap:8px;min-width:0}
-.pill{font-size:11px;padding:2px 8px;border-radius:999px;background:#0284c733;color:var(--accent);border:1px solid #0284c766;white-space:nowrap}
-.pill.err{background:#ef444433;color:#fca5a5;border-color:#ef444466}
-.hdr-btns{display:flex;gap:6px;flex-shrink:0}
-button{background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:8px 12px;font-size:13px;cursor:pointer;font-weight:600}
-button.primary{background:#0284c7;border-color:#0ea5e9;color:#fff}
-button.danger{background:#dc262633;border-color:#ef4444;color:#fca5a5}
-button:disabled{opacity:.45;cursor:not-allowed}
-.banner{padding:8px 12px;background:#78350f;color:#fef3c7;font-size:12px;border-bottom:1px solid #b45309;display:none}
-.banner.show{display:block}
-.quick{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;padding:10px 12px;background:#0b1220;border-bottom:1px solid var(--border)}
-.quick button{display:flex;align-items:center;justify-content:center;gap:6px;padding:10px 8px;font-size:13px}
-.logs-wrap{background:#090d16;border-bottom:1px solid var(--border);padding:8px 12px;font-size:12px}
-.logs-hdr{display:flex;justify-content:space-between;align-items:center;color:var(--muted)}
-pre#logs{margin:6px 0 0;max-height:140px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,monospace;font-size:11px;color:#cbd5e1;display:none}
-pre#logs.open{display:block}
-.chat{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px}
-.msg{max-width:88%;padding:10px 13px;border-radius:14px;font-size:14px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
-.msg.user{align-self:flex-end;background:#0284c7;color:#fff;border-bottom-right-radius:4px}
-.msg.bot{align-self:flex-start;background:var(--card);border:1px solid var(--border);border-bottom-left-radius:4px}
-.tools{margin-top:6px;font-size:11px;color:var(--accent)}
-.composer{padding:10px 12px;background:var(--card);border-top:1px solid var(--border);display:flex;gap:8px}
-.composer input{flex:1;background:#0f172a;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 12px;font-size:14px;outline:none}
-.modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;padding:16px;z-index:20}
-.modal.open{display:flex}
-.panel{width:100%;max-width:440px;background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:10px}
-.panel h3{margin:0 0 4px;font-size:16px}
-.field{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
-.field input,.field select{background:#0f172a;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:9px 10px;font-size:13px}
-.row{display:flex;gap:8px;justify-content:flex-end;margin-top:6px}
+:root {
+  --bg: #09090b;
+  --surface: rgba(24, 24, 27, 0.78);
+  --surface-solid: #141418;
+  --surface-2: #1c1c22;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --text: #f4f4f5;
+  --muted: #8e8e98;
+  --dim: #52525b;
+  --cyan: #38bdf8;
+  --indigo: #6366f1;
+  --emerald: #10b981;
+  --amber: #f59e0b;
+  --rose: #f43f5e;
+  --radius-card: 18px;
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "HarmonyOS Sans SC", "MiSans", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  padding-top: var(--window-inset-top, env(safe-area-inset-top, 0px));
+  padding-bottom: var(--window-inset-bottom, env(safe-area-inset-bottom, 0px));
+  background-image:
+    radial-gradient(85% 42% at 50% -8%, rgba(56, 189, 248, 0.13), transparent 70%),
+    radial-gradient(55% 32% at 88% 4%, rgba(99, 102, 241, 0.10), transparent 72%);
+  background-attachment: fixed;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ---------- Header ---------- */
+.topbar {
+  height: 56px;
+  padding: 0 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: rgba(9, 9, 11, 0.72);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  z-index: 10;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+}
+
+.orb {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  position: relative;
+  background: conic-gradient(from 140deg, #38bdf8, #6366f1, #a855f7, #38bdf8);
+  box-shadow: 0 0 18px rgba(56, 189, 248, 0.35), inset 0 0 6px rgba(255, 255, 255, 0.35);
+  animation: orbBreath 4.2s ease-in-out infinite;
+}
+
+.orb::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 32% 30%, rgba(255,255,255,0.65), rgba(14,165,233,0.25) 45%, #09090b 92%);
+}
+
+.orb.sm {
+  width: 20px;
+  height: 20px;
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.28);
+}
+
+.orb.sm::after {
+  inset: 2.5px;
+}
+
+.orb.lg {
+  width: 56px;
+  height: 56px;
+  box-shadow: 0 0 38px rgba(56, 189, 248, 0.34), 0 0 70px rgba(99, 102, 241, 0.18);
+}
+
+.orb.lg::after {
+  inset: 5px;
+}
+
+.orb.busy {
+  background: conic-gradient(from 0deg, #f59e0b, #38bdf8, #6366f1, #f59e0b);
+  animation: orbSpin 1.4s linear infinite;
+}
+
+.orb.warn {
+  background: conic-gradient(from 120deg, #f43f5e, #fb7185, #be123c, #f43f5e);
+  box-shadow: 0 0 16px rgba(244, 63, 94, 0.35);
+}
+
+@keyframes orbBreath {
+  0%, 100% { transform: scale(1); filter: brightness(1); }
+  50% { transform: scale(1.05); filter: brightness(1.16); }
+}
+
+@keyframes orbSpin {
+  to { transform: rotate(360deg); }
+}
+
+.brand-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.brand-title {
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.brand-sub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--emerald);
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.7);
+  flex-shrink: 0;
+}
+
+.status-dot.warn {
+  background: var(--amber);
+  box-shadow: 0 0 8px rgba(245, 158, 11, 0.7);
+}
+
+.status-dot.err {
+  background: var(--rose);
+  box-shadow: 0 0 8px rgba(244, 63, 94, 0.7);
+}
+
+.top-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.icon-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+  color: var(--text);
+  position: relative;
+  transition: background 0.15s, transform 0.12s, border-color 0.15s;
+}
+
+.icon-btn:active {
+  transform: scale(0.92);
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.icon-btn .badge-dot {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--cyan);
+  box-shadow: 0 0 8px var(--cyan);
+  display: none;
+}
+
+.icon-btn.active .badge-dot {
+  display: block;
+}
+
+svg.ic {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.85;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* ---------- Dynamic Island Job Pill ---------- */
+.island-wrap {
+  padding: 8px 14px 0;
+  display: none;
+  flex-shrink: 0;
+  z-index: 8;
+}
+
+.island-wrap.open {
+  display: block;
+}
+
+.island {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: 14px;
+  background: rgba(24, 24, 27, 0.86);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.island-main {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  flex: 1;
+}
+
+.spinner {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 2px solid rgba(56, 189, 248, 0.22);
+  border-top-color: var(--cyan);
+  animation: orbSpin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+.island-text {
+  min-width: 0;
+  flex: 1;
+}
+
+.island-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.island-sub {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 1px;
+}
+
+.island-btns {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.mini-btn {
+  padding: 5px 10px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.mini-btn.danger {
+  background: rgba(244, 63, 94, 0.14);
+  border-color: rgba(244, 63, 94, 0.35);
+  color: #fda4af;
+}
+
+/* ---------- Main Scroll Viewport ---------- */
+.viewport {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 16px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  scroll-behavior: smooth;
+}
+
+.viewport::-webkit-scrollbar {
+  width: 0;
+}
+
+/* ---------- Hero Empty State ---------- */
+.hero {
+  margin: auto 0;
+  padding: 12px 0 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  animation: fadeUp 0.28s ease-out;
+}
+
+.hero.hidden {
+  display: none;
+}
+
+.hero h1 {
+  margin: 18px 0 6px;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  background: linear-gradient(180deg, #ffffff 0%, #a1a1aa 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.hero p {
+  margin: 0 0 22px;
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.cap-grid {
+  width: 100%;
+  max-width: 520px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  text-align: left;
+}
+
+.cap-card {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.045) 0%, rgba(255, 255, 255, 0.02) 100%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  transition: transform 0.14s ease, border-color 0.18s ease, background 0.18s ease;
+}
+
+.cap-card:active {
+  transform: scale(0.97);
+  border-color: rgba(56, 189, 248, 0.4);
+  background: rgba(56, 189, 248, 0.07);
+}
+
+.cap-ic {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cap-ic.cyan { background: rgba(56, 189, 248, 0.14); color: var(--cyan); }
+.cap-ic.amber { background: rgba(245, 158, 11, 0.14); color: var(--amber); }
+.cap-ic.emerald { background: rgba(16, 185, 129, 0.14); color: var(--emerald); }
+.cap-ic.indigo { background: rgba(99, 102, 241, 0.16); color: #a5b4fc; }
+
+.cap-title {
+  font-size: 13.5px;
+  font-weight: 620;
+  color: var(--text);
+  line-height: 1.25;
+}
+
+.cap-desc {
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+/* ---------- Editorial Chat Feed ---------- */
+.feed {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  width: 100%;
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.turn-user {
+  align-self: flex-end;
+  max-width: 84%;
+  padding: 10px 15px;
+  border-radius: 20px 20px 6px 20px;
+  background: linear-gradient(135deg, #2563eb 0%, #0284c7 100%);
+  color: #fff;
+  font-size: 14.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  box-shadow: 0 4px 16px rgba(2, 132, 199, 0.22);
+  animation: fadeUp 0.18s ease-out;
+}
+
+.turn-agent {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  animation: fadeUp 0.2s ease-out;
+}
+
+.agent-hdr {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.agent-meta {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.tool-box {
+  margin-left: 28px;
+  background: rgba(56, 189, 248, 0.06);
+  border: 1px solid rgba(56, 189, 248, 0.18);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.tool-summary {
+  padding: 7px 11px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+  color: #7dd3fc;
+  cursor: pointer;
+  user-select: none;
+}
+
+.tool-summary-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tool-steps {
+  display: none;
+  padding: 0 11px 9px;
+  flex-wrap: wrap;
+  gap: 6px;
+  border-top: 1px solid rgba(56, 189, 248, 0.12);
+  padding-top: 8px;
+}
+
+.tool-box.open .tool-steps {
+  display: flex;
+}
+
+.tool-chip {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 7px;
+  background: rgba(9, 9, 11, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #bae6fd;
+}
+
+.agent-body {
+  padding-left: 28px;
+  font-size: 14.5px;
+  line-height: 1.62;
+  color: #e4e4e7;
+  word-break: break-word;
+}
+
+.agent-body p {
+  margin: 0 0 8px;
+}
+
+.agent-body p:last-child {
+  margin-bottom: 0;
+}
+
+.agent-body ul, .agent-body ol {
+  margin: 6px 0;
+  padding-left: 18px;
+}
+
+.agent-body li {
+  margin: 3px 0;
+}
+
+.agent-body h3, .agent-body h4 {
+  margin: 10px 0 4px;
+  font-size: 14.5px;
+  font-weight: 650;
+  color: #fff;
+}
+
+.agent-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  padding: 1.5px 5px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #7dd3fc;
+}
+
+.agent-body pre {
+  margin: 8px 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #0d0d12;
+  border: 1px solid var(--border);
+  overflow-x: auto;
+}
+
+.agent-body pre code {
+  padding: 0;
+  background: none;
+  color: #cbd5e1;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.agent-error {
+  padding-left: 28px;
+  font-size: 13.5px;
+  color: #fda4af;
+}
+
+.thinking-row {
+  padding-left: 28px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.dots {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--cyan);
+  animation: dotPulse 1.2s infinite ease-in-out;
+}
+
+.dots span:nth-child(2) { animation-delay: 0.18s; }
+.dots span:nth-child(3) { animation-delay: 0.36s; }
+
+@keyframes dotPulse {
+  0%, 80%, 100% { opacity: 0.25; transform: scale(0.8); }
+  40% { opacity: 1; transform: scale(1.1); }
+}
+
+/* ---------- Floating Capsule Dock ---------- */
+.dock {
+  padding: 6px 12px 12px;
+  background: linear-gradient(180deg, transparent 0%, rgba(9, 9, 11, 0.9) 26%, var(--bg) 100%);
+  flex-shrink: 0;
+  z-index: 9;
+}
+
+.chips-row {
+  display: flex;
+  gap: 7px;
+  overflow-x: auto;
+  padding: 0 2px 8px;
+  max-width: 720px;
+  margin: 0 auto;
+  scrollbar-width: none;
+}
+
+.chips-row::-webkit-scrollbar {
+  display: none;
+}
+
+.chip {
+  flex-shrink: 0;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  color: #d4d4d8;
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+  transition: background 0.14s, transform 0.1s;
+}
+
+.chip:active {
+  transform: scale(0.96);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.capsule {
+  max-width: 720px;
+  margin: 0 auto;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 7px 8px 7px 16px;
+  border-radius: 26px;
+  background: #16161b;
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  transition: border-color 0.18s;
+}
+
+.capsule:focus-within {
+  border-color: rgba(56, 189, 248, 0.55);
+}
+
+.capsule textarea {
+  flex: 1;
+  background: none;
+  border: 0;
+  outline: none;
+  resize: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 14.5px;
+  line-height: 1.45;
+  max-height: 112px;
+  padding: 6px 0;
+  margin: 0;
+}
+
+.capsule textarea::placeholder {
+  color: var(--dim);
+}
+
+.send-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #f4f4f5;
+  color: #09090b;
+  transition: transform 0.12s, opacity 0.15s, background 0.15s;
+}
+
+.send-btn:active {
+  transform: scale(0.92);
+}
+
+.send-btn:disabled {
+  background: rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.35);
+  opacity: 1;
+}
+
+/* ---------- Slide-Up Bottom Sheets ---------- */
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  display: none;
+  align-items: flex-end;
+  justify-content: center;
+  z-index: 40;
+}
+
+.backdrop.open {
+  display: flex;
+}
+
+.sheet {
+  width: 100%;
+  max-width: 560px;
+  max-height: 84dvh;
+  background: #131317;
+  border-top: 1px solid var(--border-strong);
+  border-radius: 24px 24px 0 0;
+  padding: 10px 16px calc(18px + var(--window-inset-bottom, env(safe-area-inset-bottom, 0px)));
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow-y: auto;
+  animation: sheetUp 0.2s cubic-bezier(0.2, 0.85, 0.3, 1);
+}
+
+@keyframes sheetUp {
+  from { transform: translateY(24px); opacity: 0.5; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+.sheet-handle {
+  width: 38px;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.2);
+  margin: 2px auto 2px;
+  flex-shrink: 0;
+}
+
+.sheet-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.sheet-hdr h2 {
+  margin: 0;
+  font-size: 16.5px;
+  font-weight: 650;
+}
+
+.task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.task-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 15px;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid var(--border);
+  text-align: left;
+}
+
+.task-row:active {
+  background: rgba(56, 189, 248, 0.08);
+  border-color: rgba(56, 189, 248, 0.35);
+}
+
+.task-row-left {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+}
+
+.task-meta-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.task-meta-sub {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.term-box {
+  background: #08080b;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 10px 12px;
+}
+
+.term-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+pre#sheetLogs {
+  margin: 0;
+  max-height: 210px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #cbd5e1;
+}
+
+/* ---------- Settings Form & Presets ---------- */
+.presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.preset-btn {
+  padding: 6px 11px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 550;
+  background: rgba(56, 189, 248, 0.09);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  color: #bae6fd;
+}
+
+.preset-btn:active {
+  background: rgba(56, 189, 248, 0.2);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.field input, .field select {
+  width: 100%;
+  background: #09090c;
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  padding: 11px 12px;
+  font-size: 13.5px;
+  outline: none;
+}
+
+.field input:focus, .field select:focus {
+  border-color: var(--cyan);
+}
+
+.sheet-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.btn-secondary {
+  flex: 1;
+  padding: 11px;
+  border-radius: 13px;
+  font-size: 14px;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border);
+  text-align: center;
+}
+
+.btn-primary {
+  flex: 1.4;
+  padding: 11px;
+  border-radius: 13px;
+  font-size: 14px;
+  font-weight: 600;
+  background: linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%);
+  color: #fff;
+  text-align: center;
+}
+
+.btn-danger {
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  background: rgba(244, 63, 94, 0.14);
+  border: 1px solid rgba(244, 63, 94, 0.35);
+  color: #fda4af;
+}
+
+.hidden {
+  display: none !important;
+}
 </style>
 </head>
 <body>
-<header>
-  <div class="brand">📱 小米13 Agent <span id="guardPill" class="pill">连接中</span></div>
-  <div class="hdr-btns">
-    <button onclick="clearChat()">清空</button>
-    <button onclick="openSettings()">⚙ 设置</button>
+
+<header class="topbar">
+  <div class="brand">
+    <div id="topOrb" class="orb"></div>
+    <div class="brand-meta">
+      <div class="brand-title">Xiaomi 13 Agent</div>
+      <div class="brand-sub">
+        <span id="statusDot" class="status-dot warn"></span>
+        <span id="statusText">连接中...</span>
+      </div>
+    </div>
+  </div>
+  <div class="top-actions">
+    <button id="autoBtn" class="icon-btn" onclick="openSheet('autoSheet')" title="自动化引擎">
+      <span class="badge-dot"></span>
+      <svg class="ic" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></svg>
+    </button>
+    <button class="icon-btn" onclick="clearChat()" title="新建对话">
+      <svg class="ic" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+    </button>
+    <button class="icon-btn" onclick="openSettings()" title="模型设置">
+      <svg class="ic" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2"/><circle cx="15.5" cy="12" r="2"/><circle cx="10.5" cy="18" r="2"/></svg>
+    </button>
   </div>
 </header>
 
-<div id="envBanner" class="banner">请在 KernelSU 模块页点击「WebUI」打开，或用浏览器访问 http://127.0.0.1:8765/ui</div>
-
-<div class="quick">
-  <button class="primary" onclick="runJob('daily_all')">⚡ 每日一键全清</button>
-  <button onclick="runJob('ms_rewards')">🪙 微软积分</button>
-  <button onclick="runJob('jd_daily')">🌱 京东农场+京豆</button>
-  <button id="cancelBtn" class="danger" onclick="cancelJob()" disabled>⏹ 停止任务</button>
-</div>
-
-<div class="logs-wrap">
-  <div class="logs-hdr" onclick="toggleLogs()">
-    <span id="jobBadge">任务状态：空闲</span>
-    <span id="toggleTip">展开日志 ▾</span>
+<div id="islandWrap" class="island-wrap">
+  <div class="island" onclick="openSheet('autoSheet')">
+    <div class="island-main">
+      <div id="islandSpin" class="spinner"></div>
+      <div class="island-text">
+        <div class="island-title"><span id="islandTitle">任务运行中</span></div>
+        <div id="islandSub" class="island-sub">正在初始化...</div>
+      </div>
+    </div>
+    <div class="island-btns" onclick="event.stopPropagation()">
+      <button class="mini-btn" onclick="openSheet('autoSheet')">日志</button>
+      <button id="islandStopBtn" class="mini-btn danger" onclick="cancelJob()">停止</button>
+    </div>
   </div>
-  <pre id="logs"></pre>
 </div>
 
-<div id="chat" class="chat">
-  <div id="welcomeMsg" class="msg bot">KernelSU Root 免密桥接已就绪。点上方按钮可 0-Token 一键跑完每日任务；或在下方直接发指令，由云端 LLM 思考执行。</div>
+<main id="viewport" class="viewport">
+  <section id="hero" class="hero">
+    <div id="heroOrb" class="orb lg"></div>
+    <h1>有什么可以帮你？</h1>
+    <p>小米 13 端侧大脑 · WebView 20ms DOM · 0-Token 原生自动化</p>
+
+    <div class="cap-grid">
+      <button class="cap-card" onclick="runJob('daily_all', true)">
+        <div class="cap-ic cyan">
+          <svg class="ic" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></svg>
+        </div>
+        <div>
+          <div class="cap-title">每日一键全清</div>
+          <div class="cap-desc">微软积分 + 京东农场 · 0 Token</div>
+        </div>
+      </button>
+
+      <button class="cap-card" onclick="runJob('ms_rewards', true)">
+        <div class="cap-ic amber">
+          <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M9.5 9.5h4a1.5 1.5 0 0 1 0 3h-3a1.5 1.5 0 0 0 0 3h4M12 7.5v9"/></svg>
+        </div>
+        <div>
+          <div class="cap-title">微软积分任务</div>
+          <div class="cap-desc">Edge &amp; Bing DOM 自动刷分</div>
+        </div>
+      </button>
+
+      <button class="cap-card" onclick="runJob('jd_daily', true)">
+        <div class="cap-ic emerald">
+          <svg class="ic" viewBox="0 0 24 24"><path d="M7 20h10M12 20v-8M12 12C7 12 5 8 5 4c4 0 7 2 7 8ZM12 14c5 0 7-3.5 7-7.5-4 0-7 2-7 7.5Z"/></svg>
+        </div>
+        <div>
+          <div class="cap-title">京东农场 + 京豆</div>
+          <div class="cap-desc">收树上水滴 · 浏览任务 · 刮豆</div>
+        </div>
+      </button>
+
+      <button class="cap-card" onclick="quickPrompt('帮我检查一下当前手机前台应用、守护状态和屏幕信息')">
+        <div class="cap-ic indigo">
+          <svg class="ic" viewBox="0 0 24 24"><rect x="6" y="2.5" width="12" height="19" rx="3"/><path d="M10.5 18h3"/></svg>
+        </div>
+        <div>
+          <div class="cap-title">诊断当前手机</div>
+          <div class="cap-desc">查看前台应用 · 守护与状态</div>
+        </div>
+      </button>
+    </div>
+  </section>
+
+  <section id="feed" class="feed"></section>
+</main>
+
+<footer class="dock">
+  <div id="chipsRow" class="chips-row">
+    <button class="chip" onclick="quickPrompt('截屏看看当前手机界面上有什么内容')">截屏识别当前界面</button>
+    <button class="chip" onclick="quickPrompt('查一下现在前台是什么应用，CDP 是否可用')">查看前台与 CDP</button>
+    <button class="chip" onclick="runJob('daily_all', true)">0-Token 每日一键全清</button>
+    <button class="chip" onclick="openSheet('autoSheet')">任务日志控制台</button>
+  </div>
+  <div class="capsule">
+    <textarea id="prompt" rows="1" placeholder="给 Xiaomi 13 Agent 发指令..."></textarea>
+    <button id="sendBtn" class="send-btn" onclick="sendChat()" disabled aria-label="发送">
+      <svg class="ic" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+    </button>
+  </div>
+</footer>
+
+<!-- Automation Bottom Sheet -->
+<div id="autoSheet" class="backdrop" onclick="closeSheet('autoSheet')">
+  <div class="sheet" onclick="event.stopPropagation()">
+    <div class="sheet-handle"></div>
+    <div class="sheet-hdr">
+      <h2>0-Token 自动化引擎</h2>
+      <button id="sheetStopBtn" class="btn-danger hidden" onclick="cancelJob()">停止任务</button>
+    </div>
+    <div class="task-list">
+      <button class="task-row" onclick="runJob('daily_all', false)">
+        <div class="task-row-left">
+          <div class="cap-ic cyan"><svg class="ic" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></svg></div>
+          <div>
+            <div class="task-meta-title">每日一键全清</div>
+            <div class="task-meta-sub">依次执行微软积分与京东农场/刮京豆</div>
+          </div>
+        </div>
+        <span class="mini-btn">运行</span>
+      </button>
+      <button class="task-row" onclick="runJob('ms_rewards', false)">
+        <div class="task-row-left">
+          <div class="cap-ic amber"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M9.5 9.5h4a1.5 1.5 0 0 1 0 3h-3a1.5 1.5 0 0 0 0 3h4M12 7.5v9"/></svg></div>
+          <div>
+            <div class="task-meta-title">微软积分每日任务</div>
+            <div class="task-meta-sub">Edge Daily + Bing CDP 签入与纯文阅读</div>
+          </div>
+        </div>
+        <span class="mini-btn">运行</span>
+      </button>
+      <button class="task-row" onclick="runJob('jd_daily', false)">
+        <div class="task-row-left">
+          <div class="cap-ic emerald"><svg class="ic" viewBox="0 0 24 24"><path d="M7 20h10M12 20v-8M12 12C7 12 5 8 5 4c4 0 7 2 7 8ZM12 14c5 0 7-3.5 7-7.5-4 0-7 2-7 7.5Z"/></svg></div>
+          <div>
+            <div class="task-meta-title">京东农场 + 天天刮京豆</div>
+            <div class="task-meta-sub">WebView CDP 20ms 直控，安全 6s 浏览</div>
+          </div>
+        </div>
+        <span class="mini-btn">运行</span>
+      </button>
+    </div>
+    <div class="term-box">
+      <div class="term-hdr">
+        <span id="sheetJobBadge">执行状态：空闲</span>
+        <span id="sheetAuthBadge"></span>
+      </div>
+      <pre id="sheetLogs">暂无后台任务日志。</pre>
+    </div>
+    <div class="sheet-actions">
+      <button class="btn-secondary" onclick="closeSheet('autoSheet')">关闭</button>
+    </div>
+  </div>
 </div>
 
-<div class="composer">
-  <input id="prompt" placeholder="输入指令，如：查一下当前前台应用和状态..." onkeydown="if(event.key==='Enter')sendChat()">
-  <button id="sendBtn" class="primary" onclick="sendChat()">发送</button>
-</div>
+<!-- Settings Bottom Sheet -->
+<div id="settingsSheet" class="backdrop" onclick="closeSheet('settingsSheet')">
+  <div class="sheet" onclick="event.stopPropagation()">
+    <div class="sheet-handle"></div>
+    <div class="sheet-hdr">
+      <h2>云端大模型与鉴权</h2>
+      <span id="authModeTag" class="agent-meta"></span>
+    </div>
 
-<div id="settingsModal" class="modal">
-  <div class="panel">
-    <h3>云端 LLM 设置（KernelSU 自动鉴权）</h3>
-    <div class="field">LLM 协议
+    <div id="tokenField" class="field">
+      Bearer Token（浏览器访问需要，KernelSU 内免填）
+      <input id="cfgToken" type="password" placeholder="粘贴 config.json 中的 bearer_token">
+    </div>
+
+    <div class="field">
+      NVIDIA NIM 实测优选预设（一键填充）
+      <div class="presets">
+        <button class="preset-btn" onclick="applyPreset('nvidia/nemotron-3.5-super-vl-120b-a12b')">Super VL 120B（快+视觉推荐）</button>
+        <button class="preset-btn" onclick="applyPreset('nvidia/nemotron-3.5-lightning-30b-a3b')">Lightning 30B（极速纯文）</button>
+        <button class="preset-btn" onclick="applyPreset('nvidia/nemotron-3.5-bolt-e4b')">Bolt E4B（超轻视觉）</button>
+      </div>
+    </div>
+
+    <div class="field">
+      LLM 协议
       <select id="cfgProvider">
-        <option value="openai">OpenAI 兼容（NVIDIA NIM / DeepSeek / 中转）</option>
+        <option value="openai">OpenAI 兼容（NVIDIA NIM / DeepSeek / OpenRouter）</option>
         <option value="gemini">Google Gemini 原生</option>
       </select>
     </div>
-    <div class="field">Base URL<input id="cfgBaseURL" placeholder="如 https://integrate.api.nvidia.com/v1"></div>
-    <div class="field">API Key（留空则保留原密钥）<input id="cfgAPIKey" type="password" placeholder="nvapi-... / sk-... / AIza..."></div>
-    <div class="field">Model<input id="cfgModel" placeholder="如 nvidia/nemotron-3.5-super-vl-120b-a12b"></div>
-    <div class="row">
-      <button onclick="closeSettings()">取消</button>
-      <button class="primary" onclick="saveSettings()">保存</button>
+    <div class="field">
+      Base URL
+      <input id="cfgBaseURL" placeholder="https://integrate.api.nvidia.com/v1">
+    </div>
+    <div class="field">
+      API Key（留空则保留手机端现有密钥）
+      <input id="cfgAPIKey" type="password" placeholder="nvapi-... / sk-... / AIza...">
+    </div>
+    <div class="field">
+      Model
+      <input id="cfgModel" placeholder="nvidia/nemotron-3.5-super-vl-120b-a12b">
+    </div>
+
+    <div class="sheet-actions">
+      <button class="btn-secondary" onclick="closeSheet('settingsSheet')">取消</button>
+      <button class="btn-primary" onclick="saveSettings()">保存配置</button>
     </div>
   </div>
 </div>
@@ -100,16 +1173,37 @@ pre#logs.open{display:block}
 <script>
 const KSU_SUPPORTED = typeof window.ksu?.exec === 'function';
 const API_BRIDGE = '/data/adb/modules/android_agent/bin/ksu_api.sh';
+const TOKEN_KEY = 'agent_bearer_token';
+const JOB_NAMES = {
+  daily_all: '每日一键全清',
+  ms_rewards: '微软积分任务',
+  jd_daily: '京东农场 + 京豆',
+};
+
 let seq = 0;
 let polling = false;
+let sending = false;
+let currentModelName = '';
+let lastGuardState = '';
 
+if (!KSU_SUPPORTED && location.hash.startsWith('#token=')) {
+  localStorage.setItem(TOKEN_KEY, decodeURIComponent(location.hash.slice(7)));
+  history.replaceState(null, '', location.pathname);
+}
+
+const getToken = () => localStorage.getItem(TOKEN_KEY) || '';
 const quote = v => "'" + String(v).replace(/'/g, "'\\''") + "'";
 const toBase64 = s => btoa(Array.from(new TextEncoder().encode(s), b => String.fromCharCode(b)).join(''));
 
+function shortModel(m) {
+  if (!m) return '未配置模型';
+  const name = m.includes('/') ? m.split('/').pop() : m;
+  return name.length > 26 ? name.slice(0, 26) + '…' : name;
+}
+
 function ksuExec(cmd, timeoutMs = 15000) {
-  if (!KSU_SUPPORTED) return Promise.reject(new Error('未检测到 KernelSU WebUI 桥接接口'));
   return new Promise((resolve, reject) => {
-    const cb = `__agent_ksu_${Date.now()}_${seq++}`;
+    const cb = `__agent_ui_${Date.now()}_${seq++}`;
     const timer = setTimeout(() => {
       delete window[cb];
       reject(new Error('操作超时，请稍后重试'));
@@ -141,64 +1235,263 @@ function ksuExec(cmd, timeoutMs = 15000) {
 }
 
 async function api(path, method = 'GET', body = null, timeoutMs = 15000) {
-  let cmd = `sh ${quote(API_BRIDGE)} ${method} ${quote(path)}`;
-  if (body !== null) {
-    cmd += ' ' + quote(toBase64(JSON.stringify(body)));
+  if (KSU_SUPPORTED) {
+    let cmd = `sh ${quote(API_BRIDGE)} ${method} ${quote(path)}`;
+    if (body !== null) cmd += ' ' + quote(toBase64(JSON.stringify(body)));
+    const raw = await ksuExec(cmd, timeoutMs);
+    if (!raw) return {};
+    const data = JSON.parse(raw);
+    if (data && data.error) throw new Error(data.error);
+    return data;
   }
-  const raw = await ksuExec(cmd, timeoutMs);
-  if (!raw) return {};
-  const data = JSON.parse(raw);
-  if (data && data.error) throw new Error(data.error);
-  return data;
+
+  const tok = getToken();
+  const headers = {'Authorization': 'Bearer ' + tok};
+  if (body !== null) headers['Content-Type'] = 'application/json';
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(path, {
+      method,
+      headers,
+      body: body !== null ? JSON.stringify(body) : undefined,
+      signal: ctrl.signal,
+    });
+    if (r.status === 401) {
+      openSettings();
+      throw new Error('Bearer Token 未设置或无效');
+    }
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-function addMsg(role, text, tools) {
-  const box = document.getElementById('chat');
+/* ---------- Lightweight Safe Markdown ---------- */
+function escapeHTML(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function renderInlineMD(line) {
+  let out = escapeHTML(line);
+  out = out.replace(/`([^`]+)`/g, '<code>$1</code>');
+  out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  return out;
+}
+
+function renderMarkdown(text) {
+  const src = String(text || '').replace(/\r\n/g, '\n');
+  const segments = src.split(/```/);
+  let html = '';
+  for (let i = 0; i < segments.length; i++) {
+    if (i % 2 === 1) {
+      const lines = segments[i].split('\n');
+      const code = lines.length > 1 && /^[a-zA-Z0-9_-]+$/.test(lines[0].trim())
+        ? lines.slice(1).join('\n')
+        : segments[i];
+      html += `<pre><code>${escapeHTML(code.trim())}</code></pre>`;
+      continue;
+    }
+    const blocks = segments[i].split('\n');
+    let inList = false;
+    for (const rawLine of blocks) {
+      const line = rawLine.trim();
+      if (!line) {
+        if (inList) { html += '</ul>'; inList = false; }
+        continue;
+      }
+      if (/^#{1,3}\s+/.test(line)) {
+        if (inList) { html += '</ul>'; inList = false; }
+        html += `<h4>${renderInlineMD(line.replace(/^#{1,3}\s+/, ''))}</h4>`;
+      } else if (/^[-*•]\s+/.test(line) || /^\d+\.\s+/.test(line)) {
+        if (!inList) { html += '<ul>'; inList = true; }
+        html += `<li>${renderInlineMD(line.replace(/^([-*•]|\d+\.)\s+/, ''))}</li>`;
+      } else {
+        if (inList) { html += '</ul>'; inList = false; }
+        html += `<p>${renderInlineMD(rawLine)}</p>`;
+      }
+    }
+    if (inList) html += '</ul>';
+  }
+  return html || '<p>(无回复内容)</p>';
+}
+
+/* ---------- Feed Rendering ---------- */
+function syncHeroVisibility() {
+  const hasTurns = document.getElementById('feed').children.length > 0;
+  document.getElementById('hero').classList.toggle('hidden', hasTurns);
+}
+
+function scrollToBottom() {
+  const vp = document.getElementById('viewport');
+  vp.scrollTop = vp.scrollHeight;
+}
+
+function appendUserBubble(text) {
   const d = document.createElement('div');
-  d.className = 'msg ' + role;
+  d.className = 'turn-user';
   d.textContent = text;
-  if (tools && tools.length) {
-    const t = document.createElement('div');
-    t.className = 'tools';
-    t.textContent = '调用工具: ' + tools.join(' → ');
-    d.appendChild(t);
-  }
-  box.appendChild(d);
-  box.scrollTop = box.scrollHeight;
+  document.getElementById('feed').appendChild(d);
+  syncHeroVisibility();
+  scrollToBottom();
 }
 
-function toggleLogs() {
-  const pre = document.getElementById('logs');
-  const open = pre.classList.toggle('open');
-  document.getElementById('toggleTip').textContent = open ? '收起日志 ▴' : '展开日志 ▾';
+function appendAgentBubble(text, tools = [], elapsedSec = null, isError = false) {
+  const wrap = document.createElement('div');
+  wrap.className = 'turn-agent';
+
+  const hdr = document.createElement('div');
+  hdr.className = 'agent-hdr';
+  const orb = document.createElement('div');
+  orb.className = 'orb sm' + (isError ? ' warn' : '');
+  const label = document.createElement('span');
+  label.textContent = 'Xiaomi 13 Agent';
+  hdr.appendChild(orb);
+  hdr.appendChild(label);
+  if (elapsedSec !== null && elapsedSec !== undefined) {
+    const meta = document.createElement('span');
+    meta.className = 'agent-meta';
+    meta.textContent = `· ${elapsedSec}s`;
+    hdr.appendChild(meta);
+  }
+  wrap.appendChild(hdr);
+
+  if (Array.isArray(tools) && tools.length > 0) {
+    const tbox = document.createElement('div');
+    tbox.className = 'tool-box';
+    const summary = document.createElement('div');
+    summary.className = 'tool-summary';
+    summary.onclick = () => tbox.classList.toggle('open');
+    summary.innerHTML = `<span class="tool-summary-left">✦ 已调用 ${tools.length} 步工具 · ${escapeHTML(tools.join(' → '))}</span><span>▾</span>`;
+    const steps = document.createElement('div');
+    steps.className = 'tool-steps';
+    tools.forEach((name, idx) => {
+      const chip = document.createElement('span');
+      chip.className = 'tool-chip';
+      chip.textContent = `${idx + 1}. ${name}`;
+      steps.appendChild(chip);
+    });
+    tbox.appendChild(summary);
+    tbox.appendChild(steps);
+    wrap.appendChild(tbox);
+  }
+
+  const body = document.createElement('div');
+  body.className = isError ? 'agent-error' : 'agent-body';
+  if (isError) {
+    body.textContent = text;
+  } else {
+    body.innerHTML = renderMarkdown(text);
+  }
+  wrap.appendChild(body);
+
+  document.getElementById('feed').appendChild(wrap);
+  syncHeroVisibility();
+  scrollToBottom();
+}
+
+function createThinkingBubble() {
+  const wrap = document.createElement('div');
+  wrap.className = 'turn-agent';
+  wrap.innerHTML = `
+    <div class="agent-hdr">
+      <div class="orb sm busy"></div>
+      <span>Xiaomi 13 Agent</span>
+      <span class="agent-meta" id="thinkClock">· 0.0s</span>
+    </div>
+    <div class="thinking-row">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span>正在分析意图与调度手机工具...</span>
+    </div>`;
+  document.getElementById('feed').appendChild(wrap);
+  syncHeroVisibility();
+  scrollToBottom();
+  const t0 = Date.now();
+  const timer = setInterval(() => {
+    const el = wrap.querySelector('#thinkClock');
+    if (el) el.textContent = `· ${((Date.now() - t0) / 1000).toFixed(1)}s`;
+  }, 150);
+  return {
+    remove() {
+      clearInterval(timer);
+      wrap.remove();
+      syncHeroVisibility();
+    },
+  };
+}
+
+/* ---------- Status & Job Polling ---------- */
+function updateHeaderStatus(guardState) {
+  lastGuardState = guardState || lastGuardState;
+  const dot = document.getElementById('statusDot');
+  const txt = document.getElementById('statusText');
+  const orb = document.getElementById('topOrb');
+  const modelPart = currentModelName ? ` · ${shortModel(currentModelName)}` : '';
+
+  if (guardState === 'active') {
+    dot.className = 'status-dot';
+    orb.classList.remove('warn');
+    txt.textContent = '守护正常' + modelPart;
+  } else if (guardState === 'offline') {
+    dot.className = 'status-dot err';
+    orb.classList.add('warn');
+    txt.textContent = '未连接' + modelPart;
+  } else {
+    dot.className = 'status-dot warn';
+    orb.classList.add('warn');
+    txt.textContent = `暂停(${guardState || '未知'})` + modelPart;
+  }
 }
 
 async function refreshStatus() {
-  const pill = document.getElementById('guardPill');
+  if (!KSU_SUPPORTED && !getToken()) {
+    updateHeaderStatus('需填Token');
+    return;
+  }
   try {
     const st = await api('/api/v1/status');
-    const gs = st.guard?.state || 'unknown';
-    pill.textContent = gs === 'active' ? '守护正常' : ('暂停:' + gs);
-    pill.className = gs === 'active' ? 'pill' : 'pill err';
-  } catch (e) {
-    pill.textContent = '离线';
-    pill.className = 'pill err';
+    updateHeaderStatus(st.guard?.state || 'unknown');
+  } catch (_) {
+    updateHeaderStatus('offline');
   }
 }
 
 async function refreshJob() {
+  if (!KSU_SUPPORTED && !getToken()) return;
   try {
     const j = await api('/api/v1/jobs/current');
-    document.getElementById('jobBadge').textContent = `任务：${j.name || '无'} [${j.state || 'idle'}]` + (j.elapsed_sec ? ` · ${j.elapsed_sec}s` : '');
-    document.getElementById('cancelBtn').disabled = j.state !== 'running';
-    const pre = document.getElementById('logs');
-    pre.textContent = (j.logs || []).join('\n') + (j.result ? '\n' + JSON.stringify(j.result, null, 2) : '');
-    if (j.state === 'running') pre.classList.add('open');
+    const state = j.state || 'idle';
+    const label = JOB_NAMES[j.name] || j.name || '自动化任务';
+    const running = state === 'running';
+
+    document.getElementById('autoBtn').classList.toggle('active', running);
+    document.getElementById('sheetStopBtn').classList.toggle('hidden', !running);
+    document.getElementById('sheetJobBadge').textContent = `任务：${j.name ? label : '空闲'} [${state}]` + (j.elapsed_sec ? ` · ${j.elapsed_sec}s` : '');
+
+    const pre = document.getElementById('sheetLogs');
+    const logs = (j.logs || []).join('\n') + (j.result ? '\n' + JSON.stringify(j.result, null, 2) : '');
+    pre.textContent = logs || '暂无后台任务日志。';
+    pre.scrollTop = pre.scrollHeight;
+
+    const islandWrap = document.getElementById('islandWrap');
+    if (running || (state !== 'idle' && (j.logs || []).length > 0)) {
+      islandWrap.classList.add('open');
+      document.getElementById('islandSpin').classList.toggle('hidden', !running);
+      document.getElementById('islandStopBtn').classList.toggle('hidden', !running);
+      const stateZh = running ? '运行中' : (state === 'completed' ? '已完成' : state);
+      document.getElementById('islandTitle').textContent = `${label} · ${stateZh}` + (j.elapsed_sec ? ` (${j.elapsed_sec}s)` : '');
+      const lastLine = (j.logs && j.logs.length) ? j.logs[j.logs.length - 1] : '准备就绪';
+      document.getElementById('islandSub').textContent = lastLine;
+    } else {
+      islandWrap.classList.remove('open');
+    }
   } catch (_) {}
 }
 
 async function pollTick() {
-  if (!KSU_SUPPORTED || polling) return;
+  if (polling) return;
   polling = true;
   try {
     await Promise.all([refreshStatus(), refreshJob()]);
@@ -207,13 +1500,14 @@ async function pollTick() {
   }
 }
 
-async function runJob(name) {
+/* ---------- Actions ---------- */
+async function runJob(name, openLogSheet) {
   try {
     await api('/api/v1/jobs/run', 'POST', {job: name});
-    document.getElementById('logs').classList.add('open');
+    if (openLogSheet) openSheet('autoSheet');
     await refreshJob();
   } catch (e) {
-    addMsg('bot', '启动失败：' + e.message);
+    appendAgentBubble('任务启动失败：' + e.message, [], null, true);
   }
 }
 
@@ -222,52 +1516,89 @@ async function cancelJob() {
     await api('/api/v1/jobs/cancel', 'POST', {});
     await refreshJob();
   } catch (e) {
-    addMsg('bot', '停止失败：' + e.message);
+    appendAgentBubble('停止任务失败：' + e.message, [], null, true);
   }
 }
 
+function quickPrompt(text) {
+  const ta = document.getElementById('prompt');
+  ta.value = text;
+  autoResizeInput();
+  sendChat();
+}
+
 async function sendChat() {
-  const inp = document.getElementById('prompt');
-  const msg = inp.value.trim();
-  if (!msg) return;
-  inp.value = '';
-  addMsg('user', msg);
-  const btn = document.getElementById('sendBtn');
-  btn.disabled = true;
-  btn.textContent = '思考中...';
+  const ta = document.getElementById('prompt');
+  const msg = ta.value.trim();
+  if (!msg || sending) return;
+  ta.value = '';
+  autoResizeInput();
+
+  sending = true;
+  document.getElementById('sendBtn').disabled = true;
+  document.getElementById('topOrb').classList.add('busy');
+
+  appendUserBubble(msg);
+  const thinking = createThinkingBubble();
+
   try {
     const res = await api('/api/v1/chat', 'POST', {message: msg}, 90000);
-    addMsg('bot', res.reply || '(无回复)', res.tools_used);
+    thinking.remove();
+    appendAgentBubble(res.reply || '(无回复)', res.tools_used || [], res.elapsed_sec);
   } catch (e) {
-    addMsg('bot', '错误：' + e.message);
+    thinking.remove();
+    appendAgentBubble(e.message, [], null, true);
   } finally {
-    btn.disabled = false;
-    btn.textContent = '发送';
+    sending = false;
+    document.getElementById('topOrb').classList.remove('busy');
+    syncSendState();
   }
 }
 
 async function clearChat() {
   try { await api('/api/v1/chat/clear', 'POST', {}); } catch (_) {}
-  document.getElementById('chat').innerHTML = '<div class="msg bot">对话已清空。</div>';
+  document.getElementById('feed').innerHTML = '';
+  syncHeroVisibility();
+}
+
+/* ---------- Sheets & Settings ---------- */
+function openSheet(id) {
+  document.getElementById(id).classList.add('open');
+  if (id === 'autoSheet') refreshJob();
+}
+
+function closeSheet(id) {
+  document.getElementById(id).classList.remove('open');
+}
+
+function applyPreset(model) {
+  document.getElementById('cfgProvider').value = 'openai';
+  document.getElementById('cfgBaseURL').value = 'https://integrate.api.nvidia.com/v1';
+  document.getElementById('cfgModel').value = model;
 }
 
 async function openSettings() {
-  document.getElementById('settingsModal').classList.add('open');
-  try {
-    const cfg = await api('/api/v1/llm/config');
-    document.getElementById('cfgProvider').value = cfg.provider || 'openai';
-    document.getElementById('cfgBaseURL').value = cfg.base_url || '';
-    document.getElementById('cfgModel').value = cfg.model || '';
-    document.getElementById('cfgAPIKey').value = '';
-    document.getElementById('cfgAPIKey').placeholder = cfg.api_key_masked ? ('当前: ' + cfg.api_key_masked) : 'nvapi-... / sk-... / AIza...';
-  } catch (_) {}
-}
-
-function closeSettings() {
-  document.getElementById('settingsModal').classList.remove('open');
+  document.getElementById('tokenField').classList.toggle('hidden', KSU_SUPPORTED);
+  document.getElementById('authModeTag').textContent = KSU_SUPPORTED ? 'KernelSU Root 免密' : 'Browser Bearer Auth';
+  if (!KSU_SUPPORTED) document.getElementById('cfgToken').value = getToken();
+  openSheet('settingsSheet');
+  if (KSU_SUPPORTED || getToken()) {
+    try {
+      const cfg = await api('/api/v1/llm/config');
+      document.getElementById('cfgProvider').value = cfg.provider || 'openai';
+      document.getElementById('cfgBaseURL').value = cfg.base_url || '';
+      document.getElementById('cfgModel').value = cfg.model || '';
+      document.getElementById('cfgAPIKey').value = '';
+      document.getElementById('cfgAPIKey').placeholder = cfg.api_key_masked ? ('当前已配置: ' + cfg.api_key_masked) : 'nvapi-... / sk-... / AIza...';
+    } catch (_) {}
+  }
 }
 
 async function saveSettings() {
+  if (!KSU_SUPPORTED) {
+    const tok = document.getElementById('cfgToken').value.trim();
+    if (tok) localStorage.setItem(TOKEN_KEY, tok);
+  }
   const body = {
     provider: document.getElementById('cfgProvider').value,
     base_url: document.getElementById('cfgBaseURL').value.trim(),
@@ -275,40 +1606,66 @@ async function saveSettings() {
   };
   const key = document.getElementById('cfgAPIKey').value.trim();
   if (key) body.api_key = key;
+
   try {
-    await api('/api/v1/llm/config', 'POST', body);
-    closeSettings();
-    addMsg('bot', `设置已保存，当前模型：${body.model || '(未变)'}`);
+    const saved = await api('/api/v1/llm/config', 'POST', body);
+    currentModelName = saved.model || body.model || currentModelName;
+    closeSheet('settingsSheet');
+    await refreshStatus();
   } catch (e) {
-    addMsg('bot', '保存设置失败：' + e.message);
+    appendAgentBubble('保存设置失败：' + e.message, [], null, true);
   }
 }
 
+/* ---------- Input Handling ---------- */
+function syncSendState() {
+  const hasText = document.getElementById('prompt').value.trim().length > 0;
+  document.getElementById('sendBtn').disabled = sending || !hasText;
+}
+
+function autoResizeInput() {
+  const ta = document.getElementById('prompt');
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 112) + 'px';
+  syncSendState();
+}
+
+const promptEl = document.getElementById('prompt');
+promptEl.addEventListener('input', autoResizeInput);
+promptEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendChat();
+  }
+});
+
 async function init() {
-  if (!KSU_SUPPORTED) {
-    document.getElementById('envBanner').classList.add('show');
-    document.getElementById('guardPill').textContent = '非KSU环境';
-    document.getElementById('guardPill').className = 'pill err';
+  document.getElementById('sheetAuthBadge').textContent = KSU_SUPPORTED ? 'KSU Root' : 'HTTP Bearer';
+  if (!KSU_SUPPORTED && !getToken()) {
+    updateHeaderStatus('需填Token');
+    openSettings();
     return;
   }
-  await pollTick();
   try {
     const [cfg, hist] = await Promise.all([
       api('/api/v1/llm/config').catch(() => null),
       api('/api/v1/chat/history').catch(() => null),
     ]);
-    if (cfg && cfg.model) {
-      document.getElementById('welcomeMsg').textContent = `KernelSU Root 免密桥接已就绪（当前模型：${cfg.model}）。点上方按钮可 0-Token 一键跑完每日任务；或在下方直接发指令交互。`;
-    }
+    if (cfg && cfg.model) currentModelName = cfg.model;
     if (hist && Array.isArray(hist.history) && hist.history.length > 0) {
       for (const m of hist.history) {
         if ((m.role === 'user' || m.role === 'assistant') && m.text) {
-          const tools = Array.isArray(m.tool_calls) ? m.tool_calls.map(tc => tc.name).filter(Boolean) : [];
-          addMsg(m.role === 'user' ? 'user' : 'bot', m.text, tools);
+          if (m.role === 'user') {
+            appendUserBubble(m.text);
+          } else {
+            const tools = Array.isArray(m.tool_calls) ? m.tool_calls.map(tc => tc.name).filter(Boolean) : [];
+            appendAgentBubble(m.text, tools);
+          }
         }
       }
     }
   } catch (_) {}
+  await pollTick();
   setInterval(pollTick, 3500);
 }
 
