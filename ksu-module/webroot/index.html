@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0f172a">
+<title>小米13 Agent</title>
+<link rel="stylesheet" href="/internal/insets.css">
+<style>
+:root{--bg:#0f172a;--card:#1e293b;--border:#334155;--text:#f1f5f9;--muted:#94a3b8;--accent:#38bdf8;--green:#22c55e;--red:#ef4444;--amber:#f59e0b}
+*{box-sizing:border-box}
+body{margin:0;padding-top:var(--window-inset-top,0px);padding-bottom:var(--window-inset-bottom,0px);font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);display:flex;flex-direction:column;height:100dvh}
+header{padding:10px 14px;background:var(--card);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:8px}
+.brand{font-weight:700;font-size:15px;display:flex;align-items:center;gap:8px;min-width:0}
+.pill{font-size:11px;padding:2px 8px;border-radius:999px;background:#0284c733;color:var(--accent);border:1px solid #0284c766;white-space:nowrap}
+.pill.err{background:#ef444433;color:#fca5a5;border-color:#ef444466}
+.hdr-btns{display:flex;gap:6px;flex-shrink:0}
+button{background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:8px 12px;font-size:13px;cursor:pointer;font-weight:600}
+button.primary{background:#0284c7;border-color:#0ea5e9;color:#fff}
+button.danger{background:#dc262633;border-color:#ef4444;color:#fca5a5}
+button:disabled{opacity:.45;cursor:not-allowed}
+.banner{padding:8px 12px;background:#78350f;color:#fef3c7;font-size:12px;border-bottom:1px solid #b45309;display:none}
+.banner.show{display:block}
+.quick{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;padding:10px 12px;background:#0b1220;border-bottom:1px solid var(--border)}
+.quick button{display:flex;align-items:center;justify-content:center;gap:6px;padding:10px 8px;font-size:13px}
+.logs-wrap{background:#090d16;border-bottom:1px solid var(--border);padding:8px 12px;font-size:12px}
+.logs-hdr{display:flex;justify-content:space-between;align-items:center;color:var(--muted)}
+pre#logs{margin:6px 0 0;max-height:140px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,monospace;font-size:11px;color:#cbd5e1;display:none}
+pre#logs.open{display:block}
+.chat{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:88%;padding:10px 13px;border-radius:14px;font-size:14px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.msg.user{align-self:flex-end;background:#0284c7;color:#fff;border-bottom-right-radius:4px}
+.msg.bot{align-self:flex-start;background:var(--card);border:1px solid var(--border);border-bottom-left-radius:4px}
+.tools{margin-top:6px;font-size:11px;color:var(--accent)}
+.composer{padding:10px 12px;background:var(--card);border-top:1px solid var(--border);display:flex;gap:8px}
+.composer input{flex:1;background:#0f172a;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 12px;font-size:14px;outline:none}
+.modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;padding:16px;z-index:20}
+.modal.open{display:flex}
+.panel{width:100%;max-width:440px;background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:10px}
+.panel h3{margin:0 0 4px;font-size:16px}
+.field{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
+.field input,.field select{background:#0f172a;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:9px 10px;font-size:13px}
+.row{display:flex;gap:8px;justify-content:flex-end;margin-top:6px}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">📱 小米13 Agent <span id="guardPill" class="pill">连接中</span></div>
+  <div class="hdr-btns">
+    <button onclick="clearChat()">清空</button>
+    <button onclick="openSettings()">⚙ 设置</button>
+  </div>
+</header>
+
+<div id="envBanner" class="banner">请在 KernelSU 模块页点击「WebUI」打开，或用浏览器访问 http://127.0.0.1:8765/ui</div>
+
+<div class="quick">
+  <button class="primary" onclick="runJob('daily_all')">⚡ 每日一键全清</button>
+  <button onclick="runJob('ms_rewards')">🪙 微软积分</button>
+  <button onclick="runJob('jd_daily')">🌱 京东农场+京豆</button>
+  <button id="cancelBtn" class="danger" onclick="cancelJob()" disabled>⏹ 停止任务</button>
+</div>
+
+<div class="logs-wrap">
+  <div class="logs-hdr" onclick="toggleLogs()">
+    <span id="jobBadge">任务状态：空闲</span>
+    <span id="toggleTip">展开日志 ▾</span>
+  </div>
+  <pre id="logs"></pre>
+</div>
+
+<div id="chat" class="chat">
+  <div id="welcomeMsg" class="msg bot">KernelSU Root 免密桥接已就绪。点上方按钮可 0-Token 一键跑完每日任务；或在下方直接发指令，由云端 LLM 思考执行。</div>
+</div>
+
+<div class="composer">
+  <input id="prompt" placeholder="输入指令，如：查一下当前前台应用和状态..." onkeydown="if(event.key==='Enter')sendChat()">
+  <button id="sendBtn" class="primary" onclick="sendChat()">发送</button>
+</div>
+
+<div id="settingsModal" class="modal">
+  <div class="panel">
+    <h3>云端 LLM 设置（KernelSU 自动鉴权）</h3>
+    <div class="field">LLM 协议
+      <select id="cfgProvider">
+        <option value="openai">OpenAI 兼容（NVIDIA NIM / DeepSeek / 中转）</option>
+        <option value="gemini">Google Gemini 原生</option>
+      </select>
+    </div>
+    <div class="field">Base URL<input id="cfgBaseURL" placeholder="如 https://integrate.api.nvidia.com/v1"></div>
+    <div class="field">API Key（留空则保留原密钥）<input id="cfgAPIKey" type="password" placeholder="nvapi-... / sk-... / AIza..."></div>
+    <div class="field">Model<input id="cfgModel" placeholder="如 nvidia/nemotron-3.5-super-vl-120b-a12b"></div>
+    <div class="row">
+      <button onclick="closeSettings()">取消</button>
+      <button class="primary" onclick="saveSettings()">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const KSU_SUPPORTED = typeof window.ksu?.exec === 'function';
+const API_BRIDGE = '/data/adb/modules/android_agent/bin/ksu_api.sh';
+let seq = 0;
+let polling = false;
+
+const quote = v => "'" + String(v).replace(/'/g, "'\\''") + "'";
+const toBase64 = s => btoa(Array.from(new TextEncoder().encode(s), b => String.fromCharCode(b)).join(''));
+
+function ksuExec(cmd, timeoutMs = 15000) {
+  if (!KSU_SUPPORTED) return Promise.reject(new Error('未检测到 KernelSU WebUI 桥接接口'));
+  return new Promise((resolve, reject) => {
+    const cb = `__agent_ksu_${Date.now()}_${seq++}`;
+    const timer = setTimeout(() => {
+      delete window[cb];
+      reject(new Error('操作超时，请稍后重试'));
+    }, timeoutMs);
+    window[cb] = (errno, stdout, stderr) => {
+      clearTimeout(timer);
+      delete window[cb];
+      const out = String(stdout || '').trim();
+      const err = String(stderr || '').trim();
+      if (Number(errno) !== 0) {
+        let msg = err || out || `命令返回 ${errno}`;
+        try {
+          const parsed = JSON.parse(out);
+          if (parsed && parsed.error) msg = parsed.error;
+        } catch (_) {}
+        reject(new Error(msg));
+        return;
+      }
+      resolve(out);
+    };
+    try {
+      window.ksu.exec(cmd, '{}', cb);
+    } catch (e) {
+      clearTimeout(timer);
+      delete window[cb];
+      reject(e);
+    }
+  });
+}
+
+async function api(path, method = 'GET', body = null, timeoutMs = 15000) {
+  let cmd = `sh ${quote(API_BRIDGE)} ${method} ${quote(path)}`;
+  if (body !== null) {
+    cmd += ' ' + quote(toBase64(JSON.stringify(body)));
+  }
+  const raw = await ksuExec(cmd, timeoutMs);
+  if (!raw) return {};
+  const data = JSON.parse(raw);
+  if (data && data.error) throw new Error(data.error);
+  return data;
+}
+
+function addMsg(role, text, tools) {
+  const box = document.getElementById('chat');
+  const d = document.createElement('div');
+  d.className = 'msg ' + role;
+  d.textContent = text;
+  if (tools && tools.length) {
+    const t = document.createElement('div');
+    t.className = 'tools';
+    t.textContent = '调用工具: ' + tools.join(' → ');
+    d.appendChild(t);
+  }
+  box.appendChild(d);
+  box.scrollTop = box.scrollHeight;
+}
+
+function toggleLogs() {
+  const pre = document.getElementById('logs');
+  const open = pre.classList.toggle('open');
+  document.getElementById('toggleTip').textContent = open ? '收起日志 ▴' : '展开日志 ▾';
+}
+
+async function refreshStatus() {
+  const pill = document.getElementById('guardPill');
+  try {
+    const st = await api('/api/v1/status');
+    const gs = st.guard?.state || 'unknown';
+    pill.textContent = gs === 'active' ? '守护正常' : ('暂停:' + gs);
+    pill.className = gs === 'active' ? 'pill' : 'pill err';
+  } catch (e) {
+    pill.textContent = '离线';
+    pill.className = 'pill err';
+  }
+}
+
+async function refreshJob() {
+  try {
+    const j = await api('/api/v1/jobs/current');
+    document.getElementById('jobBadge').textContent = `任务：${j.name || '无'} [${j.state || 'idle'}]` + (j.elapsed_sec ? ` · ${j.elapsed_sec}s` : '');
+    document.getElementById('cancelBtn').disabled = j.state !== 'running';
+    const pre = document.getElementById('logs');
+    pre.textContent = (j.logs || []).join('\n') + (j.result ? '\n' + JSON.stringify(j.result, null, 2) : '');
+    if (j.state === 'running') pre.classList.add('open');
+  } catch (_) {}
+}
+
+async function pollTick() {
+  if (!KSU_SUPPORTED || polling) return;
+  polling = true;
+  try {
+    await Promise.all([refreshStatus(), refreshJob()]);
+  } finally {
+    polling = false;
+  }
+}
+
+async function runJob(name) {
+  try {
+    await api('/api/v1/jobs/run', 'POST', {job: name});
+    document.getElementById('logs').classList.add('open');
+    await refreshJob();
+  } catch (e) {
+    addMsg('bot', '启动失败：' + e.message);
+  }
+}
+
+async function cancelJob() {
+  try {
+    await api('/api/v1/jobs/cancel', 'POST', {});
+    await refreshJob();
+  } catch (e) {
+    addMsg('bot', '停止失败：' + e.message);
+  }
+}
+
+async function sendChat() {
+  const inp = document.getElementById('prompt');
+  const msg = inp.value.trim();
+  if (!msg) return;
+  inp.value = '';
+  addMsg('user', msg);
+  const btn = document.getElementById('sendBtn');
+  btn.disabled = true;
+  btn.textContent = '思考中...';
+  try {
+    const res = await api('/api/v1/chat', 'POST', {message: msg}, 90000);
+    addMsg('bot', res.reply || '(无回复)', res.tools_used);
+  } catch (e) {
+    addMsg('bot', '错误：' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '发送';
+  }
+}
+
+async function clearChat() {
+  try { await api('/api/v1/chat/clear', 'POST', {}); } catch (_) {}
+  document.getElementById('chat').innerHTML = '<div class="msg bot">对话已清空。</div>';
+}
+
+async function openSettings() {
+  document.getElementById('settingsModal').classList.add('open');
+  try {
+    const cfg = await api('/api/v1/llm/config');
+    document.getElementById('cfgProvider').value = cfg.provider || 'openai';
+    document.getElementById('cfgBaseURL').value = cfg.base_url || '';
+    document.getElementById('cfgModel').value = cfg.model || '';
+    document.getElementById('cfgAPIKey').value = '';
+    document.getElementById('cfgAPIKey').placeholder = cfg.api_key_masked ? ('当前: ' + cfg.api_key_masked) : 'nvapi-... / sk-... / AIza...';
+  } catch (_) {}
+}
+
+function closeSettings() {
+  document.getElementById('settingsModal').classList.remove('open');
+}
+
+async function saveSettings() {
+  const body = {
+    provider: document.getElementById('cfgProvider').value,
+    base_url: document.getElementById('cfgBaseURL').value.trim(),
+    model: document.getElementById('cfgModel').value.trim(),
+  };
+  const key = document.getElementById('cfgAPIKey').value.trim();
+  if (key) body.api_key = key;
+  try {
+    await api('/api/v1/llm/config', 'POST', body);
+    closeSettings();
+    addMsg('bot', `设置已保存，当前模型：${body.model || '(未变)'}`);
+  } catch (e) {
+    addMsg('bot', '保存设置失败：' + e.message);
+  }
+}
+
+async function init() {
+  if (!KSU_SUPPORTED) {
+    document.getElementById('envBanner').classList.add('show');
+    document.getElementById('guardPill').textContent = '非KSU环境';
+    document.getElementById('guardPill').className = 'pill err';
+    return;
+  }
+  await pollTick();
+  try {
+    const [cfg, hist] = await Promise.all([
+      api('/api/v1/llm/config').catch(() => null),
+      api('/api/v1/chat/history').catch(() => null),
+    ]);
+    if (cfg && cfg.model) {
+      document.getElementById('welcomeMsg').textContent = `KernelSU Root 免密桥接已就绪（当前模型：${cfg.model}）。点上方按钮可 0-Token 一键跑完每日任务；或在下方直接发指令交互。`;
+    }
+    if (hist && Array.isArray(hist.history) && hist.history.length > 0) {
+      for (const m of hist.history) {
+        if ((m.role === 'user' || m.role === 'assistant') && m.text) {
+          const tools = Array.isArray(m.tool_calls) ? m.tool_calls.map(tc => tc.name).filter(Boolean) : [];
+          addMsg(m.role === 'user' ? 'user' : 'bot', m.text, tools);
+        }
+      }
+    }
+  } catch (_) {}
+  setInterval(pollTick, 3500);
+}
+
+init();
+</script>
+</body>
+</html>
