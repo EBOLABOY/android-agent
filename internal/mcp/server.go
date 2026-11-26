@@ -268,6 +268,7 @@ func (s *Server) buildStatus(ctx context.Context) map[string]any {
 		"version":             ServerVersion,
 		"backend":             s.backend.Name(),
 		"microkernel_running": s.backend.MicroKernelRunning(),
+		"touch":               s.backend.TouchStatus(),
 		"uptime_sec":          int64(time.Since(s.started).Seconds()),
 		"listen_addr":  s.cfg.ListenAddr,
 		"guard":        s.guard.Status(),

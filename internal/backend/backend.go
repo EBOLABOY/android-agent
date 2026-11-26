@@ -45,4 +45,5 @@ type DeviceBackend interface {
 	ScrollNode(ctx context.Context, id int, direction string, distance float64, durationMs int) ([4]int, [4]int, error)
 	StopMicroKernel(reason string)
 	MicroKernelRunning() bool
+	TouchStatus() TouchStatusInfo
 }

@@ -78,6 +78,17 @@ type ShellBackend struct {
 
 	screenMu     sync.RWMutex
 	cachedScreen ScreenInfo
+
+	touchOnce  sync.Once
+	evTouch    *EvdevTouch
+	touchProbe TouchDeviceInfo
+
+	touchMethodMu sync.RWMutex
+	lastTouchMeth string
+
+	rotMu     sync.RWMutex
+	lastRot   int
+	lastRotAt time.Time
 }
 
 func NewShellBackend(clipHelperPath string, shellTimeout time.Duration) *ShellBackend {
@@ -91,6 +102,7 @@ func NewShellBackend(clipHelperPath string, shellTimeout time.Duration) *ShellBa
 		clipHelperPath: clipHelperPath,
 		shellTimeout:   shellTimeout,
 		uiCache:        make(map[int]UINode),
+		lastTouchMeth:  "uninitialized",
 	}
 	b.kernel = NewMicroKernel(b.ensureClipHelper, defaultKernelIdleTimeout)
 	return b
@@ -196,13 +208,119 @@ func (b *ShellBackend) Screenshot(ctx context.Context, targetWidth, quality int)
 	}, nil
 }
 
+func (b *ShellBackend) ensureTouch() *EvdevTouch {
+	b.touchOnce.Do(func() {
+		info, err := ProbeTouchscreen()
+		if err != nil {
+			info.ProbeError = err.Error()
+			info.Available = false
+		}
+		b.touchProbe = info
+		if info.Available {
+			b.evTouch = NewEvdevTouch(info)
+		}
+	})
+	return b.evTouch
+}
+
+func (b *ShellBackend) setLastTouchMethod(m string) {
+	b.touchMethodMu.Lock()
+	b.lastTouchMeth = m
+	b.touchMethodMu.Unlock()
+}
+
+func (b *ShellBackend) TouchStatus() TouchStatusInfo {
+	ev := b.ensureTouch()
+	b.touchMethodMu.RLock()
+	meth := b.lastTouchMeth
+	b.touchMethodMu.RUnlock()
+	dev := b.touchProbe
+	if ev != nil {
+		dev = ev.Device()
+	}
+	return TouchStatusInfo{
+		Device:     dev,
+		LastMethod: meth,
+	}
+}
+
+func (b *ShellBackend) portraitDimensions(ctx context.Context) (int, int) {
+	b.screenMu.RLock()
+	w, h := b.cachedScreen.Width, b.cachedScreen.Height
+	b.screenMu.RUnlock()
+	if w <= 0 || h <= 0 {
+		if scr, err := b.ScreenInfo(ctx); err == nil {
+			w, h = scr.Width, scr.Height
+		}
+	}
+	if w > h && h > 0 {
+		w, h = h, w
+	}
+	if w <= 0 || h <= 0 {
+		return 1080, 2400
+	}
+	return w, h
+}
+
+func (b *ShellBackend) isPortrait(ctx context.Context) bool {
+	b.rotMu.RLock()
+	cachedRot, cachedAt := b.lastRot, b.lastRotAt
+	b.rotMu.RUnlock()
+	if !cachedAt.IsZero() && time.Since(cachedAt) < 800*time.Millisecond {
+		return cachedRot == 0
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, "/system/bin/dumpsys", "window", "displays").Output()
+	if err != nil {
+		return false
+	}
+	s := string(out)
+	if strings.Contains(s, "mCurrentRotation=ROTATION_0") {
+		b.rotMu.Lock()
+		b.lastRot = 0
+		b.lastRotAt = time.Now()
+		b.rotMu.Unlock()
+		return true
+	}
+	rot := -1
+	switch {
+	case strings.Contains(s, "mCurrentRotation=ROTATION_90"):
+		rot = 1
+	case strings.Contains(s, "mCurrentRotation=ROTATION_180"):
+		rot = 2
+	case strings.Contains(s, "mCurrentRotation=ROTATION_270"):
+		rot = 3
+	}
+	if rot >= 0 {
+		b.rotMu.Lock()
+		b.lastRot = rot
+		b.lastRotAt = time.Now()
+		b.rotMu.Unlock()
+	}
+	return false
+}
+
 func (b *ShellBackend) Tap(ctx context.Context, x, y int) error {
 	cctx, cancel := b.withTimeout(ctx)
 	defer cancel()
+
+	if ev := b.ensureTouch(); ev != nil && ev.Available() && b.isPortrait(cctx) {
+		sw, sh := b.portraitDimensions(cctx)
+		if err := ev.Tap(cctx, x, y, sw, sh); err == nil {
+			b.setLastTouchMethod("evdev:" + ev.Device().Path)
+			return nil
+		} else if cctx.Err() != nil {
+			return err
+		}
+	}
+
 	out, err := exec.CommandContext(cctx, "/system/bin/cmd", "input", "tap", strconv.Itoa(x), strconv.Itoa(y)).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("input tap failed: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
+	b.setLastTouchMethod("cmd-input-fallback")
 	return nil
 }
 
@@ -210,7 +328,19 @@ func (b *ShellBackend) LongPress(ctx context.Context, x, y, durationMs int) erro
 	if durationMs <= 0 {
 		durationMs = 800
 	}
-	return b.Swipe(ctx, x, y, x, y, durationMs)
+	cctx, cancel := b.withTimeout(ctx)
+	defer cancel()
+
+	if ev := b.ensureTouch(); ev != nil && ev.Available() && b.isPortrait(cctx) {
+		sw, sh := b.portraitDimensions(cctx)
+		if err := ev.LongPress(cctx, x, y, sw, sh, durationMs); err == nil {
+			b.setLastTouchMethod("evdev:" + ev.Device().Path)
+			return nil
+		} else if cctx.Err() != nil {
+			return err
+		}
+	}
+	return b.cmdInputSwipe(cctx, x, y, x, y, durationMs)
 }
 
 func (b *ShellBackend) Swipe(ctx context.Context, x1, y1, x2, y2, durationMs int) error {
@@ -219,7 +349,21 @@ func (b *ShellBackend) Swipe(ctx context.Context, x1, y1, x2, y2, durationMs int
 	if durationMs <= 0 {
 		durationMs = 300
 	}
-	out, err := exec.CommandContext(cctx, "/system/bin/cmd", "input", "swipe",
+
+	if ev := b.ensureTouch(); ev != nil && ev.Available() && b.isPortrait(cctx) {
+		sw, sh := b.portraitDimensions(cctx)
+		if err := ev.Swipe(cctx, x1, y1, x2, y2, sw, sh, durationMs); err == nil {
+			b.setLastTouchMethod("evdev:" + ev.Device().Path)
+			return nil
+		} else if cctx.Err() != nil {
+			return err
+		}
+	}
+	return b.cmdInputSwipe(cctx, x1, y1, x2, y2, durationMs)
+}
+
+func (b *ShellBackend) cmdInputSwipe(ctx context.Context, x1, y1, x2, y2, durationMs int) error {
+	out, err := exec.CommandContext(ctx, "/system/bin/cmd", "input", "swipe",
 		strconv.Itoa(x1), strconv.Itoa(y1),
 		strconv.Itoa(x2), strconv.Itoa(y2),
 		strconv.Itoa(durationMs),
@@ -227,6 +371,7 @@ func (b *ShellBackend) Swipe(ctx context.Context, x1, y1, x2, y2, durationMs int
 	if err != nil {
 		return fmt.Errorf("input swipe failed: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
+	b.setLastTouchMethod("cmd-input-fallback")
 	return nil
 }
 
@@ -445,6 +590,12 @@ func (b *ShellBackend) UITree(ctx context.Context, opts UITreeOptions) (*UITreeR
 	}
 
 	screenW, screenH := resp.Width, resp.Height
+	if screenW > 0 && screenH > 0 {
+		b.rotMu.Lock()
+		b.lastRot = resp.Rotation
+		b.lastRotAt = time.Now()
+		b.rotMu.Unlock()
+	}
 	if screenW <= 0 || screenH <= 0 {
 		b.screenMu.RLock()
 		screenW, screenH = b.cachedScreen.Width, b.cachedScreen.Height

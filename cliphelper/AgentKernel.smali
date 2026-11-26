@@ -462,7 +462,7 @@
 .end method
 
 .method private static handleUiTree(Lorg/json/JSONObject;)Ljava/lang/String;
-    .locals 7
+    .locals 9
     .annotation system Ldalvik/annotation/Throws;
         value = {
             Lorg/json/JSONException;
@@ -496,10 +496,27 @@
 
     :nodes_ok
     invoke-static {}, LAgentKernel;->ensureUiAutomation()Landroid/app/UiAutomation;
-    move-result-object v3
-    invoke-static {v3}, LAgentKernel;->findRootNode(Landroid/app/UiAutomation;)Landroid/view/accessibility/AccessibilityNodeInfo;
-    move-result-object v3
+    move-result-object v4
+    const/4 v5, 0x0
+    const/4 v6, 0x6
 
+    :retry_root
+    invoke-static {v4}, LAgentKernel;->findRootNode(Landroid/app/UiAutomation;)Landroid/view/accessibility/AccessibilityNodeInfo;
+    move-result-object v3
+    if-nez v3, :root_ready
+    add-int/lit8 v5, v5, 0x1
+    if-ge v5, v6, :root_ready
+    const-wide/16 v7, 0x1e
+    :try_sleep_root
+    invoke-static {v7, v8}, Ljava/lang/Thread;->sleep(J)V
+    :try_end_sleep_root
+    .catch Ljava/lang/Throwable; {:try_sleep_root .. :try_end_sleep_root} :catch_sleep_root
+    goto :retry_root
+    :catch_sleep_root
+    move-exception v3
+    goto :retry_root
+
+    :root_ready
     new-instance v4, Lorg/json/JSONObject;
     invoke-direct {v4}, Lorg/json/JSONObject;-><init>()V
     invoke-static {v4}, LAgentKernel;->putDisplayInfo(Lorg/json/JSONObject;)V

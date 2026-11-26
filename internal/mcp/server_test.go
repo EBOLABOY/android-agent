@@ -137,6 +137,9 @@ func (f *fakeBackend) StopMicroKernel(_ string) {
 	f.mu.Unlock()
 }
 func (f *fakeBackend) MicroKernelRunning() bool { return false }
+func (f *fakeBackend) TouchStatus() backend.TouchStatusInfo {
+	return backend.TouchStatusInfo{LastMethod: "fake-touch"}
+}
 
 type testDetector struct {
 	mu  sync.Mutex
