@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"sort"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -242,32 +243,84 @@ func PurifyUITree(raw []RawUINode, pkg string, screenW, screenH int, opts UITree
 		deduped = append(deduped, c)
 	}
 
-	// Step 3: Number surviving nodes and pack into token budget
+	// Step 3: Priority-bucketed packing (top/bottom bars, inputs, primary CTAs protected) into token budget,
+	// then restore original visual top-to-bottom order before assigning IDs [1..N].
 	if pkg == "" {
 		pkg = "unknown"
 	}
-	var lines []string
-	var finalNodes []UINode
 	headerPlaceholder := fmt.Sprintf("App: %s (%dx%d, 0ms, 999 nodes, ~999 tok)", pkg, screenW, screenH)
 	usedTokens := estimateTokens(headerPlaceholder)
-	truncated := false
 
-	for _, n := range deduped {
-		if len(finalNodes) >= maxEmittedUINodes {
-			truncated = true
-			break
+	type indexedNode struct {
+		origIdx int
+		tier    int
+		tokens  int
+		node    UINode
+	}
+	var buckets [3][]indexedNode
+	for i, n := range deduped {
+		tier := classifyUINodeTier(n, screenH)
+		sample := n
+		sample.ID = len(deduped)
+		if sample.ID > maxEmittedUINodes {
+			sample.ID = maxEmittedUINodes
 		}
-		n.ID = len(finalNodes) + 1
+		tok := estimateTokens(formatNodeLine(sample)) + 1
+		buckets[tier] = append(buckets[tier], indexedNode{
+			origIdx: i,
+			tier:    tier,
+			tokens:  tok,
+			node:    n,
+		})
+	}
+
+	var chosen []indexedNode
+	truncated := false
+	hasNonEdgeBody := len(buckets[1]) > 0
+	tier0Cap := opts.MaxTokens
+	if hasNonEdgeBody {
+		tier0Cap = usedTokens + int(math.Ceil(float64(opts.MaxTokens-usedTokens)*0.60))
+		if tier0Cap <= usedTokens {
+			tier0Cap = opts.MaxTokens
+		}
+	}
+
+	for tier := 0; tier < 3; tier++ {
+		for _, item := range buckets[tier] {
+			if len(chosen) >= maxEmittedUINodes {
+				truncated = true
+				break
+			}
+			limit := opts.MaxTokens
+			if tier == 0 {
+				limit = tier0Cap
+			}
+			if len(chosen) > 0 && usedTokens+item.tokens > limit {
+				truncated = true
+				continue
+			}
+			usedTokens += item.tokens
+			chosen = append(chosen, item)
+		}
+	}
+
+	// Preserve visual order top-to-bottom after priority selection.
+	sort.Slice(chosen, func(i, j int) bool {
+		return chosen[i].origIdx < chosen[j].origIdx
+	})
+
+	lines := make([]string, 0, len(chosen))
+	finalNodes := make([]UINode, 0, len(chosen))
+	actualTok := estimateTokens(headerPlaceholder)
+	for i, item := range chosen {
+		n := item.node
+		n.ID = i + 1
 		line := formatNodeLine(n)
-		tok := estimateTokens(line) + 1 // +newline
-		if len(finalNodes) > 0 && usedTokens+tok > opts.MaxTokens {
-			truncated = true
-			break
-		}
-		usedTokens += tok
+		actualTok += estimateTokens(line) + 1
 		finalNodes = append(finalNodes, n)
 		lines = append(lines, line)
 	}
+	usedTokens = actualTok
 
 	header := fmt.Sprintf("App: %s (%dx%d, %d nodes, ~%d tok)", pkg, screenW, screenH, len(finalNodes), usedTokens)
 	if truncated {
@@ -385,6 +438,34 @@ func ScrollCoordsForBounds(bounds [4]int, direction string, distance float64) (x
 		return 0, 0, 0, 0, fmt.Errorf("invalid scroll direction %q (use up, down, left, right)", direction)
 	}
 	return x1, y1, x2, y2, nil
+}
+
+var primaryCTAKeywords = []string{
+	"结算", "去结算", "加入购物车", "选规格", "立即购买",
+	"搜索", "确认", "提交", "下单", "支付", "确定", "登录", "下一步",
+}
+
+func classifyUINodeTier(n UINode, screenH int) int {
+	_, cy := rectCenter(n.Bounds)
+	isTopBar := screenH > 0 && cy <= int(float64(screenH)*0.15)
+	isBottomBar := screenH > 0 && cy >= int(float64(screenH)*0.85)
+	if n.Editable {
+		return 0
+	}
+	if n.Clickable && (isTopBar || isBottomBar) {
+		return 0
+	}
+	if n.Clickable && n.Label != "" {
+		for _, kw := range primaryCTAKeywords {
+			if strings.Contains(n.Label, kw) {
+				return 0
+			}
+		}
+	}
+	if n.Clickable || n.Scrollable || n.Checkable {
+		return 1
+	}
+	return 2
 }
 
 func formatNodeLine(n UINode) string {

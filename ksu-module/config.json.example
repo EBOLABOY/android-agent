@@ -1,5 +1,5 @@
 {
-  "listen_addr": "0.0.0.0:8765",
+  "listen_addr": "127.0.0.1:8765",
   "bearer_token": "REPLACE_WITH_SECURE_RANDOM_TOKEN",
   "screenshot_width": 720,
   "screenshot_jpeg_quality": 70,

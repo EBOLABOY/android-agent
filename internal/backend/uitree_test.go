@@ -98,7 +98,7 @@ func TestTapPointAndScrollBoundsGeometry(t *testing.T) {
 func TestMicroKernelLazyLoadIdleExitAndGameGuardKill(t *testing.T) {
 	mk := NewMicroKernel(nil, 150*time.Millisecond)
 	// Use a pure POSIX shell JSONL echo loop on Linux host to test lifecycle deterministically
-	mk.cmdFactory = func(_ bool) *exec.Cmd {
+	mk.cmdFactory = func(_ string, _ bool) *exec.Cmd {
 		return exec.Command("/bin/sh", "-c", `while IFS= read -r line; do case "$line" in *ping*) printf '{"ok":true,"pong":true}\n';; *) printf '{"ok":true}\n';; esac; done`)
 	}
 
@@ -136,5 +136,81 @@ func TestMicroKernelLazyLoadIdleExitAndGameGuardKill(t *testing.T) {
 	mk.Stop("com.tencent.tmgp.sgame")
 	if mk.Running() {
 		t.Fatal("expected Stop to kill microkernel immediately")
+	}
+}
+
+func TestPurifyUITreePriorityBucketingPreservesCheckout(t *testing.T) {
+	raw := []RawUINode{
+		{Cls: "android.widget.EditText", Text: "搜索美食", Bounds: [4]int{60, 90, 920, 180}, Flags: "ce", Depth: 2},
+	}
+	// Flood middle feed with 80 items
+	for i := 0; i < 80; i++ {
+		top := 300 + (i%20)*70
+		raw = append(raw, RawUINode{
+			Cls:    "android.widget.TextView",
+			Text:   fmt.Sprintf("推荐美食套餐详情条目第%d号包含超多描述信息", i+1),
+			Bounds: [4]int{40, top, 980, top + 60},
+			Flags:  "c",
+			Depth:  3,
+		})
+	}
+	// Add bottom primary CTA bar ("去结算")
+	raw = append(raw, RawUINode{
+		Cls:    "android.widget.Button",
+		Text:   "去结算",
+		Bounds: [4]int{700, 2200, 1020, 2320},
+		Flags:  "c",
+		Depth:  3,
+	})
+
+	res := PurifyUITree(raw, "com.sankuai.meituan", 1080, 2400, UITreeOptions{MaxTokens: 280})
+	if !res.Truncated {
+		t.Fatal("expected truncation under tight 280-token budget")
+	}
+	if !strings.Contains(res.Text, `"去结算"`) {
+		t.Fatalf("expected priority bucketing to preserve bottom '去结算' CTA, got:\n%s", res.Text)
+	}
+	if !strings.Contains(res.Text, `"搜索美食"`) {
+		t.Fatalf("expected priority bucketing to preserve top EditText '搜索美食', got:\n%s", res.Text)
+	}
+	// Verify visual order: "搜索美食" must have smaller ID than "去结算"
+	if res.Nodes[0].Label != "搜索美食" || res.Nodes[len(res.Nodes)-1].Label != "去结算" {
+		t.Fatalf("expected visual top-to-bottom order preserved, got first=%+v last=%+v", res.Nodes[0], res.Nodes[len(res.Nodes)-1])
+	}
+}
+
+func TestMicroKernelStderrRingAndOversizeAndNoDeadlock(t *testing.T) {
+	// 1. Oversized request rejected immediately before touching pipe
+	mkOver := NewMicroKernel(nil, 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := mkOver.Call(ctx, kernelRequest{Cmd: "clip_set", Text: strings.Repeat("a", maxKernelRequestBytes)}); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected oversized request rejection, got %v", err)
+	}
+
+	// 2. Process printing stderr before exiting surfaces captured stderr tail cleanly
+	mkErr := NewMicroKernel(nil, 2*time.Second)
+	mkErr.cmdFactory = func(_ string, _ bool) *exec.Cmd {
+		return exec.Command("/bin/sh", "-c", `echo "fatal-java-hint" >&2; exit 1`)
+	}
+	_, err := mkErr.Call(ctx, kernelRequest{Cmd: "ping"})
+	if err == nil || !strings.Contains(err.Error(), "fatal-java-hint") {
+		t.Fatalf("expected captured stderr tail in error, got %v", err)
+	}
+	mkErr.Stop("done")
+
+	// 3. >8 stray stdout lines must NOT deadlock reader goroutine or Stop()
+	mkFlood := NewMicroKernel(nil, 2*time.Second)
+	mkFlood.cmdFactory = func(_ string, _ bool) *exec.Cmd {
+		return exec.Command("/bin/sh", "-c", `
+			for i in $(seq 1 20); do echo "stray $i"; done
+			sleep 0.5
+		`)
+	}
+	_, _ = mkFlood.Call(ctx, kernelRequest{Cmd: "ping"})
+	stopStart := time.Now()
+	mkFlood.Stop("flood")
+	if time.Since(stopStart) > 900*time.Millisecond {
+		t.Fatalf("Stop() took too long (%v), possible reader goroutine deadlock", time.Since(stopStart))
 	}
 }

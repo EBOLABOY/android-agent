@@ -2,8 +2,8 @@
 
 小米 13（`fuxi` / Android 16 / API 36 / HyperOS 3.0 / KernelSU 3.3.1）原生低延迟 AI Agent 底座。
 
-- **当前状态**：**`v0.3.0-hybrid-engine` 已实现三层混合引擎（`hybrid-layered-v2`：4ms 内存 UI 树 + 纯 Go `/dev/input/event7` 拟人触控 + 720p 视觉兜底）与手机端自闭环大脑（0-Token 原生日常引擎 + 双协议 LLM API 大脑 + KernelSU/移动 Web 控制台 `/ui`）**。
-- **架构亮点**：零外部 Go 依赖静态单文件，内置标准 **MCP Streamable HTTP (`2025-03-26`)** 服务端（`23` 个工具）、懒加载 `app_process64` 微内核（3 分钟空闲自动销毁 + 王者荣耀前台熔断）、OpenAI/Gemini 双协议大脑与移动 PWA 控制台。
+- **当前状态**：**`v0.3.2-hardened` 安全与底层加固版 — 已实现三层混合引擎（`hybrid-layered-v2`：4ms 内存 UI 树 + 纯 Go `/dev/input/event7` Slot-8 拟人触控 + 720p 视觉兜底）、端侧 Markdown 记忆与随机时间窗 Cron 大脑、KernelSU/移动控制台 `/ui`，以及严格本机闭环安全加固**。
+- **架构亮点**：零外部 Go 依赖静态单文件（内嵌 `_ "time/tzdata"`），内置标准 **MCP Streamable HTTP (`2025-03-26`)** 服务端（`25` 个工具）、懒加载 `app_process64` 微内核（3 分钟空闲销毁 + 杂讯隔离 + 王者荣耀秒杀熔断）、`evdev` 亮屏解锁门禁、2MB 进程内日志轮转、DNS Rebinding/Origin 防护与本机 `127.0.0.1:8765` 默认监听。
 
 ---
 
@@ -127,10 +127,14 @@
 
 ## 3. 常用运维命令
 
-### 读取当前手机端 Bearer Token（宿主机执行）
+### 读取当前手机端 Bearer Token 并通过 `adb forward` 访问（宿主机执行）
+
+> [!IMPORTANT]
+> 自 **`v0.3.2-hardened`** 起，`agentd` 默认仅监听 **`127.0.0.1:8765`**（防止外出连接公共 Wi-Fi 时局域网明文暴露）。电脑端调试请先执行 `adb forward tcp:8765 tcp:8765`。
 
 ```bash
-export AGENT_HOST="http://192.168.100.100:8765"
+adb -s 192.168.100.100:5555 forward tcp:8765 tcp:8765
+export AGENT_HOST="http://127.0.0.1:8765"
 export AGENT_TOKEN="$(adb -s 192.168.100.100:5555 shell "su -c 'cat /data/adb/android_agent/config.json'" \
   | python3 -c 'import sys,json; print(json.load(sys.stdin)["bearer_token"])')"
 ```
@@ -178,13 +182,13 @@ adb -s 192.168.100.100:5555 shell "su -c 'rm -f /data/adb/android_agent/stop; no
 # 轮换 Token：直接编辑 /data/adb/android_agent/config.json 中的 bearer_token 后重启 agentd 即可
 ```
 
-### Antigravity MCP 配置（`~/.gemini/config/mcp_config.json`）
+### Antigravity MCP 配置（配合 `adb forward tcp:8765 tcp:8765`）
 
 ```json
 {
   "mcpServers": {
     "xiaomi13-agent": {
-      "url": "http://192.168.100.100:8765/mcp",
+      "url": "http://127.0.0.1:8765/mcp",
       "headers": {
         "Authorization": "Bearer <替换为 /data/adb/android_agent/config.json 中的 bearer_token>"
       }

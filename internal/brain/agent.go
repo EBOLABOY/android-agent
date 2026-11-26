@@ -2,6 +2,7 @@ package brain
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	"android-agent/internal/config"
 	"android-agent/internal/guard"
 )
+
+var ErrChatBusy = errors.New("another chat turn is already in progress")
 
 const SystemPrompt = `你是运行在用户小米 13（Android 16 / HyperOS 3.0）本机上的 AI Agent 大脑（android-agent）。
 你能直接调用混合分层设备控制工具（4ms 内存 UI 树 + 纯 Go evdev 物理拟人触控 + 720p 视觉兜底）、WebView CDP 工具（Edge/Bing/京东 20ms DOM）、0-Token 原生日常任务引擎，以及端侧持久化 Markdown 记忆。
@@ -43,7 +46,12 @@ type ChatTurnResult struct {
 }
 
 type Agent struct {
-	mu      sync.Mutex
+	mu           sync.Mutex
+	chatMu       sync.Mutex
+	activeMu     sync.Mutex
+	activeCancel context.CancelFunc
+	activeReason string
+
 	cfg     config.LLMConfig
 	exec    ToolExecutor
 	guard   *guard.Guard
@@ -91,6 +99,21 @@ func (a *Agent) History() []ChatMessage {
 	return out
 }
 
+// CancelActive immediately aborts an in-flight Chat turn (e.g. when game-guard triggers).
+func (a *Agent) CancelActive(reason string) bool {
+	a.activeMu.Lock()
+	cancel := a.activeCancel
+	if cancel != nil {
+		a.activeReason = strings.TrimSpace(reason)
+	}
+	a.activeMu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
 func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, error) {
 	userMessage = strings.TrimSpace(userMessage)
 	if userMessage == "" {
@@ -101,6 +124,23 @@ func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, 
 			return nil, fmt.Errorf("agent guard active: %s", reason)
 		}
 	}
+	if !a.chatMu.TryLock() {
+		return nil, ErrChatBusy
+	}
+	defer a.chatMu.Unlock()
+
+	runCtx, cancel := context.WithCancel(ctx)
+	a.activeMu.Lock()
+	a.activeCancel = cancel
+	a.activeReason = ""
+	a.activeMu.Unlock()
+	defer func() {
+		cancel()
+		a.activeMu.Lock()
+		a.activeCancel = nil
+		a.activeReason = ""
+		a.activeMu.Unlock()
+	}()
 
 	t0 := time.Now()
 	a.mu.Lock()
@@ -126,13 +166,22 @@ func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, 
 	var toolsUsed []string
 	var trace []ToolStep
 	steps := 0
+	lastCallSig := ""
+	repeatCount := 0
+	repeatErrCount := 0
 
 	for steps < maxSteps {
-		if err := ctx.Err(); err != nil {
+		if err := runCtx.Err(); err != nil {
+			a.activeMu.Lock()
+			reason := a.activeReason
+			a.activeMu.Unlock()
+			if reason != "" {
+				return nil, fmt.Errorf("chat cancelled (%s): %w", reason, err)
+			}
 			return nil, err
 		}
 		steps++
-		resp, err := callLLM(ctx, cfg, sysPrompt, history, tools)
+		resp, err := callLLM(runCtx, cfg, sysPrompt, history, tools)
 		if err != nil {
 			return nil, err
 		}
@@ -163,7 +212,32 @@ func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, 
 			}
 			toolsUsed = append(toolsUsed, tc.Name)
 			toolStart := time.Now()
-			out := a.exec.ExecuteTool(ctx, tc.Name, tc.Args)
+			out := a.exec.ExecuteTool(runCtx, tc.Name, tc.Args)
+
+			sigBytes, _ := json.Marshal(tc.Args)
+			sig := tc.Name + ":" + string(sigBytes)
+			if sig == lastCallSig {
+				repeatCount++
+				if out.IsError {
+					repeatErrCount++
+				} else {
+					repeatErrCount = 0
+				}
+			} else {
+				lastCallSig = sig
+				repeatCount = 1
+				if out.IsError {
+					repeatErrCount = 1
+				} else {
+					repeatErrCount = 0
+				}
+			}
+
+			toolText := out.Text
+			if repeatCount >= 3 || repeatErrCount >= 2 {
+				toolText += "\n[系统防死循环提示] 检测到连续重复调用相同工具且未取得进展，请立即更换操作策略（如滑动、截屏兜底）或直接向用户汇报当前状态。"
+			}
+
 			trace = append(trace, ToolStep{
 				Step:      len(trace) + 1,
 				Tool:      tc.Name,
@@ -176,7 +250,7 @@ func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, 
 				Role:       "tool",
 				ToolCallID: tc.ID,
 				ToolName:   tc.Name,
-				Text:       out.Text,
+				Text:       toolText,
 				ImageJPEG:  out.ImageJPEG,
 			})
 		}

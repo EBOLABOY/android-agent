@@ -89,6 +89,11 @@ type ShellBackend struct {
 	rotMu     sync.RWMutex
 	lastRot   int
 	lastRotAt time.Time
+
+	screenGateMu   sync.Mutex
+	lastGateAt     time.Time
+	lastGateErr    error
+	screenGateFunc func(ctx context.Context) error
 }
 
 func NewShellBackend(clipHelperPath string, shellTimeout time.Duration) *ShellBackend {
@@ -105,7 +110,18 @@ func NewShellBackend(clipHelperPath string, shellTimeout time.Duration) *ShellBa
 		lastTouchMeth:  "uninitialized",
 	}
 	b.kernel = NewMicroKernel(b.ensureClipHelper, defaultKernelIdleTimeout)
+	b.screenGateFunc = b.checkScreenInteractive
 	return b
+}
+
+// Close stops the micro-kernel and waits for any in-flight evdev touch gesture to release cleanly.
+func (b *ShellBackend) Close() {
+	if b.kernel != nil {
+		b.kernel.Stop("backend close")
+	}
+	if b.evTouch != nil {
+		b.evTouch.Drain()
+	}
 }
 
 func (b *ShellBackend) Name() string {
@@ -302,9 +318,116 @@ func (b *ShellBackend) isPortrait(ctx context.Context) bool {
 	return false
 }
 
+// IsBacklightScreenOn performs a zero-fork sysfs check to see if the display panel backlight is on.
+// Returns true on unknown/non-Android hosts so unit tests and fallback behavior remain intact.
+func IsBacklightScreenOn() bool {
+	patterns := []string{
+		"/sys/class/backlight/*/brightness",
+		"/sys/class/leds/*backlight*/brightness",
+	}
+	checked := false
+	for _, pat := range patterns {
+		matches, _ := filepath.Glob(pat)
+		for _, p := range matches {
+			raw, err := os.ReadFile(p)
+			if err != nil {
+				continue
+			}
+			checked = true
+			if v, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && v > 0 {
+				return true
+			}
+		}
+	}
+	if checked {
+		return false
+	}
+	dpmsMatches, _ := filepath.Glob("/sys/class/drm/card*-DSI-*/dpms")
+	for _, p := range dpmsMatches {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		checked = true
+		if strings.EqualFold(strings.TrimSpace(string(raw)), "On") {
+			return true
+		}
+	}
+	if checked {
+		return false
+	}
+	return true
+}
+
+func parseScreenInteractivePolicy(policyOut string) error {
+	if strings.Contains(policyOut, "screenState=SCREEN_STATE_OFF") ||
+		strings.Contains(policyOut, "screenState=SCREEN_STATE_DOZE") ||
+		strings.Contains(policyOut, "screenState=SCREEN_STATE_DOZE_SUSPEND") {
+		return errors.New("screen is off; refusing touch injection")
+	}
+	if strings.Contains(policyOut, "mDreamingLockscreen=true") ||
+		strings.Contains(policyOut, "isKeyguardShowing=true") {
+		return errors.New("device is locked (keyguard showing); refusing touch injection")
+	}
+	inKeyguard := false
+	for _, line := range strings.Split(policyOut, "\n") {
+		trim := strings.TrimSpace(line)
+		if strings.Contains(trim, "KeyguardServiceDelegate") {
+			inKeyguard = true
+			continue
+		}
+		if inKeyguard {
+			if strings.HasPrefix(trim, "showing=true") || strings.Contains(trim, "showing=true") {
+				return errors.New("device is locked (keyguard showing); refusing touch injection")
+			}
+			if strings.HasPrefix(trim, "showing=false") || trim == "" {
+				inKeyguard = false
+			}
+		}
+	}
+	return nil
+}
+
+func (b *ShellBackend) checkScreenInteractive(ctx context.Context) error {
+	if !IsBacklightScreenOn() {
+		return errors.New("screen is off; refusing touch injection")
+	}
+	b.screenGateMu.Lock()
+	lastAt := b.lastGateAt
+	lastErr := b.lastGateErr
+	b.screenGateMu.Unlock()
+	if !lastAt.IsZero() && time.Since(lastAt) < 800*time.Millisecond {
+		return lastErr
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, "/system/bin/dumpsys", "window", "policy").Output()
+	var gateErr error
+	if err == nil {
+		gateErr = parseScreenInteractivePolicy(string(out))
+	}
+	b.screenGateMu.Lock()
+	b.lastGateAt = time.Now()
+	b.lastGateErr = gateErr
+	b.screenGateMu.Unlock()
+	return gateErr
+}
+
+func (b *ShellBackend) enforceScreenInteractive(ctx context.Context) error {
+	if b.screenGateFunc != nil {
+		return b.screenGateFunc(ctx)
+	}
+	return b.checkScreenInteractive(ctx)
+}
+
 func (b *ShellBackend) Tap(ctx context.Context, x, y int) error {
 	cctx, cancel := b.withTimeout(ctx)
 	defer cancel()
+
+	if err := b.enforceScreenInteractive(cctx); err != nil {
+		return err
+	}
 
 	if ev := b.ensureTouch(); ev != nil && ev.Available() && b.isPortrait(cctx) {
 		sw, sh := b.portraitDimensions(cctx)
@@ -331,6 +454,10 @@ func (b *ShellBackend) LongPress(ctx context.Context, x, y, durationMs int) erro
 	cctx, cancel := b.withTimeout(ctx)
 	defer cancel()
 
+	if err := b.enforceScreenInteractive(cctx); err != nil {
+		return err
+	}
+
 	if ev := b.ensureTouch(); ev != nil && ev.Available() && b.isPortrait(cctx) {
 		sw, sh := b.portraitDimensions(cctx)
 		if err := ev.LongPress(cctx, x, y, sw, sh, durationMs); err == nil {
@@ -348,6 +475,10 @@ func (b *ShellBackend) Swipe(ctx context.Context, x1, y1, x2, y2, durationMs int
 	defer cancel()
 	if durationMs <= 0 {
 		durationMs = 300
+	}
+
+	if err := b.enforceScreenInteractive(cctx); err != nil {
+		return err
 	}
 
 	if ev := b.ensureTouch(); ev != nil && ev.Available() && b.isPortrait(cctx) {

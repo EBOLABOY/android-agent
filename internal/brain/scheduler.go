@@ -18,6 +18,7 @@ import (
 
 const (
 	defaultHeartbeatInterval = 30 * time.Second
+	maxDynamicWakeDelay      = 6 * time.Hour
 	maxScheduleHistory       = 30
 )
 
@@ -78,6 +79,7 @@ type Scheduler struct {
 	lastCheckAt time.Time
 	tickEvery   time.Duration
 	randIntn    func(int) int
+	wakeCh      chan struct{}
 }
 
 func NewScheduler(
@@ -101,6 +103,7 @@ func NewScheduler(
 		runtimes:    make(map[string]*entryRuntime),
 		tickEvery:   defaultHeartbeatInterval,
 		randIntn:    rand.Intn,
+		wakeCh:      make(chan struct{}, 1),
 	}
 	s.loadHistory()
 	s.syncRuntimesLocked(time.Now())
@@ -153,11 +156,41 @@ func (s *Scheduler) SetHistoryPath(path string) {
 
 func (s *Scheduler) UpdateConfig(cfg config.ScheduleConfig) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	prev := s.runtimes
 	s.cfg = cfg
-	// Clear existing planned dates so edited windows re-randomize immediately.
 	s.runtimes = make(map[string]*entryRuntime, len(cfg.Entries))
-	s.syncRuntimesLocked(time.Now())
+	now := time.Now()
+	today := now.Format("2006-01-02")
+	for i, e := range cfg.Entries {
+		id := strings.TrimSpace(e.ID)
+		if id == "" {
+			id = fmt.Sprintf("job-%d-%s", i+1, e.Job)
+		}
+		e.ID = id
+		rt := &entryRuntime{entry: e, plannedDate: today}
+		if old, ok := prev[id]; ok {
+			rt.lastRunDate = old.lastRunDate
+			rt.lastState = old.lastState
+			rt.lastMessage = old.lastMessage
+		}
+		// Force re-randomization of today's window if user edited the window.
+		rt.nextRunAt, rt.windowEndTime = s.pickRandomTrigger(now, e.WindowStart, e.WindowEnd)
+		s.runtimes[id] = rt
+	}
+	s.cfg.Entries = append([]config.ScheduleEntry(nil), cfg.Entries...)
+	for i, e := range s.cfg.Entries {
+		if strings.TrimSpace(e.ID) == "" {
+			s.cfg.Entries[i].ID = fmt.Sprintf("job-%d-%s", i+1, e.Job)
+		}
+	}
+	s.mu.Unlock()
+
+	if s.wakeCh != nil {
+		select {
+		case s.wakeCh <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (s *Scheduler) syncRuntimesLocked(now time.Time) {
@@ -214,19 +247,88 @@ func (s *Scheduler) pickRandomTrigger(now time.Time, startStr, endStr string) (t
 	return start.Add(time.Duration(offsetSec) * time.Second), end
 }
 
-// Run ticks every tickEvery until ctx is cancelled.
+// Run dynamically sleeps until the next scheduled window (or sleeps with 0 wakeups while disabled).
 func (s *Scheduler) Run(ctx context.Context) {
-	s.Tick(ctx, time.Now())
-	ticker := time.NewTicker(s.tickEvery)
-	defer ticker.Stop()
 	for {
+		now := time.Now()
+		s.Tick(ctx, now)
+
+		delay, ok := s.nextWakeDelay(time.Now())
+		if !ok {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.wakeCh:
+				continue
+			}
+		}
+
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case t := <-ticker.C:
-			s.Tick(ctx, t)
+		case <-s.wakeCh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
 		}
 	}
+}
+
+func (s *Scheduler) nextWakeDelay(now time.Time) (time.Duration, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.syncRuntimesLocked(now)
+	if !s.cfg.Enabled {
+		return 0, false
+	}
+
+	today := now.Format("2006-01-02")
+	enabledCount := 0
+	var earliest time.Duration = -1
+
+	for _, e := range s.cfg.Entries {
+		rt := s.runtimes[e.ID]
+		if rt == nil || !rt.entry.Enabled {
+			continue
+		}
+		enabledCount++
+		if rt.lastRunDate == today {
+			continue
+		}
+		if now.Before(rt.nextRunAt) {
+			d := rt.nextRunAt.Sub(now)
+			if earliest < 0 || d < earliest {
+				earliest = d
+			}
+		} else {
+			// Due now or deferred within window: recheck every heartbeat interval.
+			earliest = s.tickEvery
+			break
+		}
+	}
+
+	if enabledCount == 0 {
+		return 0, false
+	}
+	if earliest < 0 {
+		// All enabled entries have finished/skipped today; wake shortly after local midnight.
+		y, m, d := now.Date()
+		tomorrow := time.Date(y, m, d+1, 0, 0, 5, 0, now.Location())
+		earliest = tomorrow.Sub(now)
+	}
+	if earliest <= 0 {
+		earliest = time.Second
+	}
+	if earliest > maxDynamicWakeDelay {
+		earliest = maxDynamicWakeDelay
+	}
+	return earliest, true
 }
 
 // Tick evaluates due scheduled entries at timestamp now (exported for deterministic tests).
@@ -261,8 +363,7 @@ func (s *Scheduler) Tick(ctx context.Context, now time.Time) {
 			rt.lastRunDate = today
 			rt.lastState = "skipped"
 			rt.lastMessage = "missed daily window (daemon started after window end)"
-			s.mu.Unlock()
-			return
+			continue
 		}
 		due = append(due, rt)
 	}

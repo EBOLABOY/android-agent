@@ -10,14 +10,53 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
 
-const defaultKernelIdleTimeout = 3 * time.Minute
+const (
+	defaultKernelIdleTimeout = 3 * time.Minute
+	maxKernelRequestBytes    = 128 * 1024
+	kernelStderrRingBytes    = 4096
+)
 
-type kernelCommandFactory func(asShell bool) *exec.Cmd
+type kernelCommandFactory func(jarPath string, asShell bool) *exec.Cmd
+
+// stderrRing keeps the trailing kernelStderrRingBytes of subprocess stderr without unbounded growth.
+type stderrRing struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (r *stderrRing) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(p) >= kernelStderrRingBytes {
+		r.buf = append(r.buf[:0], p[len(p)-kernelStderrRingBytes:]...)
+		return len(p), nil
+	}
+	r.buf = append(r.buf, p...)
+	if len(r.buf) > kernelStderrRingBytes {
+		drop := len(r.buf) - kernelStderrRingBytes
+		copy(r.buf, r.buf[drop:])
+		r.buf = r.buf[:kernelStderrRingBytes]
+	}
+	return len(p), nil
+}
+
+func (r *stderrRing) String() string {
+	if r == nil {
+		return ""
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return strings.TrimSpace(string(r.buf))
+}
 
 type kernelRequest struct {
 	Cmd      string `json:"cmd"`
@@ -43,9 +82,21 @@ type kernelResponse struct {
 type kernelProc struct {
 	cmd     *exec.Cmd
 	stdin   io.WriteCloser
+	stderr  *stderrRing
 	lines   chan string
 	readErr chan error
+	stopCh  chan struct{}
+	stopOnce sync.Once
 	done    chan struct{}
+}
+
+func (p *kernelProc) closeStop() {
+	if p == nil || p.stopCh == nil {
+		return
+	}
+	p.stopOnce.Do(func() {
+		close(p.stopCh)
+	})
 }
 
 // MicroKernel lazily starts and manages a persistent `app_process64 AgentKernel` child process
@@ -73,8 +124,7 @@ func NewMicroKernel(ensureJar func() (string, error), idleTimeout time.Duration)
 		ensureJar:   ensureJar,
 		idleTimeout: idleTimeout,
 	}
-	mk.cmdFactory = func(asShell bool) *exec.Cmd {
-		jarPath, _ := mk.ensureJar()
+	mk.cmdFactory = func(jarPath string, asShell bool) *exec.Cmd {
 		cmd := exec.Command("/system/bin/app_process64", "/system/bin", "AgentKernel")
 		cmd.Env = append(os.Environ(),
 			"CLASSPATH="+jarPath,
@@ -125,6 +175,7 @@ func terminateKernelProc(p *kernelProc) {
 	if p == nil {
 		return
 	}
+	p.closeStop()
 	if p.stdin != nil {
 		_ = p.stdin.Close()
 	}
@@ -144,14 +195,17 @@ func (m *MicroKernel) startLocked() (*kernelProc, error) {
 	seqBefore := m.stopSeq
 	m.stateMu.Unlock()
 
+	var jarPath string
 	if m.ensureJar != nil {
-		if _, err := m.ensureJar(); err != nil {
+		p, err := m.ensureJar()
+		if err != nil {
 			return nil, fmt.Errorf("prepare AgentKernel jar: %w", err)
 		}
+		jarPath = p
 	}
 
 	spawnOnce := func(asShell bool) (*kernelProc, error) {
-		cmd := m.cmdFactory(asShell)
+		cmd := m.cmdFactory(jarPath, asShell)
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
 			return nil, err
@@ -161,7 +215,8 @@ func (m *MicroKernel) startLocked() (*kernelProc, error) {
 			_ = stdin.Close()
 			return nil, err
 		}
-		cmd.Stderr = io.Discard
+		errRing := &stderrRing{}
+		cmd.Stderr = errRing
 		if err := cmd.Start(); err != nil {
 			_ = stdin.Close()
 			_ = stdout.Close()
@@ -170,8 +225,10 @@ func (m *MicroKernel) startLocked() (*kernelProc, error) {
 		kp := &kernelProc{
 			cmd:     cmd,
 			stdin:   stdin,
+			stderr:  errRing,
 			lines:   make(chan string, 8),
 			readErr: make(chan error, 1),
+			stopCh:  make(chan struct{}),
 			done:    make(chan struct{}),
 		}
 		go func(r io.ReadCloser, lp *kernelProc) {
@@ -181,8 +238,26 @@ func (m *MicroKernel) startLocked() (*kernelProc, error) {
 			sc := bufio.NewScanner(r)
 			sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
 			for sc.Scan() {
-				lp.lines <- sc.Text()
+				line := sc.Text()
+				select {
+				case lp.lines <- line:
+				case <-lp.stopCh:
+					goto exitReader
+				default:
+					// Avoid deadlocking the reader goroutine if spurious stdout fills the buffer:
+					// drop the oldest stale buffered line and enqueue the latest frame.
+					select {
+					case <-lp.lines:
+					default:
+					}
+					select {
+					case lp.lines <- line:
+					case <-lp.stopCh:
+						goto exitReader
+					}
+				}
 			}
+		exitReader:
 			if err := sc.Err(); err != nil {
 				lp.readErr <- err
 			} else {
@@ -282,6 +357,15 @@ func (m *MicroKernel) invalidateProc(p *kernelProc) {
 }
 
 func (m *MicroKernel) Call(ctx context.Context, req kernelRequest) (*kernelResponse, error) {
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	if len(payload)+1 > maxKernelRequestBytes {
+		return nil, fmt.Errorf("AgentKernel request exceeds %d bytes limit (%d bytes)", maxKernelRequestBytes, len(payload)+1)
+	}
+	payload = append(payload, '\n')
+
 	m.callMu.Lock()
 	defer m.callMu.Unlock()
 
@@ -294,7 +378,7 @@ func (m *MicroKernel) Call(ctx context.Context, req kernelRequest) (*kernelRespo
 		if err != nil {
 			return nil, err
 		}
-		resp, err := m.roundTrip(ctx, kp, req)
+		resp, err := m.roundTrip(ctx, kp, payload)
 		if err == nil {
 			m.stateMu.Lock()
 			if m.proc == kp && m.gen == gen {
@@ -312,14 +396,25 @@ func (m *MicroKernel) Call(ctx context.Context, req kernelRequest) (*kernelRespo
 	return nil, lastErr
 }
 
-func (m *MicroKernel) roundTrip(ctx context.Context, kp *kernelProc, req kernelRequest) (*kernelResponse, error) {
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	payload = append(payload, '\n')
-	if _, err := kp.stdin.Write(payload); err != nil {
-		return nil, fmt.Errorf("write AgentKernel stdin: %w", err)
+func (m *MicroKernel) roundTrip(ctx context.Context, kp *kernelProc, payload []byte) (*kernelResponse, error) {
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, werr := kp.stdin.Write(payload)
+		writeDone <- werr
+	}()
+
+	select {
+	case <-ctx.Done():
+		_ = kp.stdin.Close()
+		return nil, ctx.Err()
+	case werr := <-writeDone:
+		if werr != nil {
+			if st := kp.stderr.String(); st != "" {
+				return nil, fmt.Errorf("write AgentKernel stdin: %w (stderr: %s)", werr, st)
+			}
+			return nil, fmt.Errorf("write AgentKernel stdin: %w", werr)
+		}
 	}
 
 	select {
@@ -331,10 +426,16 @@ func (m *MicroKernel) roundTrip(ctx context.Context, kp *kernelProc, req kernelR
 			if rerr == nil {
 				rerr = io.EOF
 			}
+			if st := kp.stderr.String(); st != "" {
+				return nil, fmt.Errorf("AgentKernel exited: %w (stderr: %s)", rerr, st)
+			}
 			return nil, fmt.Errorf("AgentKernel exited: %w", rerr)
 		}
 		var resp kernelResponse
 		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			if st := kp.stderr.String(); st != "" {
+				return nil, fmt.Errorf("decode AgentKernel response: %w (stderr: %s)", err, st)
+			}
 			return nil, fmt.Errorf("decode AgentKernel response: %w", err)
 		}
 		if !resp.OK {

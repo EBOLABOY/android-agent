@@ -23,6 +23,13 @@ case "$REQ_PATH" in
     ;;
 esac
 
+case "$REQ_PATH" in
+  *..*|*[[:space:]]*)
+    printf '%s\n' '{"error":"invalid API path"}'
+    exit 2
+    ;;
+esac
+
 if [ ! -r "$CONF" ]; then
   printf '%s\n' '{"error":"config.json unreadable"}'
   exit 1
@@ -37,13 +44,13 @@ fi
 URL="http://127.0.0.1:8765$REQ_PATH"
 
 if [ -n "$BODY_B64" ]; then
-  RESP="$(printf '%s' "$BODY_B64" | base64 -d 2>/dev/null | /system/bin/curl -sS --connect-timeout 5 --max-time 85 -X "$METHOD" \
+  RESP="$(printf '%s' "$BODY_B64" | base64 -d 2>/dev/null | /system/bin/curl --path-as-is -sS --connect-timeout 5 --max-time 85 -X "$METHOD" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
     --data-binary @- \
     -w "\n%{http_code}" "$URL" 2>/dev/null)"
 else
-  RESP="$(/system/bin/curl -sS --connect-timeout 5 --max-time 85 -X "$METHOD" \
+  RESP="$(/system/bin/curl --path-as-is -sS --connect-timeout 5 --max-time 85 -X "$METHOD" \
     -H "Authorization: Bearer $TOKEN" \
     -w "\n%{http_code}" "$URL" 2>/dev/null)"
 fi

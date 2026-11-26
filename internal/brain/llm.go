@@ -52,6 +52,73 @@ type llmResponse struct {
 	ToolCalls []ToolCall
 }
 
+var llmRetryBaseDelay = time.Second
+
+func isRetryableHTTPStatus(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests, http.StatusInternalServerError,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func doHTTPWithRetry(ctx context.Context, buildReq func() (*http.Request, error)) (int, []byte, error) {
+	const maxAttempts = 3
+	var lastErr error
+	var lastCode int
+	var lastRaw []byte
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return 0, nil, err
+		}
+		req, err := buildReq()
+		if err != nil {
+			return 0, nil, err
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return 0, nil, err
+			}
+		} else {
+			raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+			resp.Body.Close()
+			if rerr != nil {
+				lastErr = rerr
+				if errors.Is(rerr, context.Canceled) || errors.Is(rerr, context.DeadlineExceeded) {
+					return 0, nil, rerr
+				}
+			} else if !isRetryableHTTPStatus(resp.StatusCode) {
+				return resp.StatusCode, raw, nil
+			} else {
+				lastCode = resp.StatusCode
+				lastRaw = raw
+				lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			}
+		}
+
+		if attempt+1 < maxAttempts {
+			delay := llmRetryBaseDelay * time.Duration(1<<attempt)
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return 0, nil, ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+
+	if lastCode > 0 {
+		return lastCode, lastRaw, nil
+	}
+	return 0, nil, lastErr
+}
+
 func callLLM(ctx context.Context, cfg config.LLMConfig, systemPrompt string, history []ChatMessage, tools []ToolSpec) (*llmResponse, error) {
 	if strings.TrimSpace(cfg.APIKey) == "" {
 		return nil, errors.New("LLM api_key is not configured; set it in Settings (/ui) or config.json")
@@ -160,24 +227,20 @@ func callOpenAI(ctx context.Context, cfg config.LLMConfig, systemPrompt string, 
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-
-	resp, err := http.DefaultClient.Do(req)
+	statusCode, raw, err := doHTTPWithRetry(ctx, func() (*http.Request, error) {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+		if rerr != nil {
+			return nil, rerr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+		return req, nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("openai request failed: %w", err)
 	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("LLM HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	if statusCode < 200 || statusCode >= 300 {
+		return nil, fmt.Errorf("LLM HTTP %d: %s", statusCode, strings.TrimSpace(string(raw)))
 	}
 
 	var parsed struct {
@@ -304,24 +367,20 @@ func callGemini(ctx context.Context, cfg config.LLMConfig, systemPrompt string, 
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-goog-api-key", cfg.APIKey)
-
-	resp, err := http.DefaultClient.Do(req)
+	statusCode, raw, err := doHTTPWithRetry(ctx, func() (*http.Request, error) {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+		if rerr != nil {
+			return nil, rerr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-goog-api-key", cfg.APIKey)
+		return req, nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("gemini request failed: %w", err)
 	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("Gemini HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	if statusCode < 200 || statusCode >= 300 {
+		return nil, fmt.Errorf("Gemini HTTP %d: %s", statusCode, strings.TrimSpace(string(raw)))
 	}
 
 	var parsed struct {

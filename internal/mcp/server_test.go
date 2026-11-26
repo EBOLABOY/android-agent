@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -518,5 +519,141 @@ func TestWebUIAuthAndLLMConfigPersistence(t *testing.T) {
 	reloaded, err := config.Load(tmpCfgPath, false)
 	if err != nil || !reloaded.Schedule.Enabled || len(reloaded.Schedule.Entries) != 1 {
 		t.Fatalf("expected persisted schedule config, got %+v err=%v", reloaded, err)
+	}
+}
+
+func TestSecurityHardeningOriginHostCSPSoulAndGuardChat(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := config.Default()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.BearerToken = "tok-sec-test-123456"
+	cfg.PauseFlagPath = ""
+	cfg.MemoryDir = filepath.Join(tmpDir, "memory")
+	cfg.CDPSocket = "nonexistent_test_cdp_socket_999"
+
+	startedLLM := make(chan struct{})
+	releaseLLM := make(chan struct{})
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-startedLLM:
+		default:
+			close(startedLLM)
+		}
+		select {
+		case <-r.Context().Done():
+		case <-releaseLLM:
+		}
+	}))
+	defer llmSrv.Close()
+	defer close(releaseLLM)
+	cfg.LLM = config.LLMConfig{
+		Provider:   "openai",
+		BaseURL:    llmSrv.URL,
+		APIKey:     "sk-test",
+		Model:      "test-model",
+		TimeoutSec: 5,
+	}
+
+	det := &testDetector{}
+	g := guard.New(guard.Options{Packages: []string{"com.tencent.tmgp.sgame"}, PollInterval: time.Second, Detector: det})
+	srv := NewServer(cfg, &fakeBackend{}, g, cdp.NewClient(cfg.CDPSocket), nil)
+	g.SetListener(srv)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	defer srv.Close()
+	baseURL := "http://" + srv.Addr()
+
+	// 1. /ui security headers (CSP, XFO, nosniff)
+	rUI, err := http.Get(baseURL + "/ui")
+	if err != nil {
+		t.Fatalf("GET /ui: %v", err)
+	}
+	rUI.Body.Close()
+	if rUI.Header.Get("X-Frame-Options") != "DENY" ||
+		rUI.Header.Get("X-Content-Type-Options") != "nosniff" ||
+		!strings.Contains(rUI.Header.Get("Content-Security-Policy"), "frame-ancestors 'none'") {
+		t.Fatalf("missing security headers on /ui: %+v", rUI.Header)
+	}
+
+	// 2. DNS Rebinding Host rejection -> 403
+	reqHost, _ := http.NewRequest(http.MethodGet, baseURL+"/health", nil)
+	reqHost.Host = "evil.attacker.com:8765"
+	reqHost.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	respHost, err := http.DefaultClient.Do(reqHost)
+	if err != nil {
+		t.Fatalf("Host request err: %v", err)
+	}
+	respHost.Body.Close()
+	if respHost.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for foreign Host header, got %d", respHost.StatusCode)
+	}
+
+	// 3. Cross-origin Origin rejection -> 403
+	reqOrigin, _ := http.NewRequest(http.MethodGet, baseURL+"/api/v1/status", nil)
+	reqOrigin.Header.Set("Origin", "https://evil.example")
+	reqOrigin.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	respOrigin, err := http.DefaultClient.Do(reqOrigin)
+	if err != nil {
+		t.Fatalf("Origin request err: %v", err)
+	}
+	respOrigin.Body.Close()
+	if respOrigin.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-origin Origin header, got %d", respOrigin.StatusCode)
+	}
+
+	// 4. Remote non-loopback POST to SOUL.md must be rejected -> 403
+	soulBody, _ := json.Marshal(map[string]any{"name": "SOUL.md", "content": "# hacked"})
+	reqSoul := httptest.NewRequest(http.MethodPost, "/api/v1/memory", bytes.NewReader(soulBody))
+	reqSoul.RemoteAddr = "192.168.1.88:44444"
+	reqSoul.Host = "127.0.0.1:8765"
+	reqSoul.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	reqSoul.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.handler.ServeHTTP(rec, reqSoul)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-loopback SOUL.md modification, got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// 5. Concurrent chat returns 409 Conflict, and game-guard StopForGuard cancels in-flight chat
+	chatPayload := []byte(`{"message":"正在执行多步操作"}`)
+	firstDone := make(chan int, 1)
+	go func() {
+		req1, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/chat", bytes.NewReader(chatPayload))
+		req1.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+		req1.Header.Set("Content-Type", "application/json")
+		resp1, err := http.DefaultClient.Do(req1)
+		if err != nil {
+			firstDone <- -1
+			return
+		}
+		resp1.Body.Close()
+		firstDone <- resp1.StatusCode
+	}()
+
+	<-startedLLM
+	req2, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/chat", bytes.NewReader(chatPayload))
+	req2.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	req2.Header.Set("Content-Type", "application/json")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("concurrent chat req failed: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on concurrent /api/v1/chat, got %d", resp2.StatusCode)
+	}
+
+	// Trigger game-guard while first chat is waiting on LLM -> must abort promptly!
+	det.set("com.tencent.tmgp.sgame")
+	g.CheckOnce(context.Background())
+
+	select {
+	case code := <-firstDone:
+		if code == http.StatusOK {
+			t.Fatalf("expected in-flight chat to abort on StopForGuard, got 200")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("in-flight chat was not cancelled immediately by StopForGuard")
 	}
 }

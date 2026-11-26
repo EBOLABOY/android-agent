@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -49,40 +50,48 @@ type ListenerController interface {
 }
 
 type Guard struct {
-	mu             sync.RWMutex
-	packages       []string
-	pollInterval   time.Duration
-	resumeGrace    time.Duration
-	pauseFlagPath  string
-	detector       ForegroundDetector
-	listener       ListenerController
-	manualPaused   bool
-	manualReason   string
-	gamePaused     bool
-	activeGamePkg  string
-	gameClearedAt  time.Time
-	lastCheckAt    time.Time
-	onGamePause    func(pkg string)
-	onGameResume   func()
-	logger         func(format string, args ...any)
+	mu                    sync.RWMutex
+	packages              []string
+	pollInterval          time.Duration
+	screenOffPollInterval time.Duration
+	resumeGrace           time.Duration
+	pauseFlagPath         string
+	detector              ForegroundDetector
+	screenChecker         func() bool
+	listener              ListenerController
+	manualPaused          bool
+	manualReason          string
+	gamePaused            bool
+	activeGamePkg         string
+	gameClearedAt         time.Time
+	lastCheckAt           time.Time
+	onGamePause           func(pkg string)
+	onGameResume          func()
+	logger                func(format string, args ...any)
 }
 
 type Options struct {
-	Packages      []string
-	PollInterval  time.Duration
-	ResumeGrace   time.Duration
-	PauseFlagPath string
-	Detector      ForegroundDetector
-	Listener      ListenerController
-	OnGamePause   func(pkg string)
-	OnGameResume  func()
-	Logger        func(format string, args ...any)
+	Packages              []string
+	PollInterval          time.Duration
+	ScreenOffPollInterval time.Duration
+	ResumeGrace           time.Duration
+	PauseFlagPath         string
+	Detector              ForegroundDetector
+	ScreenChecker         func() bool
+	Listener              ListenerController
+	OnGamePause           func(pkg string)
+	OnGameResume          func()
+	Logger                func(format string, args ...any)
 }
 
 func New(opts Options) *Guard {
 	poll := opts.PollInterval
 	if poll <= 0 {
 		poll = 2 * time.Second
+	}
+	screenOffPoll := opts.ScreenOffPollInterval
+	if screenOffPoll <= 0 {
+		screenOffPoll = 30 * time.Second
 	}
 	grace := opts.ResumeGrace
 	if grace < 0 {
@@ -91,6 +100,10 @@ func New(opts Options) *Guard {
 	det := opts.Detector
 	if det == nil {
 		det = &AndroidForegroundDetector{}
+	}
+	screenChecker := opts.ScreenChecker
+	if screenChecker == nil {
+		screenChecker = DefaultScreenChecker
 	}
 	logger := opts.Logger
 	if logger == nil {
@@ -104,16 +117,55 @@ func New(opts Options) *Guard {
 		}
 	}
 	return &Guard{
-		packages:      pkgs,
-		pollInterval:  poll,
-		resumeGrace:   grace,
-		pauseFlagPath: opts.PauseFlagPath,
-		detector:      det,
-		listener:      opts.Listener,
-		onGamePause:   opts.OnGamePause,
-		onGameResume:  opts.OnGameResume,
-		logger:        logger,
+		packages:              pkgs,
+		pollInterval:          poll,
+		screenOffPollInterval: screenOffPoll,
+		resumeGrace:           grace,
+		pauseFlagPath:         opts.PauseFlagPath,
+		detector:              det,
+		screenChecker:         screenChecker,
+		listener:              opts.Listener,
+		onGamePause:           opts.OnGamePause,
+		onGameResume:          opts.OnGameResume,
+		logger:                logger,
 	}
+}
+
+// DefaultScreenChecker performs a zero-fork sysfs backlight check.
+// If no display sysfs entries exist (e.g. non-Android test hosts), it returns true.
+func DefaultScreenChecker() bool {
+	checked := false
+	for _, pat := range []string{"/sys/class/backlight/*/brightness", "/sys/class/leds/*backlight*/brightness"} {
+		matches, _ := filepath.Glob(pat)
+		for _, p := range matches {
+			raw, err := os.ReadFile(p)
+			if err != nil {
+				continue
+			}
+			checked = true
+			if v, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && v > 0 {
+				return true
+			}
+		}
+	}
+	if checked {
+		return false
+	}
+	dpmsMatches, _ := filepath.Glob("/sys/class/drm/card*-DSI-*/dpms")
+	for _, p := range dpmsMatches {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		checked = true
+		if strings.EqualFold(strings.TrimSpace(string(raw)), "On") {
+			return true
+		}
+	}
+	if checked {
+		return false
+	}
+	return true
 }
 
 func (g *Guard) SetListener(lc ListenerController) {
@@ -260,18 +312,30 @@ func (g *Guard) CheckOnce(ctx context.Context) {
 	g.mu.Unlock()
 }
 
+func (g *Guard) isGamePausedFast() bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.gamePaused
+}
+
 // Run starts the background anti-risk monitoring loop until ctx is cancelled.
+// When the display is off and no game pause is active, it throttles polling to save standby power.
 func (g *Guard) Run(ctx context.Context) {
-	// Immediate check on startup before traffic arrives
 	g.CheckOnce(ctx)
-	ticker := time.NewTicker(g.pollInterval)
-	defer ticker.Stop()
 	for {
+		interval := g.pollInterval
+		if g.screenChecker != nil && !g.isGamePausedFast() && !g.screenChecker() {
+			interval = g.screenOffPollInterval
+		}
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
-			g.CheckOnce(ctx)
+		case <-timer.C:
+			if g.isGamePausedFast() || g.screenChecker == nil || g.screenChecker() {
+				g.CheckOnce(ctx)
+			}
 		}
 	}
 }
@@ -332,6 +396,12 @@ func findRunningPackages(packages []string) map[string][]int {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil || pid <= 0 {
 			continue
+		}
+		// Android app UIDs are >= 10000; skip kernel/system daemons without opening /proc/<pid>/cmdline.
+		if info, ierr := e.Info(); ierr == nil {
+			if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Uid < 10000 {
+				continue
+			}
 		}
 		raw, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
 		if err != nil || len(raw) == 0 {

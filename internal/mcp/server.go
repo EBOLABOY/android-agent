@@ -13,6 +13,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -29,7 +30,7 @@ import (
 
 const (
 	ServerName          = "android-agent"
-	ServerVersion       = "0.3.1-ondevice"
+	ServerVersion       = "0.3.2-hardened"
 	DefaultProtoVersion = "2025-03-26"
 )
 
@@ -116,7 +117,7 @@ func NewServer(cfg *config.Config, be backend.DeviceBackend, g *guard.Guard, cdp
 		authedAPI.ServeHTTP(w, r)
 	})
 
-	s.handler = rootMux
+	s.handler = s.originHostMiddleware(rootMux)
 	return s
 }
 
@@ -172,6 +173,9 @@ func (s *Server) Start() error {
 // StopForGuard completely closes the TCP listener and terminates active SSE streams
 // while a guarded game (e.g. com.tencent.tmgp.sgame) is in the foreground.
 func (s *Server) StopForGuard(reason string) {
+	if s.agent != nil {
+		s.agent.CancelActive("guard blocked: " + reason)
+	}
 	if s.jobs != nil {
 		s.jobs.Cancel("guard blocked: " + reason)
 	}
@@ -224,6 +228,9 @@ func (s *Server) Addr() string {
 
 // Close permanently shuts down the server.
 func (s *Server) Close() {
+	if s.agent != nil {
+		s.agent.CancelActive("server shutdown")
+	}
 	if s.backend != nil {
 		s.backend.StopMicroKernel("server shutdown")
 	}
@@ -255,6 +262,86 @@ func (s *Server) cancelAllSSE() {
 	for _, fn := range cancels {
 		fn()
 	}
+}
+
+func stripHostPort(hostport string) string {
+	hostport = strings.TrimSpace(hostport)
+	if hostport == "" {
+		return ""
+	}
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		return strings.ToLower(strings.Trim(h, "[]"))
+	}
+	return strings.ToLower(strings.Trim(hostport, "[]"))
+}
+
+func isLoopbackHost(h string) bool {
+	return h == "localhost" || h == "127.0.0.1" || h == "::1"
+}
+
+func isAllowedHostHeader(hostHeader string) bool {
+	if strings.TrimSpace(hostHeader) == "" {
+		return true
+	}
+	h := stripHostPort(hostHeader)
+	if h == "" {
+		return false
+	}
+	if isLoopbackHost(h) {
+		return true
+	}
+	return net.ParseIP(h) != nil
+}
+
+func isAllowedOriginHeader(originHeader, reqHostHeader string) bool {
+	originHeader = strings.TrimSpace(originHeader)
+	if originHeader == "" {
+		return true
+	}
+	u, err := url.Parse(originHeader)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return false
+	}
+	ohost := stripHostPort(u.Host)
+	if ohost == "" {
+		return false
+	}
+	if isLoopbackHost(ohost) {
+		return true
+	}
+	reqHost := stripHostPort(reqHostHeader)
+	return reqHost != "" && strings.EqualFold(ohost, reqHost)
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	h := stripHostPort(remoteAddr)
+	if h == "" {
+		return false
+	}
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
+}
+
+// originHostMiddleware mitigates DNS Rebinding and cross-origin browser requests.
+func (s *Server) originHostMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isAllowedHostHeader(r.Host) {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error": "forbidden Host header (DNS rebinding protection)",
+			})
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" && !isAllowedOriginHeader(origin, r.Host) {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error": "forbidden Origin header",
+			})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
@@ -405,6 +492,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.agent.Chat(r.Context(), body.Message)
 	if err != nil {
+		if errors.Is(err, brain.ErrChatBusy) {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
@@ -517,6 +608,12 @@ func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 32*1024)).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+			return
+		}
+		if strings.EqualFold(strings.TrimSpace(body.Name), brain.MemorySoulFile) && !isLoopbackRemoteAddr(r.RemoteAddr) {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error": "SOUL.md can only be modified from a local loopback session",
+			})
 			return
 		}
 		if err := s.memory.Write(body.Name, body.Content); err != nil {

@@ -31,6 +31,9 @@ fi
   done
   sleep 2
 
+  BACKOFF=3
+  STDERR_LOG="$DATA_DIR/agentd.stderr.log"
+
   while true; do
     if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ] || [ -f "$DATA_DIR/stop" ]; then
       if [ -f "$DAEMON_PID" ]; then
@@ -41,11 +44,17 @@ fi
       exit 0
     fi
 
-    # Keep log bounded (~2MB)
+    # Keep boot/stderr logs bounded
     if [ -f "$LOG" ]; then
       LOG_SZ="$(wc -c < "$LOG" 2>/dev/null || echo 0)"
       if [ "$LOG_SZ" -gt 2097152 ]; then
-        mv -f "$LOG" "${LOG}.old" 2>/dev/null || true
+        mv -f "$LOG" "${LOG}.1" 2>/dev/null || true
+      fi
+    fi
+    if [ -f "$STDERR_LOG" ]; then
+      ERR_SZ="$(wc -c < "$STDERR_LOG" 2>/dev/null || echo 0)"
+      if [ "$ERR_SZ" -gt 65536 ]; then
+        mv -f "$STDERR_LOG" "${STDERR_LOG}.1" 2>/dev/null || true
       fi
     fi
 
@@ -53,20 +62,34 @@ fi
       chmod 755 "$BIN" 2>/dev/null || true
     fi
 
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] starting agentd" >> "$LOG"
-    "$BIN" -config "$CONF" >> "$LOG" 2>&1 &
+    START_TS="$(date +%s 2>/dev/null || echo 0)"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] starting agentd (backoff=${BACKOFF}s)" >> "$LOG"
+    "$BIN" -config "$CONF" -log-file "$LOG" >/dev/null 2>>"$STDERR_LOG" &
     CHILD=$!
     echo "$CHILD" > "$DAEMON_PID"
     wait "$CHILD"
     RC=$?
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] agentd exited with code $RC" >> "$LOG"
+    END_TS="$(date +%s 2>/dev/null || echo 0)"
+    RAN_SEC=$((END_TS - START_TS))
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] agentd exited with code $RC after ${RAN_SEC}s" >> "$LOG"
     rm -f "$DAEMON_PID"
 
     if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ] || [ -f "$DATA_DIR/stop" ]; then
       rm -f "$WATCHDOG_PID"
       exit 0
     fi
-    sleep 3
+
+    if [ "$RAN_SEC" -ge 15 ]; then
+      BACKOFF=3
+    else
+      case "$BACKOFF" in
+        3) BACKOFF=6 ;;
+        6) BACKOFF=15 ;;
+        15) BACKOFF=30 ;;
+        *) BACKOFF=60 ;;
+      esac
+    fi
+    sleep "$BACKOFF"
   done
 ) </dev/null >/dev/null 2>&1 &
 echo $! > "$WATCHDOG_PID"

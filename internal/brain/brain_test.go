@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"android-agent/internal/config"
 	"android-agent/internal/guard"
@@ -170,5 +171,122 @@ func TestGuardBlocksAgentChat(t *testing.T) {
 	ag := NewAgent(config.LLMConfig{Provider: "openai", APIKey: "k", Model: "m"}, &mockExec{}, g)
 	if _, err := ag.Chat(context.Background(), "hello"); err == nil {
 		t.Fatal("expected guard-blocked error")
+	}
+}
+
+func TestAgentConcurrencyBusyAndCancelActive(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	ag := NewAgent(config.LLMConfig{
+		Provider:   "openai",
+		BaseURL:    srv.URL,
+		APIKey:     "sk-test",
+		Model:      "test-model",
+		TimeoutSec: 5,
+	}, &mockExec{}, nil)
+
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := ag.Chat(context.Background(), "慢请求")
+		firstErr <- err
+	}()
+
+	<-started
+	if _, err := ag.Chat(context.Background(), "并发双击"); err != ErrChatBusy {
+		t.Fatalf("expected ErrChatBusy while chat in flight, got %v", err)
+	}
+	if !ag.CancelActive("com.tencent.tmgp.sgame") {
+		t.Fatal("expected CancelActive to report true while chat in flight")
+	}
+	err := <-firstErr
+	if err == nil {
+		t.Fatal("expected cancelled error after CancelActive")
+	}
+}
+
+func TestAgentLLMRetryAndLoopDetection(t *testing.T) {
+	oldDelay := llmRetryBaseDelay
+	llmRetryBaseDelay = 2 * time.Millisecond
+	defer func() { llmRetryBaseDelay = oldDelay }()
+
+	var attempts atomic.Int32
+	var sawLoopNudge atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		// Fail first 2 HTTP attempts (429 then 503) to exercise retry backoff
+		if n == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		if n == 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+
+		var req struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		for _, m := range req.Messages {
+			if c, ok := m["content"].(string); ok && strings.Contains(c, "[系统防死循环提示]") {
+				sawLoopNudge.Store(true)
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if sawLoopNudge.Load() {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{"role": "assistant", "content": "已收到防死循环提示，切换策略汇报。"},
+				}},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]any{
+					"role": "assistant",
+					"tool_calls": []map[string]any{{
+						"id":       "tc_loop",
+						"type":     "function",
+						"function": map[string]any{"name": "phone_status", "arguments": "{}"},
+					}},
+				},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	ag := NewAgent(config.LLMConfig{
+		Provider: "openai",
+		BaseURL:  srv.URL,
+		APIKey:   "sk-test",
+		Model:    "test-model",
+		MaxSteps: 8,
+	}, &mockExec{}, nil)
+
+	res, err := ag.Chat(context.Background(), "测试重试与死循环检测")
+	if err != nil {
+		t.Fatalf("Chat failed: %v", err)
+	}
+	if !sawLoopNudge.Load() {
+		t.Fatal("expected loop detection prompt to be injected after 3 identical tool calls")
+	}
+	if !strings.Contains(res.Reply, "防死循环") {
+		t.Fatalf("unexpected reply: %q", res.Reply)
 	}
 }

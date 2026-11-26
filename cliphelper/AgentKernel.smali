@@ -5,6 +5,7 @@
 .field private static sUi:Landroid/app/UiAutomation;
 .field private static sThread:Landroid/os/HandlerThread;
 .field private static sClip:Landroid/content/IClipboard;
+.field private static sOut:Ljava/io/PrintStream;
 
 .method public constructor <init>()V
     .locals 0
@@ -122,7 +123,7 @@
 .end method
 
 .method private static findRootNode(Landroid/app/UiAutomation;)Landroid/view/accessibility/AccessibilityNodeInfo;
-    .locals 6
+    .locals 9
     invoke-virtual {p0}, Landroid/app/UiAutomation;->getRootInActiveWindow()Landroid/view/accessibility/AccessibilityNodeInfo;
     move-result-object v0
     if-eqz v0, :try_windows
@@ -137,6 +138,8 @@
 
     :scan_list
     const/4 v1, 0x0
+    const/4 v7, 0x0
+    const/4 v8, 0x1
     invoke-interface {v0}, Ljava/util/List;->size()I
     move-result v2
     const/4 v3, 0x0
@@ -147,31 +150,38 @@
     move-result-object v4
     check-cast v4, Landroid/view/accessibility/AccessibilityWindowInfo;
     if-eqz v4, :win_next
+    if-nez v7, :win_recycle
+
+    :try_win_get
     invoke-virtual {v4}, Landroid/view/accessibility/AccessibilityWindowInfo;->getRoot()Landroid/view/accessibility/AccessibilityNodeInfo;
     move-result-object v5
     if-eqz v5, :win_recycle
     invoke-virtual {v4}, Landroid/view/accessibility/AccessibilityWindowInfo;->getType()I
-    move-result v4
-    const/4 p0, 0x1
-    if-ne v4, p0, :save_fallback
-    if-eqz v1, :ret_app_root
+    move-result v6
+    :try_end_win_get
+    .catch Ljava/lang/Throwable; {:try_win_get .. :try_end_win_get} :win_recycle
+
+    if-ne v6, v8, :save_fallback
+    move-object v7, v5
+    if-eqz v1, :win_recycle
     :try_rec_fb
     invoke-virtual {v1}, Landroid/view/accessibility/AccessibilityNodeInfo;->recycle()V
     :try_end_rec_fb
-    .catch Ljava/lang/Throwable; {:try_rec_fb .. :try_end_rec_fb} :ret_app_root
-    :ret_app_root
-    return-object v5
+    .catch Ljava/lang/Throwable; {:try_rec_fb .. :try_end_rec_fb} :clear_fb
+    :clear_fb
+    const/4 v1, 0x0
+    goto :win_recycle
 
     :save_fallback
     if-nez v1, :rec_extra
     move-object v1, v5
-    goto :win_next
+    goto :win_recycle
+
     :rec_extra
     :try_rec_ex
     invoke-virtual {v5}, Landroid/view/accessibility/AccessibilityNodeInfo;->recycle()V
     :try_end_rec_ex
-    .catch Ljava/lang/Throwable; {:try_rec_ex .. :try_end_rec_ex} :win_next
-    goto :win_next
+    .catch Ljava/lang/Throwable; {:try_rec_ex .. :try_end_rec_ex} :win_recycle
 
     :win_recycle
     :try_rec_w
@@ -184,6 +194,10 @@
     goto :win_loop
 
     :win_done
+    if-eqz v7, :ret_fallback
+    return-object v7
+
+    :ret_fallback
     return-object v1
 .end method
 
@@ -737,6 +751,14 @@
         }
     .end annotation
 
+    sget-object v0, LAgentKernel;->sOut:Ljava/io/PrintStream;
+    if-nez v0, :out_ready
+    sget-object v0, Ljava/lang/System;->out:Ljava/io/PrintStream;
+    sput-object v0, LAgentKernel;->sOut:Ljava/io/PrintStream;
+    sget-object v1, Ljava/lang/System;->err:Ljava/io/PrintStream;
+    invoke-static {v1}, Ljava/lang/System;->setOut(Ljava/io/PrintStream;)V
+
+    :out_ready
     new-instance v0, Ljava/io/BufferedReader;
     new-instance v1, Ljava/io/InputStreamReader;
     sget-object v2, Ljava/lang/System;->in:Ljava/io/InputStream;
@@ -842,7 +864,10 @@
     invoke-virtual {v1, v3, v4}, Ljava/lang/String;->replace(CC)Ljava/lang/String;
     move-result-object v1
 
+    sget-object v3, LAgentKernel;->sOut:Ljava/io/PrintStream;
+    if-nez v3, :use_sout
     sget-object v3, Ljava/lang/System;->out:Ljava/io/PrintStream;
+    :use_sout
     invoke-virtual {v3, v1}, Ljava/io/PrintStream;->println(Ljava/lang/String;)V
     invoke-virtual {v3}, Ljava/io/PrintStream;->flush()V
 

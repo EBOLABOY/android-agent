@@ -55,7 +55,7 @@ type Config struct {
 
 func Default() *Config {
 	return &Config{
-		ListenAddr:            "0.0.0.0:8765",
+		ListenAddr:            "127.0.0.1:8765",
 		BearerToken:           "",
 		ScreenshotWidth:       720,
 		ScreenshotJPEGQuality: 70,

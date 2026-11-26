@@ -3,6 +3,7 @@ package guard
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -111,5 +112,49 @@ func TestManualPauseResume(t *testing.T) {
 	g.ResumeManual()
 	if blocked, _ := g.IsActionBlocked(); blocked {
 		t.Fatal("expected unblocked after ResumeManual")
+	}
+}
+
+type countingDetector struct {
+	calls atomic.Int32
+}
+
+func (c *countingDetector) DetectGuardedForeground(_ context.Context, _ []string) (string, error) {
+	c.calls.Add(1)
+	return "", nil
+}
+
+func TestGuardScreenOffThrottling(t *testing.T) {
+	var screenOn atomic.Bool
+	det := &countingDetector{}
+	g := New(Options{
+		Packages:              []string{"com.tencent.tmgp.sgame"},
+		PollInterval:          12 * time.Millisecond,
+		ScreenOffPollInterval: 90 * time.Millisecond,
+		Detector:              det,
+		ScreenChecker: func() bool {
+			return screenOn.Load()
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.Run(ctx)
+	}()
+
+	time.Sleep(60 * time.Millisecond)
+	if calls := det.calls.Load(); calls != 1 {
+		t.Fatalf("expected only 1 startup check while screen off during 60ms (<90ms), got %d", calls)
+	}
+
+	screenOn.Store(true)
+	time.Sleep(110 * time.Millisecond)
+	cancel()
+	<-done
+
+	if calls := det.calls.Load(); calls < 3 {
+		t.Fatalf("expected rapid 12ms checks once screen turned on, got %d calls", calls)
 	}
 }

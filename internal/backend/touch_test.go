@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -243,5 +244,89 @@ func assertEndsWithRelease(t *testing.T, events []inputEvent) {
 	}
 	if !hasTrackRelease || !hasBtnRelease {
 		t.Fatalf("missing release events (track=-1:%v, btn_touch=0:%v)", hasTrackRelease, hasBtnRelease)
+	}
+}
+
+func TestEvdevHighSlotSelectionAndDrain(t *testing.T) {
+	dev := testTouchDevice()
+	dev.MaxSlot = 9
+	ev := NewEvdevTouch(dev)
+	if ev.Slot() != 8 || ev.Device().Slot != 8 {
+		t.Fatalf("expected high touch slot 8 for MaxSlot=9, got slot=%d", ev.Slot())
+	}
+
+	stream := &mockEvdevStream{}
+	inSleep := make(chan struct{})
+	releaseSleep := make(chan struct{})
+	ev.openWriter = func(string) (io.WriteCloser, error) { return stream, nil }
+	ev.sleepFn = func(_ context.Context, _ time.Duration) error {
+		close(inSleep)
+		<-releaseSleep
+		return nil
+	}
+
+	doneTap := make(chan error, 1)
+	go func() {
+		doneTap <- ev.Tap(context.Background(), 300, 600, 1080, 2400)
+	}()
+
+	<-inSleep
+	drained := make(chan struct{})
+	go func() {
+		ev.Drain()
+		close(drained)
+	}()
+
+	select {
+	case <-drained:
+		t.Fatal("Drain() returned before in-flight gesture released")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(releaseSleep)
+	if err := <-doneTap; err != nil {
+		t.Fatalf("Tap failed: %v", err)
+	}
+	<-drained
+
+	events := decodeEvents(stream.buf.Bytes())
+	assertCleanDownAndUp(t, events)
+	sawSlot8 := false
+	for _, e := range events {
+		if e.Type == evAbs && e.Code == absMtSlot {
+			if e.Value != 8 {
+				t.Fatalf("expected all ABS_MT_SLOT events to use slot 8, got %d", e.Value)
+			}
+			sawSlot8 = true
+		}
+	}
+	if !sawSlot8 {
+		t.Fatal("expected ABS_MT_SLOT events in output")
+	}
+}
+
+func TestShellBackendScreenOffAndLockedGate(t *testing.T) {
+	if err := parseScreenInteractivePolicy("screenState=SCREEN_STATE_OFF\nshowing=false\n"); err == nil {
+		t.Fatal("expected SCREEN_STATE_OFF to be rejected")
+	}
+	if err := parseScreenInteractivePolicy("screenState=SCREEN_STATE_ON\nKeyguardServiceDelegate\n  showing=true\n"); err == nil {
+		t.Fatal("expected keyguard showing=true to be rejected")
+	}
+	if err := parseScreenInteractivePolicy("screenState=SCREEN_STATE_ON\nKeyguardServiceDelegate\n  showing=false\n"); err != nil {
+		t.Fatalf("expected unlocked screen-on policy to pass, got %v", err)
+	}
+
+	be := NewShellBackend("", time.Second)
+	be.screenGateFunc = func(context.Context) error {
+		return errors.New("device is locked (keyguard showing); refusing touch injection")
+	}
+	if err := be.Tap(context.Background(), 100, 200); err == nil || !strings.Contains(err.Error(), "locked") {
+		t.Fatalf("expected Tap to be blocked when locked, got %v", err)
+	}
+	if err := be.LongPress(context.Background(), 100, 200, 500); err == nil {
+		t.Fatal("expected LongPress to be blocked when locked")
+	}
+	if err := be.Swipe(context.Background(), 100, 200, 100, 400, 300); err == nil {
+		t.Fatal("expected Swipe to be blocked when locked")
 	}
 }

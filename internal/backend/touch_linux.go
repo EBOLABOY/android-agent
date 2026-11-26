@@ -65,6 +65,8 @@ type TouchDeviceInfo struct {
 	HasBtnToolFinger bool   `json:"has_btn_tool_finger"`
 	HasTouchMajor    bool   `json:"has_touch_major"`
 	MaxTouchMajor    int32  `json:"max_touch_major,omitempty"`
+	MaxSlot          int32  `json:"max_slot,omitempty"`
+	Slot             int    `json:"slot"`
 	Available        bool   `json:"available"`
 	ProbeError       string `json:"probe_error,omitempty"`
 }
@@ -86,6 +88,7 @@ type inputEvent struct {
 // EvdevTouch writes Linux Multitouch Type B events directly to the physical touchscreen /dev/input/eventX.
 type EvdevTouch struct {
 	dev        TouchDeviceInfo
+	slot       int32
 	writeMu    sync.Mutex
 	trackingID int32
 
@@ -94,8 +97,18 @@ type EvdevTouch struct {
 }
 
 func NewEvdevTouch(dev TouchDeviceInfo) *EvdevTouch {
+	// Use a high multitouch slot (e.g. slot 8 out of 0..9 on Xiaomi 13 fts)
+	// so automation never collides with a human finger touching slot 0.
+	slot := int32(0)
+	if dev.MaxSlot >= 8 {
+		slot = 8
+	} else if dev.MaxSlot >= 2 {
+		slot = dev.MaxSlot
+	}
+	dev.Slot = int(slot)
 	return &EvdevTouch{
 		dev:        dev,
+		slot:       slot,
 		trackingID: 100,
 		openWriter: func(path string) (io.WriteCloser, error) {
 			return os.OpenFile(path, os.O_WRONLY, 0)
@@ -113,6 +126,22 @@ func (e *EvdevTouch) Device() TouchDeviceInfo {
 		return TouchDeviceInfo{}
 	}
 	return e.dev
+}
+
+func (e *EvdevTouch) Slot() int {
+	if e == nil {
+		return 0
+	}
+	return int(e.slot)
+}
+
+// Drain waits until any in-flight gesture finishes and emits its deferred finger-up frame.
+func (e *EvdevTouch) Drain() {
+	if e == nil {
+		return
+	}
+	e.writeMu.Lock()
+	e.writeMu.Unlock()
 }
 
 // ProbeTouchscreen scans /dev/input/event* and selects the physical hardware touchscreen,
@@ -229,6 +258,12 @@ func inspectInputDevice(path string) (TouchDeviceInfo, error) {
 		_, _, maxMajor, err := readAbsInfo(fd, absMtTouchMajor)
 		if err == nil {
 			info.MaxTouchMajor = maxMajor
+		}
+	}
+	if hasSlot {
+		_, _, maxSlot, err := readAbsInfo(fd, absMtSlot)
+		if err == nil && maxSlot > 0 {
+			info.MaxSlot = maxSlot
 		}
 	}
 	return info, nil
@@ -513,7 +548,7 @@ func (e *EvdevTouch) emitDownLocked(w io.Writer, trackingID, rawX, rawY, touchMa
 	now := time.Now()
 	events := make([]inputEvent, 0, 8)
 	events = append(events,
-		makeEvent(now, evAbs, absMtSlot, 0),
+		makeEvent(now, evAbs, absMtSlot, e.slot),
 		makeEvent(now, evAbs, absMtTrackingID, trackingID),
 		makeEvent(now, evAbs, absMtPositionX, rawX),
 		makeEvent(now, evAbs, absMtPositionY, rawY),
@@ -535,7 +570,7 @@ func (e *EvdevTouch) emitMoveLocked(w io.Writer, rawX, rawY, touchMajor int32) e
 	now := time.Now()
 	events := make([]inputEvent, 0, 5)
 	events = append(events,
-		makeEvent(now, evAbs, absMtSlot, 0),
+		makeEvent(now, evAbs, absMtSlot, e.slot),
 		makeEvent(now, evAbs, absMtPositionX, rawX),
 		makeEvent(now, evAbs, absMtPositionY, rawY),
 	)
@@ -550,7 +585,7 @@ func (e *EvdevTouch) emitUpLocked(w io.Writer) error {
 	now := time.Now()
 	events := make([]inputEvent, 0, 5)
 	events = append(events,
-		makeEvent(now, evAbs, absMtSlot, 0),
+		makeEvent(now, evAbs, absMtSlot, e.slot),
 		makeEvent(now, evAbs, absMtTrackingID, -1),
 	)
 	if e.dev.HasBtnTouch {
@@ -583,8 +618,14 @@ func writeEvents(w io.Writer, events []inputEvent) error {
 		binary.LittleEndian.PutUint16(buf[off+18:], ev.Code)
 		binary.LittleEndian.PutUint32(buf[off+20:], uint32(ev.Value))
 	}
-	_, err := w.Write(buf)
-	return err
+	n, err := w.Write(buf)
+	if err != nil {
+		return err
+	}
+	if n != len(buf) {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 func sleepWithContext(ctx context.Context, d time.Duration) error {

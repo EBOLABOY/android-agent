@@ -9,11 +9,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+	_ "time/tzdata"
 
 	"android-agent/internal/backend"
 	"android-agent/internal/cdp"
@@ -22,10 +25,77 @@ import (
 	"android-agent/internal/mcp"
 )
 
+const maxLogFileBytes = 2 * 1024 * 1024
+
+type rotatingFileWriter struct {
+	mu       sync.Mutex
+	path     string
+	maxBytes int64
+	f        *os.File
+	size     int64
+}
+
+func newRotatingFileWriter(path string, maxBytes int64) (*rotatingFileWriter, error) {
+	if maxBytes <= 0 {
+		maxBytes = maxLogFileBytes
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	var sz int64
+	if st, err := f.Stat(); err == nil {
+		sz = st.Size()
+	}
+	return &rotatingFileWriter{
+		path:     path,
+		maxBytes: maxBytes,
+		f:        f,
+		size:     sz,
+	}, nil
+}
+
+func (w *rotatingFileWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f == nil {
+		return 0, os.ErrClosed
+	}
+	if w.size+int64(len(p)) > w.maxBytes && w.size > 0 {
+		_ = w.f.Close()
+		_ = os.Rename(w.path, w.path+".1")
+		nf, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			w.f = nil
+			return 0, err
+		}
+		w.f = nf
+		w.size = 0
+	}
+	n, err := w.f.Write(p)
+	w.size += int64(n)
+	return n, err
+}
+
+func (w *rotatingFileWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f == nil {
+		return nil
+	}
+	err := w.f.Close()
+	w.f = nil
+	return err
+}
+
 func main() {
 	var (
 		configPath  = flag.String("config", "/data/adb/android_agent/config.json", "Path to config.json")
 		initConfig  = flag.Bool("init-config", true, "Create default config with random token if missing")
+		logFile     = flag.String("log-file", "", "Optional log file path with 2MB in-process rotation")
 		showVersion = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Parse()
@@ -35,10 +105,23 @@ func main() {
 		return
 	}
 
+	tzMsg := initAndroidTimezone()
+
+	if strings.TrimSpace(*logFile) != "" {
+		rw, err := newRotatingFileWriter(strings.TrimSpace(*logFile), maxLogFileBytes)
+		if err != nil {
+			log.Printf("log rotation init failed (%v); falling back to stderr", err)
+		} else {
+			log.SetOutput(rw)
+			defer rw.Close()
+		}
+	}
+
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	logf := func(format string, args ...any) {
 		log.Printf(format, args...)
 	}
+	logf("%s", tzMsg)
 	initAndroidCACerts(logf)
 
 	cfg, err := config.Load(*configPath, *initConfig)
@@ -98,9 +181,34 @@ func main() {
 			logf("received signal %v, shutting down cleanly", sig)
 			cancel()
 			srv.Close()
+			be.Close()
 			return
 		}
 	}
+}
+
+func initAndroidTimezone() string {
+	tz := strings.TrimSpace(os.Getenv("TZ"))
+	if tz == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		if out, err := exec.CommandContext(ctx, "/system/bin/getprop", "persist.sys.timezone").Output(); err == nil {
+			tz = strings.TrimSpace(string(out))
+		}
+	}
+	if tz == "" {
+		tz = "Asia/Shanghai"
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		if sh, shErr := time.LoadLocation("Asia/Shanghai"); shErr == nil {
+			time.Local = sh
+			return fmt.Sprintf("tz: failed to load %q (%v); fell back to Asia/Shanghai", tz, err)
+		}
+		return fmt.Sprintf("tz: failed to load %q (%v); using %s", tz, err, time.Local.String())
+	}
+	time.Local = loc
+	return fmt.Sprintf("tz: using %s (%s)", tz, time.Now().Format("-07:00"))
 }
 
 // initAndroidCACerts loads Android's Conscrypt/system root CA certificates into
