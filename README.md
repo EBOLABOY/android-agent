@@ -2,8 +2,8 @@
 
 小米 13（`fuxi` / Android 16 / API 36 / HyperOS 3.0 / KernelSU 3.3.1）原生低延迟 AI Agent 底座。
 
-- **当前状态**：**`v0.2.0-ondevice` 已内置手机端自闭环大脑（0-Token 原生日常引擎 + 双协议 LLM API 大脑 + 移动 Web 控制台 `/ui`）**，不再强依赖宿主机或电脑即可直接在小米 13 本机完成每日任务与自然语言交互；同时保留完整 MCP 服务端与游戏防风控熔断。
-- **架构亮点**：零外部 Go 依赖静态单文件，内置标准 **MCP Streamable HTTP (`2025-03-26`)** 服务端（`20` 个工具）、OpenAI/Gemini 双协议 Function-Calling 大脑与 `//go:embed` 移动 PWA 控制台（`http://127.0.0.1:8765/ui`）。
+- **当前状态**：**`v0.3.0-hybrid-engine` 已实现三层混合引擎（`hybrid-layered-v2`：4ms 内存 UI 树 + 纯 Go `/dev/input/event7` 拟人触控 + 720p 视觉兜底）与手机端自闭环大脑（0-Token 原生日常引擎 + 双协议 LLM API 大脑 + KernelSU/移动 Web 控制台 `/ui`）**。
+- **架构亮点**：零外部 Go 依赖静态单文件，内置标准 **MCP Streamable HTTP (`2025-03-26`)** 服务端（`23` 个工具）、懒加载 `app_process64` 微内核（3 分钟空闲自动销毁 + 王者荣耀前台熔断）、OpenAI/Gemini 双协议大脑与移动 PWA 控制台。
 
 ---
 
@@ -17,9 +17,15 @@
 ├── internal/
 │   ├── config/config.go               # config.json 解析、环境变量覆盖、首次启动自动生成 64 位随机 Token
 │   ├── backend/
-│   │   ├── backend.go                 # DeviceBackend 抽象接口（为阶段 2 @agent_sys 预留无缝替换点）
-│   │   ├── shell.go                   # 阶段 1 实现：raw screencap、cmd input/window、sh monkey、app_process64 剪贴板
-│   │   └── cliphelper.jar             # 内嵌的 1.9KB Dalvik 剪贴板助手（//go:embed）
+│   │   ├── backend.go                 # DeviceBackend 抽象接口
+│   │   ├── shell.go                   # hybrid-layered-v2 混合分层调度器（UI 树 + evdev + Shell/截屏兜底）
+│   │   ├── microkernel.go             # 懒加载 app_process64 (uid=2000) JSONL 管道管理器（3min 空闲退出+游戏熔断）
+│   │   ├── uitree.go                  # 控件树提纯压缩（300~500 Token）、卡片合并与 ID->坐标缓存
+│   │   ├── touch_linux.go             # 纯 Go /dev/input/eventX Multitouch Type B 拟人触控（defer 防卡死释放）
+│   │   ├── touch_ptr.go               # Linux ioctl 指针辅助
+│   │   ├── uitree_test.go
+│   │   ├── touch_test.go
+│   │   └── cliphelper.jar             # 内嵌 Dalvik 微内核 JAR（AgentClip + AgentKernel，//go:embed）
 │   ├── imgutil/
 │   │   ├── compress.go                # 原始 RGBA / PNG 解码 + 双线性等比缩放(720px) + JPEG(q=70) 压缩
 │   │   └── compress_test.go
@@ -42,14 +48,19 @@
 │   └── mcp/
 │       ├── server.go                  # 标准 MCP Streamable HTTP (2025-03-26) + /ui + /api/v1/jobs/* + /api/v1/chat + /api/v1/llm/config
 │       └── server_test.go
-├── cliphelper/AgentClip.smali         # 适配 Android 16 IClipboard 签名的剪贴板助手 Smali 源码
+├── cliphelper/
+│   ├── AgentClip.smali                # 适配 Android 16 IClipboard 的单次兜底剪贴板助手
+│   └── AgentKernel.smali              # 常驻懒加载微内核（UiAutomation 内存抓树 + 剪贴板，JSONL IPC）
 ├── ksu-module/                        # KernelSU 模块打包目录
 │   ├── module.prop
 │   ├── service.sh                     # 开机自启与守护进程保活脚本
 │   ├── action.sh                      # KSU 管理器一键查看/拉起脚本
 │   ├── uninstall.sh                   # 卸载清理脚本
 │   ├── config.json.example
-│   └── bin/agentd                     # linux/arm64 静态编译产物（.gitignore 忽略，运行 build.sh 生成）
+│   ├── webroot/index.html             # KernelSU 管理器原生内置 OLED AI Agent WebUI
+│   └── bin/
+│       ├── ksu_api.sh                 # KernelSU Root 免密 curl 桥接脚本
+│       └── agentd                     # linux/arm64 静态编译产物（.gitignore 忽略，运行 build.sh 生成）
 ├── lsposed-webview-debug/             # 极薄 13KB 零权限 LSPosed 模块（仅为选定 App 开启 WebView CDP）
 │   ├── AndroidManifest.xml
 │   ├── build_apk.sh                   # aapt2 + smali + zipalign + apksigner 一键打包签名
@@ -89,6 +100,28 @@
 | **应用拉起与触控输入** | 通过 | 通过 `/system/bin/sh /system/bin/monkey` 拉起应用，触控/按键直调 `/system/bin/cmd input` |
 | **Edge 浏览器 CDP** | 通过 | Microsoft Edge (`com.microsoft.emmx`, `EdgA/157`) 暴露 `@chrome_devtools_remote`：`cdp_status` **`21ms`**、`cdp_list_targets` **`15ms`**、`Runtime.evaluate` **`24~31ms`** |
 | **防风控暂停/恢复** | 通过 | 手动暂停拦截所有操作工具；`com.tencent.tmgp.sgame`（王者荣耀）进前台自动关闭 8765 监听，退出 3 秒后自动恢复 |
+
+---
+
+## 2.5 三层混合引擎（`v0.3.0-hybrid-engine` / `hybrid-layered-v2`）与真机实测
+
+在 `Xiaomi 13`（Android 16 API 36 / HyperOS 3.0）实机上的分阶段实测表现：
+
+1. **感知层（懒加载 `app_process64 uid=2000` 微内核）**
+   - 通过 `stdin/stdout` JSONL 管道驱动 `AgentKernel`，连接 `UiAutomation` 跳过 `waitForIdle` 并设最大深度（36）/节点上限（1200）防卡死；平时 0 内存，连续 **3 分钟无调用自动销毁**，王者荣耀（`com.tencent.tmgp.sgame`）进前台**秒杀微内核**。
+   - **新增 3 个核心工具（工具总数增至 `23` 个）**：
+     - `phone_ui_tree`：从内存直读控件树并提纯压缩（过滤不可见节点、密码脱敏、卡片合并、边界去重），控制在 **300~500 Token** 内并缓存 `ID -> bounds`。
+     - `phone_tap_node`：根据 `[id]` 计算中心点并叠加有限随机偏移，走 `evdev` 拟人点击。
+     - `phone_scroll_node`：在指定可滑动容器范围内执行拟人弧线滑动。
+   - **真机实测**：稳态 `phone_ui_tree` 内部耗时 **`4~14 ms`**（美团首页 176 原始节点压缩为 39 节点 / `~440 tok`，较原生 `uiautomator dump` 6.3~12.3s 提速数百倍）；复用管道的 `phone_clipboard_get` 仅 **`26.2 ms`**。
+
+2. **触控层（纯 Go `/dev/input/eventX` 物理拟人触控）**
+   - 自动扫描 `/dev/input/event*` 的 `EVIOCGID` / Sysfs / `EVIOCGPROP` / `EVIOCGABS`，精准剔除蓝牙 `uhid` 外设，自动锁定小米 13 物理 SPI 触摸屏 **`/dev/input/event7`（`fts`，`0..10799 × 0..23999` 十倍亚像素量程，Type B 协议）**。
+   - 点击随机按压 **`30~80ms`**（实测抓包 `57.06ms`），滑动使用 **二次贝塞尔微弧度 + Minimum-Jerk 变速**；写入全程互斥锁并用 `defer` 兜底补发抬起释放事件（`ABS_MT_TRACKING_ID=-1`、`BTN_TOUCH=0`、`SYN_REPORT=0`），绝不卡死屏幕。
+   - **安全降级**：仅竖屏（`ROTATION_0`）启用，检测到横屏或设备写入异常时自动无缝回退 `/system/bin/cmd input`。
+
+3. **兜底层（视觉与 Shell 保底）**
+   - 遇到自绘页面/游戏/WebView（控件树为空）或微内核异常时，自动回退 `raw screencap` 720p JPEG（或 `cdp_*`）与 Shell 命令。
 
 ---
 
