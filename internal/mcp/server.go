@@ -13,6 +13,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -28,7 +29,7 @@ import (
 
 const (
 	ServerName          = "android-agent"
-	ServerVersion       = "0.2.0-ondevice"
+	ServerVersion       = "0.3.1-ondevice"
 	DefaultProtoVersion = "2025-03-26"
 )
 
@@ -39,8 +40,10 @@ type Server struct {
 	guard      *guard.Guard
 	cdp        *cdp.Client
 	runner     *workflows.Runner
+	memory     *brain.MemoryStore
 	agent      *brain.Agent
 	jobs       *brain.JobManager
+	scheduler  *brain.Scheduler
 	started    time.Time
 	logger     func(format string, args ...any)
 
@@ -80,7 +83,11 @@ func NewServer(cfg *config.Config, be backend.DeviceBackend, g *guard.Guard, cdp
 	s.runner = workflows.NewRunner(be, cdpClient, g, cfg.ScreenshotWidth, func(line string) {
 		logger("workflow: %s", line)
 	})
+	s.memory = brain.NewMemoryStore(cfg.MemoryDir)
+	_ = s.memory.EnsureDefaults()
 	s.agent = brain.NewAgent(cfg.LLM, s, g)
+	s.agent.SetMemoryStore(s.memory)
+	s.scheduler = brain.NewScheduler(cfg.Schedule, g, s.jobs, "", s.runWorkflowJob, logger)
 
 	apiMux := http.NewServeMux()
 	apiMux.HandleFunc("/mcp", s.handleMCP)
@@ -95,6 +102,8 @@ func NewServer(cfg *config.Config, be backend.DeviceBackend, g *guard.Guard, cdp
 	apiMux.HandleFunc("/api/v1/chat/history", s.handleChatHistory)
 	apiMux.HandleFunc("/api/v1/chat/clear", s.handleChatClear)
 	apiMux.HandleFunc("/api/v1/llm/config", s.handleLLMConfig)
+	apiMux.HandleFunc("/api/v1/memory", s.handleMemory)
+	apiMux.HandleFunc("/api/v1/schedule", s.handleSchedule)
 
 	authedAPI := s.authMiddleware(apiMux)
 	rootMux := http.NewServeMux()
@@ -115,6 +124,15 @@ func (s *Server) SetConfigPath(path string) {
 	s.cfgMu.Lock()
 	s.configPath = path
 	s.cfgMu.Unlock()
+	if strings.TrimSpace(path) != "" && s.scheduler != nil {
+		s.scheduler.SetHistoryPath(filepath.Join(filepath.Dir(path), "schedule_history.json"))
+	}
+}
+
+func (s *Server) StartScheduler(ctx context.Context) {
+	if s.scheduler != nil {
+		s.scheduler.Run(ctx)
+	}
 }
 
 // Start binds the TCP listener and begins serving HTTP requests.
@@ -341,23 +359,27 @@ func (s *Server) handleJobRun(w http.ResponseWriter, r *http.Request) {
 	}
 	jobName := strings.TrimSpace(body.Job)
 	st, err := s.jobs.Start(jobName, func(ctx context.Context, logFn func(string)) (any, error) {
-		rnr := workflows.NewRunner(s.backend, s.cdp, s.guard, s.cfg.ScreenshotWidth, logFn)
-		switch jobName {
-		case "daily_all":
-			return rnr.RunDailyAll(ctx)
-		case "ms_rewards":
-			return rnr.RunMSRewards(ctx, workflows.MSRewardsOptions{SearchIntervalSec: 6.0, ReadCount: 10})
-		case "jd_daily":
-			return rnr.RunJDDaily(ctx, workflows.JDDailyOptions{BrowseSec: 8.5, MaxBrowse: 24, WaterMode: "tasks"})
-		default:
-			return nil, fmt.Errorf("unknown job %q (use daily_all, ms_rewards, or jd_daily)", jobName)
-		}
+		return s.runWorkflowJob(ctx, jobName, logFn)
 	})
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "job": st})
 		return
 	}
 	writeJSON(w, http.StatusAccepted, st)
+}
+
+func (s *Server) runWorkflowJob(ctx context.Context, jobName string, logFn func(string)) (any, error) {
+	rnr := workflows.NewRunner(s.backend, s.cdp, s.guard, s.cfg.ScreenshotWidth, logFn)
+	switch strings.TrimSpace(jobName) {
+	case "daily_all":
+		return rnr.RunDailyAll(ctx)
+	case "ms_rewards":
+		return rnr.RunMSRewards(ctx, workflows.MSRewardsOptions{SearchIntervalSec: 6.0, ReadCount: 10})
+	case "jd_daily":
+		return rnr.RunJDDaily(ctx, workflows.JDDailyOptions{BrowseSec: 8.5, MaxBrowse: 24, WaterMode: "tasks"})
+	default:
+		return nil, fmt.Errorf("unknown job %q (use daily_all, ms_rewards, or jd_daily)", jobName)
+	}
 }
 
 func (s *Server) handleJobCancel(w http.ResponseWriter, r *http.Request) {
@@ -477,6 +499,74 @@ func (s *Server) handleLLMConfig(w http.ResponseWriter, r *http.Request) {
 			"api_key_masked": config.MaskSecret(llm.APIKey),
 			"model":          llm.Model,
 		})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"files": s.memory.List(),
+		})
+	case http.MethodPost:
+		var body struct {
+			Name    string `json:"name"`
+			Content string `json:"content"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 32*1024)).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+			return
+		}
+		if err := s.memory.Write(body.Name, body.Content); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":    true,
+			"files": s.memory.List(),
+		})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.scheduler.Status())
+	case http.MethodPost:
+		var body config.ScheduleConfig
+		if err := json.NewDecoder(io.LimitReader(r.Body, 32*1024)).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+			return
+		}
+		for i, e := range body.Entries {
+			switch strings.TrimSpace(e.Job) {
+			case "daily_all", "ms_rewards", "jd_daily":
+			default:
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid job %q", e.Job)})
+				return
+			}
+			if strings.TrimSpace(e.ID) == "" {
+				body.Entries[i].ID = fmt.Sprintf("job-%d-%s", i+1, e.Job)
+			}
+		}
+		s.cfgMu.Lock()
+		s.cfg.Schedule = body
+		cfgPath := s.configPath
+		var saveErr error
+		if cfgPath != "" {
+			saveErr = config.Save(cfgPath, s.cfg)
+		}
+		s.cfgMu.Unlock()
+		s.scheduler.UpdateConfig(body)
+		if saveErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": saveErr.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, s.scheduler.Status())
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -1065,6 +1155,25 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		}
 		return textJSONResult(map[string]any{"ok": true}, false)
 
+	case "read_memory":
+		name := getString(args, "file", "all")
+		content, err := s.memory.Read(name)
+		if err != nil {
+			return textErrorResult(err.Error())
+		}
+		return map[string]any{
+			"content": []map[string]any{{"type": "text", "text": content}},
+			"isError": false,
+		}
+
+	case "append_memory":
+		file := getString(args, "file", brain.MemoryUserFile)
+		entry := getString(args, "entry", "")
+		if err := s.memory.Append(file, entry); err != nil {
+			return textErrorResult(err.Error())
+		}
+		return textJSONResult(map[string]any{"ok": true, "file": file}, false)
+
 	default:
 		return textErrorResult(fmt.Sprintf("unknown tool: %s", name))
 	}
@@ -1368,6 +1477,28 @@ func toolDefinitions() []map[string]any {
 					"tag":   map[string]any{"type": "string"},
 				},
 				"required": []string{"text"},
+			},
+		},
+		{
+			"name":        "read_memory",
+			"description": "Read on-device Markdown memory files (SOUL.md, MEMORY.md, LEARNINGS.md, or 'all').",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"file": map[string]any{"type": "string", "enum": []string{"all", "SOUL.md", "MEMORY.md", "LEARNINGS.md"}, "description": "Memory file name (default all)"},
+				},
+			},
+		},
+		{
+			"name":        "append_memory",
+			"description": "Append a timestamped bullet entry to MEMORY.md (user preferences/habits) or LEARNINGS.md (app pitfalls/fixes). SOUL.md cannot be modified by tools.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"file":  map[string]any{"type": "string", "enum": []string{"MEMORY.md", "LEARNINGS.md"}, "description": "Target Markdown file"},
+					"entry": map[string]any{"type": "string", "description": "Concise Chinese/English note to remember"},
+				},
+				"required": []string{"file", "entry"},
 			},
 		},
 	}

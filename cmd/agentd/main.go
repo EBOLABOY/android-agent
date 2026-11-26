@@ -83,6 +83,7 @@ func main() {
 	}
 
 	go g.Run(ctx)
+	go srv.StartScheduler(ctx)
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1, syscall.SIGUSR2)

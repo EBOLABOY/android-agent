@@ -19,7 +19,6 @@ if (typeof window.ksu?.exec === 'function') {
   --bg: #09090b;
   --surface: rgba(24, 24, 27, 0.78);
   --surface-solid: #141418;
-  --surface-2: #1c1c22;
   --border: rgba(255, 255, 255, 0.08);
   --border-strong: rgba(255, 255, 255, 0.14);
   --text: #f4f4f5;
@@ -27,6 +26,7 @@ if (typeof window.ksu?.exec === 'function') {
   --dim: #52525b;
   --cyan: #38bdf8;
   --indigo: #6366f1;
+  --violet: #a855f7;
   --emerald: #10b981;
   --amber: #f59e0b;
   --rose: #f43f5e;
@@ -75,18 +75,17 @@ button:disabled {
   cursor: not-allowed;
 }
 
-/* ---------- Header ---------- */
+/* ---------- Header & Hybrid Telemetry Bar ---------- */
 .topbar {
-  height: 56px;
+  height: 54px;
   padding: 0 14px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  background: rgba(9, 9, 11, 0.72);
+  gap: 8px;
+  background: rgba(9, 9, 11, 0.78);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
-  border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   z-index: 10;
 }
@@ -94,7 +93,7 @@ button:disabled {
 .brand {
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: 10px;
   min-width: 0;
 }
 
@@ -123,19 +122,15 @@ button:disabled {
   box-shadow: 0 0 12px rgba(56, 189, 248, 0.28);
 }
 
-.orb.sm::after {
-  inset: 2.5px;
-}
+.orb.sm::after { inset: 2.5px; }
 
 .orb.lg {
-  width: 56px;
-  height: 56px;
+  width: 54px;
+  height: 54px;
   box-shadow: 0 0 38px rgba(56, 189, 248, 0.34), 0 0 70px rgba(99, 102, 241, 0.18);
 }
 
-.orb.lg::after {
-  inset: 5px;
-}
+.orb.lg::after { inset: 5px; }
 
 .orb.busy {
   background: conic-gradient(from 0deg, #f59e0b, #38bdf8, #6366f1, #f59e0b);
@@ -163,7 +158,7 @@ button:disabled {
 }
 
 .brand-title {
-  font-size: 15px;
+  font-size: 14.5px;
   font-weight: 650;
   letter-spacing: -0.01em;
   line-height: 1.2;
@@ -175,7 +170,7 @@ button:disabled {
 .brand-sub {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   font-size: 11px;
   color: var(--muted);
   margin-top: 2px;
@@ -193,27 +188,20 @@ button:disabled {
   flex-shrink: 0;
 }
 
-.status-dot.warn {
-  background: var(--amber);
-  box-shadow: 0 0 8px rgba(245, 158, 11, 0.7);
-}
-
-.status-dot.err {
-  background: var(--rose);
-  box-shadow: 0 0 8px rgba(244, 63, 94, 0.7);
-}
+.status-dot.warn { background: var(--amber); box-shadow: 0 0 8px rgba(245, 158, 11, 0.7); }
+.status-dot.err { background: var(--rose); box-shadow: 0 0 8px rgba(244, 63, 94, 0.7); }
 
 .top-actions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   flex-shrink: 0;
 }
 
 .icon-btn {
-  width: 36px;
-  height: 36px;
-  border-radius: 12px;
+  width: 34px;
+  height: 34px;
+  border-radius: 11px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -221,7 +209,7 @@ button:disabled {
   border: 1px solid var(--border);
   color: var(--text);
   position: relative;
-  transition: background 0.15s, transform 0.12s, border-color 0.15s;
+  transition: background 0.15s, transform 0.12s;
 }
 
 .icon-btn:active {
@@ -231,29 +219,61 @@ button:disabled {
 
 .icon-btn .badge-dot {
   position: absolute;
-  top: 7px;
-  right: 7px;
-  width: 7px;
-  height: 7px;
+  top: 6px;
+  right: 6px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
   background: var(--cyan);
   box-shadow: 0 0 8px var(--cyan);
   display: none;
 }
 
-.icon-btn.active .badge-dot {
-  display: block;
-}
+.icon-btn.active .badge-dot { display: block; }
 
 svg.ic {
-  width: 18px;
-  height: 18px;
+  width: 17px;
+  height: 17px;
   stroke: currentColor;
   fill: none;
   stroke-width: 1.85;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
+
+.telemetry-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 14px 7px;
+  background: rgba(9, 9, 11, 0.78);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex-shrink: 0;
+}
+
+.telemetry-bar::-webkit-scrollbar { display: none; }
+
+.t-pill {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  font-weight: 550;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+  color: #cbd5e1;
+  white-space: nowrap;
+}
+
+.t-pill.good { border-color: rgba(16, 185, 129, 0.28); color: #6ee7b7; background: rgba(16, 185, 129, 0.08); }
+.t-pill.cyan { border-color: rgba(56, 189, 248, 0.28); color: #7dd3fc; background: rgba(56, 189, 248, 0.08); }
+.t-pill.warn { border-color: rgba(245, 158, 11, 0.30); color: #fcd34d; background: rgba(245, 158, 11, 0.09); }
+.t-pill.err { border-color: rgba(244, 63, 94, 0.35); color: #fda4af; background: rgba(244, 63, 94, 0.1); }
 
 /* ---------- Dynamic Island Job Pill ---------- */
 .island-wrap {
@@ -263,9 +283,7 @@ svg.ic {
   z-index: 8;
 }
 
-.island-wrap.open {
-  display: block;
-}
+.island-wrap.open { display: block; }
 
 .island {
   display: flex;
@@ -274,7 +292,7 @@ svg.ic {
   gap: 10px;
   padding: 9px 12px;
   border-radius: 14px;
-  background: rgba(24, 24, 27, 0.86);
+  background: rgba(24, 24, 27, 0.88);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   border: 1px solid var(--border-strong);
@@ -299,34 +317,11 @@ svg.ic {
   flex-shrink: 0;
 }
 
-.island-text {
-  min-width: 0;
-  flex: 1;
-}
+.island-text { min-width: 0; flex: 1; }
+.island-title { font-size: 12.5px; font-weight: 600; }
+.island-sub { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
 
-.island-title {
-  font-size: 12.5px;
-  font-weight: 600;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.island-sub {
-  font-size: 11px;
-  color: var(--muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  margin-top: 1px;
-}
-
-.island-btns {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-shrink: 0;
-}
+.island-btns { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 
 .mini-btn {
   padding: 5px 10px;
@@ -349,20 +344,18 @@ svg.ic {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 16px 14px 12px;
+  padding: 14px 14px 12px;
   display: flex;
   flex-direction: column;
   scroll-behavior: smooth;
 }
 
-.viewport::-webkit-scrollbar {
-  width: 0;
-}
+.viewport::-webkit-scrollbar { width: 0; }
 
 /* ---------- Hero Empty State ---------- */
 .hero {
   margin: auto 0;
-  padding: 12px 0 8px;
+  padding: 8px 0;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -370,13 +363,11 @@ svg.ic {
   animation: fadeUp 0.28s ease-out;
 }
 
-.hero.hidden {
-  display: none;
-}
+.hero.hidden { display: none; }
 
 .hero h1 {
-  margin: 18px 0 6px;
-  font-size: 22px;
+  margin: 16px 0 6px;
+  font-size: 21px;
   font-weight: 700;
   letter-spacing: -0.02em;
   background: linear-gradient(180deg, #ffffff 0%, #a1a1aa 100%);
@@ -385,8 +376,8 @@ svg.ic {
 }
 
 .hero p {
-  margin: 0 0 22px;
-  font-size: 12.5px;
+  margin: 0 0 20px;
+  font-size: 12px;
   color: var(--muted);
   line-height: 1.5;
 }
@@ -404,10 +395,10 @@ svg.ic {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.045) 0%, rgba(255, 255, 255, 0.02) 100%);
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
-  padding: 14px;
+  padding: 13px;
   display: flex;
   flex-direction: column;
-  gap: 9px;
+  gap: 8px;
   transition: transform 0.14s ease, border-color 0.18s ease, background 0.18s ease;
 }
 
@@ -418,9 +409,9 @@ svg.ic {
 }
 
 .cap-ic {
-  width: 32px;
-  height: 32px;
-  border-radius: 10px;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -430,21 +421,12 @@ svg.ic {
 .cap-ic.amber { background: rgba(245, 158, 11, 0.14); color: var(--amber); }
 .cap-ic.emerald { background: rgba(16, 185, 129, 0.14); color: var(--emerald); }
 .cap-ic.indigo { background: rgba(99, 102, 241, 0.16); color: #a5b4fc; }
+.cap-ic.violet { background: rgba(168, 85, 247, 0.16); color: #d8b4fe; }
 
-.cap-title {
-  font-size: 13.5px;
-  font-weight: 620;
-  color: var(--text);
-  line-height: 1.25;
-}
+.cap-title { font-size: 13px; font-weight: 620; color: var(--text); line-height: 1.25; }
+.cap-desc { font-size: 11px; color: var(--muted); line-height: 1.35; }
 
-.cap-desc {
-  font-size: 11.5px;
-  color: var(--muted);
-  line-height: 1.35;
-}
-
-/* ---------- Editorial Chat Feed ---------- */
+/* ---------- Editorial Chat Feed & Multi-Step Trace ---------- */
 .feed {
   display: flex;
   flex-direction: column;
@@ -490,15 +472,25 @@ svg.ic {
   color: var(--text);
 }
 
-.agent-meta {
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--muted);
+.agent-meta { font-size: 11px; font-weight: 500; color: var(--muted); }
+
+.confirm-banner {
+  margin-left: 28px;
+  padding: 10px 12px;
+  border-radius: 13px;
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.42);
+  color: #fde68a;
+  font-size: 12.5px;
+  line-height: 1.45;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
 }
 
 .tool-box {
   margin-left: 28px;
-  background: rgba(56, 189, 248, 0.06);
+  background: rgba(56, 189, 248, 0.05);
   border: 1px solid rgba(56, 189, 248, 0.18);
   border-radius: 12px;
   overflow: hidden;
@@ -528,25 +520,52 @@ svg.ic {
 
 .tool-steps {
   display: none;
-  padding: 0 11px 9px;
-  flex-wrap: wrap;
+  padding: 8px 11px 10px;
+  flex-direction: column;
   gap: 6px;
   border-top: 1px solid rgba(56, 189, 248, 0.12);
-  padding-top: 8px;
 }
 
-.tool-box.open .tool-steps {
+.tool-box.open .tool-steps { display: flex; }
+
+.trace-row {
   display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font-size: 11.5px;
+  line-height: 1.4;
 }
 
-.tool-chip {
+.cat-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 650;
+  padding: 1.5px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
+
+.cat-ui_tree { color: #7dd3fc; background: rgba(56, 189, 248, 0.12); border-color: rgba(56, 189, 248, 0.3); }
+.cat-touch { color: #6ee7b7; background: rgba(16, 185, 129, 0.12); border-color: rgba(16, 185, 129, 0.3); }
+.cat-vision { color: #fcd34d; background: rgba(245, 158, 11, 0.12); border-color: rgba(245, 158, 11, 0.3); }
+.cat-cdp { color: #a5b4fc; background: rgba(99, 102, 241, 0.14); border-color: rgba(99, 102, 241, 0.3); }
+.cat-memory { color: #d8b4fe; background: rgba(168, 85, 247, 0.14); border-color: rgba(168, 85, 247, 0.3); }
+.cat-workflow { color: #93c5fd; background: rgba(37, 99, 235, 0.14); border-color: rgba(37, 99, 235, 0.3); }
+.cat-system { color: #cbd5e1; background: rgba(255, 255, 255, 0.06); }
+
+.trace-tool {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #e4e4e7;
   font-size: 11px;
-  padding: 3px 8px;
-  border-radius: 7px;
-  background: rgba(9, 9, 11, 0.55);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  color: #bae6fd;
+  flex-shrink: 0;
+}
+
+.trace-sum {
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
 }
 
 .agent-body {
@@ -557,91 +576,22 @@ svg.ic {
   word-break: break-word;
 }
 
-.agent-body p {
-  margin: 0 0 8px;
-}
+.agent-body p { margin: 0 0 8px; }
+.agent-body p:last-child { margin-bottom: 0; }
+.agent-body ul, .agent-body ol { margin: 6px 0; padding-left: 18px; }
+.agent-body li { margin: 3px 0; }
+.agent-body h3, .agent-body h4 { margin: 10px 0 4px; font-size: 14.5px; font-weight: 650; color: #fff; }
+.agent-body code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; padding: 1.5px 5px; border-radius: 6px; background: rgba(255, 255, 255, 0.08); color: #7dd3fc; }
+.agent-body pre { margin: 8px 0; padding: 10px 12px; border-radius: 12px; background: #0d0d12; border: 1px solid var(--border); overflow-x: auto; }
+.agent-body pre code { padding: 0; background: none; color: #cbd5e1; font-size: 12px; line-height: 1.5; }
+.agent-error { padding-left: 28px; font-size: 13.5px; color: #fda4af; }
 
-.agent-body p:last-child {
-  margin-bottom: 0;
-}
-
-.agent-body ul, .agent-body ol {
-  margin: 6px 0;
-  padding-left: 18px;
-}
-
-.agent-body li {
-  margin: 3px 0;
-}
-
-.agent-body h3, .agent-body h4 {
-  margin: 10px 0 4px;
-  font-size: 14.5px;
-  font-weight: 650;
-  color: #fff;
-}
-
-.agent-body code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12.5px;
-  padding: 1.5px 5px;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.08);
-  color: #7dd3fc;
-}
-
-.agent-body pre {
-  margin: 8px 0;
-  padding: 10px 12px;
-  border-radius: 12px;
-  background: #0d0d12;
-  border: 1px solid var(--border);
-  overflow-x: auto;
-}
-
-.agent-body pre code {
-  padding: 0;
-  background: none;
-  color: #cbd5e1;
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.agent-error {
-  padding-left: 28px;
-  font-size: 13.5px;
-  color: #fda4af;
-}
-
-.thinking-row {
-  padding-left: 28px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  color: var(--muted);
-}
-
-.dots {
-  display: inline-flex;
-  gap: 4px;
-}
-
-.dots span {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--cyan);
-  animation: dotPulse 1.2s infinite ease-in-out;
-}
-
+.thinking-row { padding-left: 28px; display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.dots { display: inline-flex; gap: 4px; }
+.dots span { width: 5px; height: 5px; border-radius: 50%; background: var(--cyan); animation: dotPulse 1.2s infinite ease-in-out; }
 .dots span:nth-child(2) { animation-delay: 0.18s; }
 .dots span:nth-child(3) { animation-delay: 0.36s; }
-
-@keyframes dotPulse {
-  0%, 80%, 100% { opacity: 0.25; transform: scale(0.8); }
-  40% { opacity: 1; transform: scale(1.1); }
-}
+@keyframes dotPulse { 0%, 80%, 100% { opacity: 0.25; transform: scale(0.8); } 40% { opacity: 1; transform: scale(1.1); } }
 
 /* ---------- Floating Capsule Dock ---------- */
 .dock {
@@ -661,9 +611,7 @@ svg.ic {
   scrollbar-width: none;
 }
 
-.chips-row::-webkit-scrollbar {
-  display: none;
-}
+.chips-row::-webkit-scrollbar { display: none; }
 
 .chip {
   flex-shrink: 0;
@@ -674,13 +622,9 @@ svg.ic {
   background: rgba(255, 255, 255, 0.045);
   border: 1px solid var(--border);
   white-space: nowrap;
-  transition: background 0.14s, transform 0.1s;
 }
 
-.chip:active {
-  transform: scale(0.96);
-  background: rgba(255, 255, 255, 0.1);
-}
+.chip:active { transform: scale(0.96); background: rgba(255, 255, 255, 0.1); }
 
 .capsule {
   max-width: 720px;
@@ -693,12 +637,9 @@ svg.ic {
   background: #16161b;
   border: 1px solid var(--border-strong);
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
-  transition: border-color 0.18s;
 }
 
-.capsule:focus-within {
-  border-color: rgba(56, 189, 248, 0.55);
-}
+.capsule:focus-within { border-color: rgba(56, 189, 248, 0.55); }
 
 .capsule textarea {
   flex: 1;
@@ -712,12 +653,9 @@ svg.ic {
   line-height: 1.45;
   max-height: 112px;
   padding: 6px 0;
-  margin: 0;
 }
 
-.capsule textarea::placeholder {
-  color: var(--dim);
-}
+.capsule textarea::placeholder { color: var(--dim); }
 
 .send-btn {
   width: 36px;
@@ -729,18 +667,9 @@ svg.ic {
   justify-content: center;
   background: #f4f4f5;
   color: #09090b;
-  transition: transform 0.12s, opacity 0.15s, background 0.15s;
 }
 
-.send-btn:active {
-  transform: scale(0.92);
-}
-
-.send-btn:disabled {
-  background: rgba(255, 255, 255, 0.12);
-  color: rgba(255, 255, 255, 0.35);
-  opacity: 1;
-}
+.send-btn:disabled { background: rgba(255, 255, 255, 0.12); color: rgba(255, 255, 255, 0.35); opacity: 1; }
 
 /* ---------- Slide-Up Bottom Sheets ---------- */
 .backdrop {
@@ -755,206 +684,168 @@ svg.ic {
   z-index: 40;
 }
 
-.backdrop.open {
-  display: flex;
-}
+.backdrop.open { display: flex; }
 
 .sheet {
   width: 100%;
-  max-width: 560px;
-  max-height: 84dvh;
+  max-width: 580px;
+  max-height: 86dvh;
   background: #131317;
   border-top: 1px solid var(--border-strong);
   border-radius: 24px 24px 0 0;
   padding: 10px 16px calc(18px + var(--window-inset-bottom, env(safe-area-inset-bottom, 0px)));
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 13px;
   overflow-y: auto;
   animation: sheetUp 0.2s cubic-bezier(0.2, 0.85, 0.3, 1);
 }
 
-@keyframes sheetUp {
-  from { transform: translateY(24px); opacity: 0.5; }
-  to { transform: translateY(0); opacity: 1; }
-}
+@keyframes sheetUp { from { transform: translateY(24px); opacity: 0.5; } to { transform: translateY(0); opacity: 1; } }
 
-.sheet-handle {
-  width: 38px;
-  height: 4px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.2);
-  margin: 2px auto 2px;
-  flex-shrink: 0;
-}
+.sheet-handle { width: 38px; height: 4px; border-radius: 999px; background: rgba(255, 255, 255, 0.2); margin: 2px auto; flex-shrink: 0; }
+.sheet-hdr { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.sheet-hdr h2 { margin: 0; font-size: 16px; font-weight: 650; }
 
-.sheet-hdr {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
+.sec-title { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
 
-.sheet-hdr h2 {
-  margin: 0;
-  font-size: 16.5px;
-  font-weight: 650;
-}
-
-.task-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
+.task-list { display: flex; flex-direction: column; gap: 8px; }
 
 .task-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 12px 14px;
-  border-radius: 15px;
+  padding: 11px 13px;
+  border-radius: 14px;
   background: rgba(255, 255, 255, 0.035);
   border: 1px solid var(--border);
   text-align: left;
 }
 
-.task-row:active {
-  background: rgba(56, 189, 248, 0.08);
-  border-color: rgba(56, 189, 248, 0.35);
-}
+.task-row-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.task-meta-title { font-size: 13.5px; font-weight: 600; }
+.task-meta-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
 
-.task-row-left {
-  display: flex;
-  align-items: center;
-  gap: 11px;
-  min-width: 0;
-}
-
-.task-meta-title {
-  font-size: 14px;
-  font-weight: 600;
-}
-
-.task-meta-sub {
-  font-size: 11.5px;
-  color: var(--muted);
-  margin-top: 2px;
-}
-
-.term-box {
-  background: #08080b;
+.cron-card {
+  padding: 12px 13px;
+  border-radius: 15px;
+  background: rgba(255, 255, 255, 0.03);
   border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
-.term-hdr {
+.cron-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.switch-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 11.5px;
-  color: var(--muted);
-  margin-bottom: 8px;
-}
-
-pre#sheetLogs {
-  margin: 0;
-  max-height: 210px;
-  overflow: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
-  line-height: 1.5;
-  color: #cbd5e1;
-}
-
-/* ---------- Settings Form & Presets ---------- */
-.presets {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 7px;
-}
-
-.preset-btn {
-  padding: 6px 11px;
-  border-radius: 999px;
-  font-size: 11.5px;
+  gap: 10px;
+  font-size: 13px;
   font-weight: 550;
-  background: rgba(56, 189, 248, 0.09);
-  border: 1px solid rgba(56, 189, 248, 0.25);
-  color: #bae6fd;
 }
 
-.preset-btn:active {
-  background: rgba(56, 189, 248, 0.2);
+.switch-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--cyan);
 }
 
-.field {
+.hist-list {
   display: flex;
   flex-direction: column;
+  gap: 5px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.hist-item {
+  font-size: 11px;
+  color: var(--muted);
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.25);
+}
+
+.term-box { background: #08080b; border: 1px solid var(--border); border-radius: 14px; padding: 10px 12px; }
+.term-hdr { display: flex; align-items: center; justify-content: space-between; font-size: 11.5px; color: var(--muted); margin-bottom: 8px; }
+pre#sheetLogs { margin: 0; max-height: 180px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.5; color: #cbd5e1; }
+
+/* ---------- Segmented Tabs & Memory Editor ---------- */
+.seg-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
   gap: 6px;
+  padding: 4px;
+  border-radius: 13px;
+  background: #09090c;
+  border: 1px solid var(--border);
+}
+
+.seg-btn {
+  padding: 8px 6px;
+  border-radius: 10px;
   font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  text-align: center;
+}
+
+.seg-btn.active {
+  background: rgba(56, 189, 248, 0.16);
+  color: #e0f2fe;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+}
+
+.mem-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
   color: var(--muted);
 }
 
-.field input, .field select {
+.mem-editor {
   width: 100%;
+  min-height: 240px;
+  max-height: 44dvh;
+  resize: vertical;
   background: #09090c;
-  color: var(--text);
+  color: #e4e4e7;
   border: 1px solid var(--border-strong);
-  border-radius: 12px;
-  padding: 11px 12px;
-  font-size: 13.5px;
+  border-radius: 14px;
+  padding: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
   outline: none;
 }
 
-.field input:focus, .field select:focus {
-  border-color: var(--cyan);
-}
+.mem-editor:focus { border-color: var(--cyan); }
 
-.sheet-actions {
-  display: flex;
-  gap: 8px;
-  margin-top: 2px;
-}
+/* ---------- Settings Form & Presets ---------- */
+.presets { display: flex; flex-wrap: wrap; gap: 7px; }
+.preset-btn { padding: 6px 11px; border-radius: 999px; font-size: 11.5px; font-weight: 550; background: rgba(56, 189, 248, 0.09); border: 1px solid rgba(56, 189, 248, 0.25); color: #bae6fd; }
+.field { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); }
+.field input, .field select { width: 100%; background: #09090c; color: var(--text); border: 1px solid var(--border-strong); border-radius: 11px; padding: 10px 11px; font-size: 13px; outline: none; }
+.field input:focus, .field select:focus { border-color: var(--cyan); }
 
-.btn-secondary {
-  flex: 1;
-  padding: 11px;
-  border-radius: 13px;
-  font-size: 14px;
-  font-weight: 600;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid var(--border);
-  text-align: center;
-}
-
-.btn-primary {
-  flex: 1.4;
-  padding: 11px;
-  border-radius: 13px;
-  font-size: 14px;
-  font-weight: 600;
-  background: linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%);
-  color: #fff;
-  text-align: center;
-}
-
-.btn-danger {
-  padding: 6px 12px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 600;
-  background: rgba(244, 63, 94, 0.14);
-  border: 1px solid rgba(244, 63, 94, 0.35);
-  color: #fda4af;
-}
-
-.hidden {
-  display: none !important;
-}
+.sheet-actions { display: flex; gap: 8px; margin-top: 2px; }
+.btn-secondary { flex: 1; padding: 11px; border-radius: 13px; font-size: 14px; font-weight: 600; background: rgba(255, 255, 255, 0.06); border: 1px solid var(--border); text-align: center; }
+.btn-primary { flex: 1.4; padding: 11px; border-radius: 13px; font-size: 14px; font-weight: 600; background: linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%); color: #fff; text-align: center; }
+.btn-danger { padding: 6px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; background: rgba(244, 63, 94, 0.14); border: 1px solid rgba(244, 63, 94, 0.35); color: #fda4af; }
+.hidden { display: none !important; }
 </style>
 </head>
 <body>
@@ -971,7 +862,10 @@ pre#sheetLogs {
     </div>
   </div>
   <div class="top-actions">
-    <button id="autoBtn" class="icon-btn" onclick="openSheet('autoSheet')" title="自动化引擎">
+    <button class="icon-btn" onclick="openMemory()" title="端侧记忆">
+      <svg class="ic" viewBox="0 0 24 24"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/><path d="M8 7h8M8 11h6"/></svg>
+    </button>
+    <button id="autoBtn" class="icon-btn" onclick="openAutomation()" title="自动化与定时心跳">
       <span class="badge-dot"></span>
       <svg class="ic" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></svg>
     </button>
@@ -984,8 +878,15 @@ pre#sheetLogs {
   </div>
 </header>
 
+<div class="telemetry-bar">
+  <span id="pillGuard" class="t-pill">守护: 检测中</span>
+  <span id="pillKernel" class="t-pill">UI树: 0MB待机</span>
+  <span id="pillTouch" class="t-pill">触控: 探测中</span>
+  <span id="pillCron" class="t-pill">心跳: 未开启</span>
+</div>
+
 <div id="islandWrap" class="island-wrap">
-  <div class="island" onclick="openSheet('autoSheet')">
+  <div class="island" onclick="openAutomation()">
     <div class="island-main">
       <div id="islandSpin" class="spinner"></div>
       <div class="island-text">
@@ -994,7 +895,7 @@ pre#sheetLogs {
       </div>
     </div>
     <div class="island-btns" onclick="event.stopPropagation()">
-      <button class="mini-btn" onclick="openSheet('autoSheet')">日志</button>
+      <button class="mini-btn" onclick="openAutomation()">日志</button>
       <button id="islandStopBtn" class="mini-btn danger" onclick="cancelJob()">停止</button>
     </div>
   </div>
@@ -1004,46 +905,38 @@ pre#sheetLogs {
   <section id="hero" class="hero">
     <div id="heroOrb" class="orb lg"></div>
     <h1>有什么可以帮你？</h1>
-    <p>小米 13 端侧大脑 · WebView 20ms DOM · 0-Token 原生自动化</p>
+    <p>hybrid-layered-v2 · 4ms 内存 UI 树 · evdev 拟人触控 · 端侧记忆</p>
 
     <div class="cap-grid">
       <button class="cap-card" onclick="runJob('daily_all', true)">
-        <div class="cap-ic cyan">
-          <svg class="ic" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></svg>
-        </div>
+        <div class="cap-ic cyan"><svg class="ic" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></svg></div>
         <div>
           <div class="cap-title">每日一键全清</div>
           <div class="cap-desc">微软积分 + 京东农场 · 0 Token</div>
         </div>
       </button>
 
-      <button class="cap-card" onclick="runJob('ms_rewards', true)">
-        <div class="cap-ic amber">
-          <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M9.5 9.5h4a1.5 1.5 0 0 1 0 3h-3a1.5 1.5 0 0 0 0 3h4M12 7.5v9"/></svg>
-        </div>
+      <button class="cap-card" onclick="quickPrompt('用 phone_ui_tree 查一下当前桌面或美团界面有什么可点击入口（只读，不要下单）')">
+        <div class="cap-ic emerald"><svg class="ic" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg></div>
         <div>
-          <div class="cap-title">微软积分任务</div>
-          <div class="cap-desc">Edge &amp; Bing DOM 自动刷分</div>
+          <div class="cap-title">4ms 控件树控机</div>
+          <div class="cap-desc">纯文本操控美团/原生 App</div>
         </div>
       </button>
 
-      <button class="cap-card" onclick="runJob('jd_daily', true)">
-        <div class="cap-ic emerald">
-          <svg class="ic" viewBox="0 0 24 24"><path d="M7 20h10M12 20v-8M12 12C7 12 5 8 5 4c4 0 7 2 7 8ZM12 14c5 0 7-3.5 7-7.5-4 0-7 2-7 7.5Z"/></svg>
-        </div>
+      <button class="cap-card" onclick="openMemory()">
+        <div class="cap-ic violet"><svg class="ic" viewBox="0 0 24 24"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/><path d="M8 7h8M8 11h6"/></svg></div>
         <div>
-          <div class="cap-title">京东农场 + 京豆</div>
-          <div class="cap-desc">收树上水滴 · 浏览任务 · 刮豆</div>
+          <div class="cap-title">端侧记忆管理</div>
+          <div class="cap-desc">编辑 SOUL / MEMORY / LEARNINGS</div>
         </div>
       </button>
 
-      <button class="cap-card" onclick="quickPrompt('帮我检查一下当前手机前台应用、守护状态和屏幕信息')">
-        <div class="cap-ic indigo">
-          <svg class="ic" viewBox="0 0 24 24"><rect x="6" y="2.5" width="12" height="19" rx="3"/><path d="M10.5 18h3"/></svg>
-        </div>
+      <button class="cap-card" onclick="openAutomation()">
+        <div class="cap-ic amber"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div>
         <div>
-          <div class="cap-title">诊断当前手机</div>
-          <div class="cap-desc">查看前台应用 · 守护与状态</div>
+          <div class="cap-title">定时随机心跳</div>
+          <div class="cap-desc">随机时间窗 · 王者游戏自动避让</div>
         </div>
       </button>
     </div>
@@ -1054,10 +947,10 @@ pre#sheetLogs {
 
 <footer class="dock">
   <div id="chipsRow" class="chips-row">
-    <button class="chip" onclick="quickPrompt('截屏看看当前手机界面上有什么内容')">截屏识别当前界面</button>
-    <button class="chip" onclick="quickPrompt('查一下现在前台是什么应用，CDP 是否可用')">查看前台与 CDP</button>
-    <button class="chip" onclick="runJob('daily_all', true)">0-Token 每日一键全清</button>
-    <button class="chip" onclick="openSheet('autoSheet')">任务日志控制台</button>
+    <button class="chip" onclick="quickPrompt('打开美团搜附近高分奶茶店，加购一杯少冰不额外加糖后，停在结算确认页让我人工核对')">美团逛店加购（停在确认页）</button>
+    <button class="chip" onclick="quickPrompt('调用 phone_ui_tree 看看当前屏幕识别出哪些元素')">4ms 读取当前控件树</button>
+    <button class="chip" onclick="quickPrompt('截屏看看当前手机界面')">截屏视觉兜底</button>
+    <button class="chip" onclick="openMemory()">查看端侧记忆</button>
   </div>
   <div class="capsule">
     <textarea id="prompt" rows="1" placeholder="给 Xiaomi 13 Agent 发指令..."></textarea>
@@ -1067,14 +960,40 @@ pre#sheetLogs {
   </div>
 </footer>
 
-<!-- Automation Bottom Sheet -->
+<!-- Memory Drawer -->
+<div id="memorySheet" class="backdrop" onclick="closeSheet('memorySheet')">
+  <div class="sheet" onclick="event.stopPropagation()">
+    <div class="sheet-handle"></div>
+    <div class="sheet-hdr">
+      <h2>端侧 Markdown 记忆系统</h2>
+      <span id="memPermBadge" class="t-pill cyan">加载中</span>
+    </div>
+    <div class="seg-tabs">
+      <button id="tabSOUL" class="seg-btn active" onclick="selectMemoryTab('SOUL.md')">SOUL.md</button>
+      <button id="tabMEM" class="seg-btn" onclick="selectMemoryTab('MEMORY.md')">MEMORY.md</button>
+      <button id="tabLEARN" class="seg-btn" onclick="selectMemoryTab('LEARNINGS.md')">LEARNINGS.md</button>
+    </div>
+    <div class="mem-meta">
+      <span id="memDesc">人设与安全红线</span>
+      <span id="memUpdated"></span>
+    </div>
+    <textarea id="memEditor" class="mem-editor" spellcheck="false" placeholder="加载记忆内容..."></textarea>
+    <div class="sheet-actions">
+      <button class="btn-secondary" onclick="closeSheet('memorySheet')">关闭</button>
+      <button id="memSaveBtn" class="btn-primary" onclick="saveMemory()">保存此记忆</button>
+    </div>
+  </div>
+</div>
+
+<!-- Automation & Cron Sheet -->
 <div id="autoSheet" class="backdrop" onclick="closeSheet('autoSheet')">
   <div class="sheet" onclick="event.stopPropagation()">
     <div class="sheet-handle"></div>
     <div class="sheet-hdr">
-      <h2>0-Token 自动化引擎</h2>
+      <h2>0-Token 引擎与心跳调度</h2>
       <button id="sheetStopBtn" class="btn-danger hidden" onclick="cancelJob()">停止任务</button>
     </div>
+
     <div class="task-list">
       <button class="task-row" onclick="runJob('daily_all', false)">
         <div class="task-row-left">
@@ -1091,7 +1010,7 @@ pre#sheetLogs {
           <div class="cap-ic amber"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M9.5 9.5h4a1.5 1.5 0 0 1 0 3h-3a1.5 1.5 0 0 0 0 3h4M12 7.5v9"/></svg></div>
           <div>
             <div class="task-meta-title">微软积分每日任务</div>
-            <div class="task-meta-sub">Edge Daily + Bing CDP 签入与纯文阅读</div>
+            <div class="task-meta-sub">Edge + Bing CDP 签入与纯文阅读</div>
           </div>
         </div>
         <span class="mini-btn">运行</span>
@@ -1107,6 +1026,35 @@ pre#sheetLogs {
         <span class="mini-btn">运行</span>
       </button>
     </div>
+
+    <div class="sec-title">每日随机时间窗心跳（Cron）</div>
+    <div class="cron-card">
+      <label class="switch-row">
+        <span>启用每日定时自动执行</span>
+        <input id="cronEnabled" type="checkbox">
+      </label>
+      <div class="field">执行任务
+        <select id="cronJob">
+          <option value="daily_all">daily_all（微软 + 京东全套）</option>
+          <option value="ms_rewards">ms_rewards（仅微软积分）</option>
+          <option value="jd_daily">jd_daily（仅京东农场+京豆）</option>
+        </select>
+      </div>
+      <div class="cron-row">
+        <div class="field">最早时间<input id="cronStart" type="time" value="08:15"></div>
+        <div class="field">最晚时间<input id="cronEnd" type="time" value="09:30"></div>
+      </div>
+      <label class="switch-row">
+        <span style="font-size:12px;color:var(--muted)">若王者荣耀正在前台则顺延 15 分钟</span>
+        <input id="cronDefer" type="checkbox" checked>
+      </label>
+      <div class="mem-meta">
+        <span id="cronNextTip">今日随机计划：未计算</span>
+        <button class="mini-btn" onclick="saveSchedule()">保存定时</button>
+      </div>
+      <div id="cronHistory" class="hist-list"></div>
+    </div>
+
     <div class="term-box">
       <div class="term-hdr">
         <span id="sheetJobBadge">执行状态：空闲</span>
@@ -1143,25 +1091,15 @@ pre#sheetLogs {
       </div>
     </div>
 
-    <div class="field">
-      LLM 协议
+    <div class="field">LLM 协议
       <select id="cfgProvider">
         <option value="openai">OpenAI 兼容（NVIDIA NIM / DeepSeek / OpenRouter）</option>
         <option value="gemini">Google Gemini 原生</option>
       </select>
     </div>
-    <div class="field">
-      Base URL
-      <input id="cfgBaseURL" placeholder="https://integrate.api.nvidia.com/v1">
-    </div>
-    <div class="field">
-      API Key（留空则保留手机端现有密钥）
-      <input id="cfgAPIKey" type="password" placeholder="nvapi-... / sk-... / AIza...">
-    </div>
-    <div class="field">
-      Model
-      <input id="cfgModel" placeholder="nvidia/nemotron-3.5-super-vl-120b-a12b">
-    </div>
+    <div class="field">Base URL<input id="cfgBaseURL" placeholder="https://integrate.api.nvidia.com/v1"></div>
+    <div class="field">API Key（留空则保留现有密钥）<input id="cfgAPIKey" type="password" placeholder="nvapi-... / sk-... / AIza..."></div>
+    <div class="field">Model<input id="cfgModel" placeholder="nvidia/nemotron-3.5-super-vl-120b-a12b"></div>
 
     <div class="sheet-actions">
       <button class="btn-secondary" onclick="closeSheet('settingsSheet')">取消</button>
@@ -1179,12 +1117,22 @@ const JOB_NAMES = {
   ms_rewards: '微软积分任务',
   jd_daily: '京东农场 + 京豆',
 };
+const CAT_LABELS = {
+  ui_tree: 'UI树',
+  touch: 'evdev触控',
+  vision: '截屏兜底',
+  cdp: 'WebView CDP',
+  memory: '记忆',
+  workflow: '0-Token工作流',
+  system: '系统',
+};
 
 let seq = 0;
 let polling = false;
 let sending = false;
 let currentModelName = '';
-let lastGuardState = '';
+let memFilesCache = [];
+let activeMemFile = 'SOUL.md';
 
 if (!KSU_SUPPORTED && location.hash.startsWith('#token=')) {
   localStorage.setItem(TOKEN_KEY, decodeURIComponent(location.hash.slice(7)));
@@ -1198,7 +1146,7 @@ const toBase64 = s => btoa(Array.from(new TextEncoder().encode(s), b => String.f
 function shortModel(m) {
   if (!m) return '未配置模型';
   const name = m.includes('/') ? m.split('/').pop() : m;
-  return name.length > 26 ? name.slice(0, 26) + '…' : name;
+  return name.length > 24 ? name.slice(0, 24) + '…' : name;
 }
 
 function ksuExec(cmd, timeoutMs = 15000) {
@@ -1320,8 +1268,7 @@ function renderMarkdown(text) {
 
 /* ---------- Feed Rendering ---------- */
 function syncHeroVisibility() {
-  const hasTurns = document.getElementById('feed').children.length > 0;
-  document.getElementById('hero').classList.toggle('hidden', hasTurns);
+  document.getElementById('hero').classList.toggle('hidden', document.getElementById('feed').children.length > 0);
 }
 
 function scrollToBottom() {
@@ -1338,7 +1285,42 @@ function appendUserBubble(text) {
   scrollToBottom();
 }
 
-function appendAgentBubble(text, tools = [], elapsedSec = null, isError = false) {
+function buildToolTraceBox(tools, trace) {
+  const box = document.createElement('div');
+  box.className = 'tool-box';
+
+  const stepsData = (Array.isArray(trace) && trace.length > 0)
+    ? trace
+    : (Array.isArray(tools) ? tools.map((name, i) => ({step: i + 1, tool: name, category: 'system'})) : []);
+  if (stepsData.length === 0) return null;
+
+  const summary = document.createElement('div');
+  summary.className = 'tool-summary';
+  summary.onclick = () => box.classList.toggle('open');
+  const names = stepsData.map(s => s.tool);
+  summary.innerHTML = `<span class="tool-summary-left">✦ 已执行 ${stepsData.length} 步工具 · ${escapeHTML(names.join(' → '))}</span><span>▾</span>`;
+
+  const list = document.createElement('div');
+  list.className = 'tool-steps';
+  stepsData.forEach(s => {
+    const row = document.createElement('div');
+    row.className = 'trace-row';
+    const cat = s.category || 'system';
+    const catName = CAT_LABELS[cat] || cat;
+    const msText = (s.elapsed_ms !== undefined && s.elapsed_ms !== null) ? ` (${s.elapsed_ms}ms)` : '';
+    row.innerHTML = `
+      <span class="cat-badge cat-${escapeHTML(cat)}">${escapeHTML(catName)}</span>
+      <span class="trace-tool">${escapeHTML(s.tool + msText)}</span>
+      <span class="trace-sum">${escapeHTML(s.summary || (s.is_error ? '失败' : ''))}</span>
+    `;
+    list.appendChild(row);
+  });
+  box.appendChild(summary);
+  box.appendChild(list);
+  return box;
+}
+
+function appendAgentBubble(text, tools = [], elapsedSec = null, isError = false, trace = [], needsConfirm = false) {
   const wrap = document.createElement('div');
   wrap.className = 'turn-agent';
 
@@ -1358,33 +1340,20 @@ function appendAgentBubble(text, tools = [], elapsedSec = null, isError = false)
   }
   wrap.appendChild(hdr);
 
-  if (Array.isArray(tools) && tools.length > 0) {
-    const tbox = document.createElement('div');
-    tbox.className = 'tool-box';
-    const summary = document.createElement('div');
-    summary.className = 'tool-summary';
-    summary.onclick = () => tbox.classList.toggle('open');
-    summary.innerHTML = `<span class="tool-summary-left">✦ 已调用 ${tools.length} 步工具 · ${escapeHTML(tools.join(' → '))}</span><span>▾</span>`;
-    const steps = document.createElement('div');
-    steps.className = 'tool-steps';
-    tools.forEach((name, idx) => {
-      const chip = document.createElement('span');
-      chip.className = 'tool-chip';
-      chip.textContent = `${idx + 1}. ${name}`;
-      steps.appendChild(chip);
-    });
-    tbox.appendChild(summary);
-    tbox.appendChild(steps);
-    wrap.appendChild(tbox);
+  const traceBox = buildToolTraceBox(tools, trace);
+  if (traceBox) wrap.appendChild(traceBox);
+
+  if (needsConfirm) {
+    const banner = document.createElement('div');
+    banner.className = 'confirm-banner';
+    banner.innerHTML = `<svg class="ic" style="flex-shrink:0;margin-top:2px" viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg><span><strong>需要人工确认</strong>：Agent 已遵守 SOUL.md 安全红线停在此步，请在手机屏幕上核对金额/验证码后再手动操作。</span>`;
+    wrap.appendChild(banner);
   }
 
   const body = document.createElement('div');
   body.className = isError ? 'agent-error' : 'agent-body';
-  if (isError) {
-    body.textContent = text;
-  } else {
-    body.innerHTML = renderMarkdown(text);
-  }
+  if (isError) body.textContent = text;
+  else body.innerHTML = renderMarkdown(text);
   wrap.appendChild(body);
 
   document.getElementById('feed').appendChild(wrap);
@@ -1403,7 +1372,7 @@ function createThinkingBubble() {
     </div>
     <div class="thinking-row">
       <div class="dots"><span></span><span></span><span></span></div>
-      <span>正在分析意图与调度手机工具...</span>
+      <span>正在规划并调度三层混合引擎...</span>
     </div>`;
   document.getElementById('feed').appendChild(wrap);
   syncHeroVisibility();
@@ -1422,39 +1391,72 @@ function createThinkingBubble() {
   };
 }
 
-/* ---------- Status & Job Polling ---------- */
-function updateHeaderStatus(guardState) {
-  lastGuardState = guardState || lastGuardState;
+/* ---------- Status, Telemetry & Cron Polling ---------- */
+function applyTelemetry(st) {
+  const guardState = st?.guard?.state || 'offline';
   const dot = document.getElementById('statusDot');
   const txt = document.getElementById('statusText');
   const orb = document.getElementById('topOrb');
   const modelPart = currentModelName ? ` · ${shortModel(currentModelName)}` : '';
 
+  const pillGuard = document.getElementById('pillGuard');
   if (guardState === 'active') {
     dot.className = 'status-dot';
     orb.classList.remove('warn');
-    txt.textContent = '守护正常' + modelPart;
+    txt.textContent = 'hybrid-v2' + modelPart;
+    pillGuard.className = 't-pill good';
+    pillGuard.textContent = '守护: 正常';
   } else if (guardState === 'offline') {
     dot.className = 'status-dot err';
     orb.classList.add('warn');
-    txt.textContent = '未连接' + modelPart;
+    txt.textContent = '离线' + modelPart;
+    pillGuard.className = 't-pill err';
+    pillGuard.textContent = '守护: 离线';
   } else {
     dot.className = 'status-dot warn';
     orb.classList.add('warn');
-    txt.textContent = `暂停(${guardState || '未知'})` + modelPart;
+    txt.textContent = `暂停(${guardState})` + modelPart;
+    pillGuard.className = 't-pill warn';
+    pillGuard.textContent = '守护: 暂停';
+  }
+
+  const pillKernel = document.getElementById('pillKernel');
+  if (st?.microkernel_running) {
+    pillKernel.className = 't-pill cyan';
+    pillKernel.textContent = 'UI树: 常驻就绪';
+  } else {
+    pillKernel.className = 't-pill';
+    pillKernel.textContent = 'UI树: 0MB待机';
+  }
+
+  const pillTouch = document.getElementById('pillTouch');
+  const td = st?.touch?.device || {};
+  const lm = st?.touch?.last_method || '';
+  if (lm.startsWith('evdev:')) {
+    pillTouch.className = 't-pill good';
+    pillTouch.textContent = `触控: evdev (${td.name || 'fts'})`;
+  } else if (lm === 'cmd-input-fallback') {
+    pillTouch.className = 't-pill warn';
+    pillTouch.textContent = '触控: cmd回退';
+  } else if (td.available) {
+    pillTouch.className = 't-pill cyan';
+    pillTouch.textContent = `触控: evdev就绪 (${td.name || 'fts'})`;
+  } else {
+    pillTouch.className = 't-pill';
+    pillTouch.textContent = '触控: cmd input';
   }
 }
 
 async function refreshStatus() {
   if (!KSU_SUPPORTED && !getToken()) {
-    updateHeaderStatus('需填Token');
+    applyTelemetry({guard: {state: 'offline'}});
     return;
   }
   try {
     const st = await api('/api/v1/status');
-    updateHeaderStatus(st.guard?.state || 'unknown');
+    applyTelemetry(st);
   } catch (_) {
-    updateHeaderStatus('offline');
+    applyTelemetry({guard: {state: 'offline'}});
   }
 }
 
@@ -1490,6 +1492,72 @@ async function refreshJob() {
   } catch (_) {}
 }
 
+function updateCronPill(sched) {
+  const pill = document.getElementById('pillCron');
+  if (!sched || !sched.enabled) {
+    pill.className = 't-pill';
+    pill.textContent = '心跳: 未开启';
+    return;
+  }
+  const e = (sched.entries && sched.entries[0]) || null;
+  if (e && e.next_run_at) {
+    const t = new Date(e.next_run_at);
+    const hhmm = isNaN(t) ? '' : `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
+    pill.className = 't-pill cyan';
+    pill.textContent = hhmm ? `心跳: ${hhmm}` : '心跳: 已开启';
+  } else {
+    pill.className = 't-pill cyan';
+    pill.textContent = '心跳: 已开启';
+  }
+}
+
+async function refreshSchedule() {
+  if (!KSU_SUPPORTED && !getToken()) return;
+  try {
+    const sched = await api('/api/v1/schedule');
+    updateCronPill(sched);
+    document.getElementById('cronEnabled').checked = !!sched.enabled;
+    const e = (sched.entries && sched.entries[0]) || null;
+    if (e) {
+      document.getElementById('cronJob').value = e.job || 'daily_all';
+      document.getElementById('cronStart').value = e.window_start || '08:15';
+      document.getElementById('cronEnd').value = e.window_end || '09:30';
+      document.getElementById('cronDefer').checked = e.defer_on_game !== false;
+      const t = e.next_run_at ? new Date(e.next_run_at) : null;
+      const hhmm = (t && !isNaN(t)) ? `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}` : '—';
+      document.getElementById('cronNextTip').textContent = `今日随机触发：${hhmm}` + (e.last_state ? ` · 上次:${e.last_state}` : '');
+    }
+    const histBox = document.getElementById('cronHistory');
+    const items = (sched.history || []).slice(-5).reverse();
+    histBox.innerHTML = items.length ? items.map(h => {
+      const ts = (h.triggered_at || '').slice(11, 16);
+      return `<div class="hist-item"><span>${escapeHTML(ts + ' ' + h.job)}</span><span>${escapeHTML(h.state + (h.message ? ' · ' + h.message : ''))}</span></div>`;
+    }).join('') : '';
+  } catch (_) {}
+}
+
+async function saveSchedule() {
+  const payload = {
+    enabled: document.getElementById('cronEnabled').checked,
+    entries: [{
+      id: 'daily-all',
+      job: document.getElementById('cronJob').value,
+      enabled: true,
+      window_start: document.getElementById('cronStart').value || '08:15',
+      window_end: document.getElementById('cronEnd').value || '09:30',
+      defer_on_game: document.getElementById('cronDefer').checked,
+    }],
+  };
+  try {
+    const res = await api('/api/v1/schedule', 'POST', payload);
+    updateCronPill(res);
+    await refreshSchedule();
+    document.getElementById('cronNextTip').textContent += '（已保存）';
+  } catch (e) {
+    appendAgentBubble('保存定时计划失败：' + e.message, [], null, true);
+  }
+}
+
 async function pollTick() {
   if (polling) return;
   polling = true;
@@ -1500,11 +1568,67 @@ async function pollTick() {
   }
 }
 
-/* ---------- Actions ---------- */
+/* ---------- Memory Manager ---------- */
+async function openMemory() {
+  openSheet('memorySheet');
+  try {
+    const res = await api('/api/v1/memory');
+    memFilesCache = res.files || [];
+    renderMemoryTab();
+  } catch (e) {
+    document.getElementById('memEditor').value = '读取记忆失败：' + e.message;
+  }
+}
+
+function selectMemoryTab(name) {
+  activeMemFile = name;
+  document.getElementById('tabSOUL').classList.toggle('active', name === 'SOUL.md');
+  document.getElementById('tabMEM').classList.toggle('active', name === 'MEMORY.md');
+  document.getElementById('tabLEARN').classList.toggle('active', name === 'LEARNINGS.md');
+  renderMemoryTab();
+}
+
+function renderMemoryTab() {
+  const f = memFilesCache.find(x => x.name === activeMemFile) || memFilesCache[0];
+  if (!f) return;
+  document.getElementById('memDesc').textContent = `${f.title} · ${f.description}`;
+  document.getElementById('memUpdated').textContent = `${f.bytes || 0} B`;
+  const badge = document.getElementById('memPermBadge');
+  badge.className = f.ai_writable ? 't-pill good' : 't-pill warn';
+  badge.textContent = f.ai_writable ? '用户+AI可追加' : '红线文件（仅用户可改）';
+  document.getElementById('memEditor').value = f.content || '';
+}
+
+async function saveMemory() {
+  const btn = document.getElementById('memSaveBtn');
+  const content = document.getElementById('memEditor').value;
+  btn.disabled = true;
+  btn.textContent = '保存中...';
+  try {
+    const res = await api('/api/v1/memory', 'POST', {name: activeMemFile, content});
+    memFilesCache = res.files || memFilesCache;
+    renderMemoryTab();
+    btn.textContent = '已保存 ✓';
+    setTimeout(() => { btn.textContent = '保存此记忆'; }, 1200);
+  } catch (e) {
+    btn.textContent = '保存失败';
+    appendAgentBubble('保存记忆失败：' + e.message, [], null, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---------- Actions & Chat ---------- */
+function openAutomation() {
+  openSheet('autoSheet');
+  refreshJob();
+  refreshSchedule();
+}
+
 async function runJob(name, openLogSheet) {
   try {
     await api('/api/v1/jobs/run', 'POST', {job: name});
-    if (openLogSheet) openSheet('autoSheet');
+    if (openLogSheet) openAutomation();
     await refreshJob();
   } catch (e) {
     appendAgentBubble('任务启动失败：' + e.message, [], null, true);
@@ -1544,7 +1668,15 @@ async function sendChat() {
   try {
     const res = await api('/api/v1/chat', 'POST', {message: msg}, 90000);
     thinking.remove();
-    appendAgentBubble(res.reply || '(无回复)', res.tools_used || [], res.elapsed_sec);
+    appendAgentBubble(
+      res.reply || '(无回复)',
+      res.tools_used || [],
+      res.elapsed_sec,
+      false,
+      res.tool_trace || [],
+      !!res.needs_confirmation
+    );
+    refreshStatus();
   } catch (e) {
     thinking.remove();
     appendAgentBubble(e.message, [], null, true);
@@ -1561,10 +1693,8 @@ async function clearChat() {
   syncHeroVisibility();
 }
 
-/* ---------- Sheets & Settings ---------- */
 function openSheet(id) {
   document.getElementById(id).classList.add('open');
-  if (id === 'autoSheet') refreshJob();
 }
 
 function closeSheet(id) {
@@ -1617,7 +1747,6 @@ async function saveSettings() {
   }
 }
 
-/* ---------- Input Handling ---------- */
 function syncSendState() {
   const hasText = document.getElementById('prompt').value.trim().length > 0;
   document.getElementById('sendBtn').disabled = sending || !hasText;
@@ -1642,25 +1771,26 @@ promptEl.addEventListener('keydown', (e) => {
 async function init() {
   document.getElementById('sheetAuthBadge').textContent = KSU_SUPPORTED ? 'KSU Root' : 'HTTP Bearer';
   if (!KSU_SUPPORTED && !getToken()) {
-    updateHeaderStatus('需填Token');
+    applyTelemetry({guard: {state: 'offline'}});
     openSettings();
     return;
   }
   try {
-    const [cfg, hist] = await Promise.all([
+    const [cfg, hist, sched] = await Promise.all([
       api('/api/v1/llm/config').catch(() => null),
       api('/api/v1/chat/history').catch(() => null),
+      api('/api/v1/schedule').catch(() => null),
     ]);
     if (cfg && cfg.model) currentModelName = cfg.model;
-    if (hist && Array.isArray(hist.history) && hist.history.length > 0) {
-      for (const m of hist.history) {
-        if ((m.role === 'user' || m.role === 'assistant') && m.text) {
-          if (m.role === 'user') {
-            appendUserBubble(m.text);
-          } else {
-            const tools = Array.isArray(m.tool_calls) ? m.tool_calls.map(tc => tc.name).filter(Boolean) : [];
-            appendAgentBubble(m.text, tools);
-          }
+    if (sched) updateCronPill(sched);
+    const msgs = hist?.messages || hist?.history || [];
+    for (const m of msgs) {
+      if ((m.role === 'user' || m.role === 'assistant') && m.text) {
+        if (m.role === 'user') {
+          appendUserBubble(m.text);
+        } else {
+          const tools = Array.isArray(m.tool_calls) ? m.tool_calls.map(tc => tc.name).filter(Boolean) : [];
+          appendAgentBubble(m.text, tools);
         }
       }
     }

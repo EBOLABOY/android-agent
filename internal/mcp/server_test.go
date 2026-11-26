@@ -163,6 +163,7 @@ func TestMCPAuthToolsAndGameGuardListenerShutdown(t *testing.T) {
 	cfg.ListenAddr = "127.0.0.1:0"
 	cfg.BearerToken = "super-secret-token-123"
 	cfg.PauseFlagPath = ""
+	cfg.MemoryDir = filepath.Join(t.TempDir(), "memory")
 	cfg.CDPSocket = "nonexistent_test_cdp_socket_777"
 
 	det := &testDetector{}
@@ -394,11 +395,13 @@ func TestMCPAuthToolsAndGameGuardListenerShutdown(t *testing.T) {
 }
 
 func TestWebUIAuthAndLLMConfigPersistence(t *testing.T) {
-	tmpCfgPath := filepath.Join(t.TempDir(), "config.json")
+	tmpDir := t.TempDir()
+	tmpCfgPath := filepath.Join(tmpDir, "config.json")
 	cfg := config.Default()
 	cfg.ListenAddr = "127.0.0.1:0"
 	cfg.BearerToken = "tok-ui-test-123456"
 	cfg.PauseFlagPath = ""
+	cfg.MemoryDir = filepath.Join(tmpDir, "memory")
 	cfg.CDPSocket = "nonexistent_test_cdp_socket_888"
 
 	det := &testDetector{}
@@ -470,5 +473,50 @@ func TestWebUIAuthAndLLMConfigPersistence(t *testing.T) {
 	}
 	if _, err := config.Load(tmpCfgPath, false); err != nil {
 		t.Fatalf("persisted config load failed: %v", err)
+	}
+
+	// 4. Verify /api/v1/memory GET + POST
+	memReq, _ := http.NewRequest(http.MethodGet, baseURL+"/api/v1/memory", nil)
+	memReq.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	memResp, err := http.DefaultClient.Do(memReq)
+	if err != nil || memResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/v1/memory failed: status=%v err=%v", memResp, err)
+	}
+	memResp.Body.Close()
+
+	memBody, _ := json.Marshal(map[string]any{"name": "MEMORY.md", "content": "# User\n- 喜欢少冰\n"})
+	memPost, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/memory", bytes.NewReader(memBody))
+	memPost.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	memPost.Header.Set("Content-Type", "application/json")
+	memPostResp, err := http.DefaultClient.Do(memPost)
+	if err != nil || memPostResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/v1/memory failed: %v", err)
+	}
+	memPostResp.Body.Close()
+
+	// 5. Verify /api/v1/schedule POST + GET persistence
+	schedBody, _ := json.Marshal(map[string]any{
+		"enabled": true,
+		"entries": []map[string]any{{
+			"id":            "daily-all",
+			"job":           "daily_all",
+			"enabled":       true,
+			"window_start":  "09:00",
+			"window_end":    "10:00",
+			"defer_on_game": true,
+		}},
+	})
+	schedReq, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/schedule", bytes.NewReader(schedBody))
+	schedReq.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	schedReq.Header.Set("Content-Type", "application/json")
+	schedResp, err := http.DefaultClient.Do(schedReq)
+	if err != nil || schedResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/v1/schedule failed: %v", err)
+	}
+	schedResp.Body.Close()
+
+	reloaded, err := config.Load(tmpCfgPath, false)
+	if err != nil || !reloaded.Schedule.Enabled || len(reloaded.Schedule.Entries) != 1 {
+		t.Fatalf("expected persisted schedule config, got %+v err=%v", reloaded, err)
 	}
 }

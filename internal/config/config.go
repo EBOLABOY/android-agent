@@ -21,20 +21,36 @@ type LLMConfig struct {
 	TimeoutSec int    `json:"timeout_sec"`
 }
 
+type ScheduleEntry struct {
+	ID          string `json:"id"`
+	Job         string `json:"job"`           // "daily_all" | "ms_rewards" | "jd_daily"
+	Enabled     bool   `json:"enabled"`
+	WindowStart string `json:"window_start"`  // "HH:MM" local 24h time
+	WindowEnd   string `json:"window_end"`    // "HH:MM" local 24h time
+	DeferOnGame bool   `json:"defer_on_game"` // true: defer if guarded game foreground; false: skip today
+}
+
+type ScheduleConfig struct {
+	Enabled bool            `json:"enabled"`
+	Entries []ScheduleEntry `json:"entries,omitempty"`
+}
+
 type Config struct {
-	ListenAddr            string    `json:"listen_addr"`
-	BearerToken           string    `json:"bearer_token"`
-	ScreenshotWidth       int       `json:"screenshot_width"`
-	ScreenshotJPEGQuality int       `json:"screenshot_jpeg_quality"`
-	GuardPackages         []string  `json:"guard_packages"`
-	GuardPollIntervalMs   int       `json:"guard_poll_interval_ms"`
-	GuardResumeGraceMs    int       `json:"guard_resume_grace_ms"`
-	CDPSocket             string    `json:"cdp_socket"`
-	SysSocket             string    `json:"sys_socket"`
-	ClipHelperPath        string    `json:"clip_helper_path"`
-	PauseFlagPath         string    `json:"pause_flag_path"`
-	ShellTimeoutMs        int       `json:"shell_timeout_ms"`
-	LLM                   LLMConfig `json:"llm,omitempty"`
+	ListenAddr            string         `json:"listen_addr"`
+	BearerToken           string         `json:"bearer_token"`
+	ScreenshotWidth       int            `json:"screenshot_width"`
+	ScreenshotJPEGQuality int            `json:"screenshot_jpeg_quality"`
+	GuardPackages         []string       `json:"guard_packages"`
+	GuardPollIntervalMs   int            `json:"guard_poll_interval_ms"`
+	GuardResumeGraceMs    int            `json:"guard_resume_grace_ms"`
+	CDPSocket             string         `json:"cdp_socket"`
+	SysSocket             string         `json:"sys_socket"`
+	ClipHelperPath        string         `json:"clip_helper_path"`
+	PauseFlagPath         string         `json:"pause_flag_path"`
+	ShellTimeoutMs        int            `json:"shell_timeout_ms"`
+	MemoryDir             string         `json:"memory_dir,omitempty"`
+	LLM                   LLMConfig      `json:"llm,omitempty"`
+	Schedule              ScheduleConfig `json:"schedule,omitempty"`
 }
 
 func Default() *Config {
@@ -51,10 +67,24 @@ func Default() *Config {
 		ClipHelperPath:        "/data/local/tmp/android_agent_cliphelper.jar",
 		PauseFlagPath:         "/data/adb/android_agent/paused",
 		ShellTimeoutMs:        10000,
+		MemoryDir:             "/data/adb/android_agent/memory",
 		LLM: LLMConfig{
 			Provider:   "openai",
 			MaxSteps:   20,
 			TimeoutSec: 60,
+		},
+		Schedule: ScheduleConfig{
+			Enabled: false,
+			Entries: []ScheduleEntry{
+				{
+					ID:          "daily-all",
+					Job:         "daily_all",
+					Enabled:     true,
+					WindowStart: "08:15",
+					WindowEnd:   "09:30",
+					DeferOnGame: true,
+				},
+			},
 		},
 	}
 }
@@ -160,6 +190,9 @@ func applyEnv(cfg *Config) {
 	if v := strings.TrimSpace(os.Getenv("AGENT_CLIP_HELPER_PATH")); v != "" {
 		cfg.ClipHelperPath = v
 	}
+	if v := strings.TrimSpace(os.Getenv("AGENT_MEMORY_DIR")); v != "" {
+		cfg.MemoryDir = v
+	}
 	if v := strings.TrimSpace(os.Getenv("AGENT_LLM_PROVIDER")); v != "" {
 		cfg.LLM.Provider = strings.ToLower(v)
 	}
@@ -202,6 +235,12 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.ShellTimeoutMs <= 0 {
 		cfg.ShellTimeoutMs = def.ShellTimeoutMs
+	}
+	if strings.TrimSpace(cfg.MemoryDir) == "" {
+		cfg.MemoryDir = def.MemoryDir
+	}
+	if len(cfg.Schedule.Entries) == 0 {
+		cfg.Schedule.Entries = append([]ScheduleEntry(nil), def.Schedule.Entries...)
 	}
 	if strings.TrimSpace(cfg.LLM.Provider) == "" {
 		cfg.LLM.Provider = def.LLM.Provider

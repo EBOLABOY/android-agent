@@ -13,6 +13,7 @@
   "clip_helper_path": "/data/local/tmp/android_agent_cliphelper.jar",
   "pause_flag_path": "/data/adb/android_agent/paused",
   "shell_timeout_ms": 10000,
+  "memory_dir": "/data/adb/android_agent/memory",
   "llm": {
     "provider": "openai",
     "base_url": "https://api.deepseek.com/v1",
@@ -20,5 +21,18 @@
     "model": "deepseek-chat",
     "max_steps": 20,
     "timeout_sec": 60
+  },
+  "schedule": {
+    "enabled": false,
+    "entries": [
+      {
+        "id": "daily-all",
+        "job": "daily_all",
+        "enabled": true,
+        "window_start": "08:15",
+        "window_end": "09:30",
+        "defer_on_game": true
+      }
+    ]
   }
 }

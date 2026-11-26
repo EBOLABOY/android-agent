@@ -1,6 +1,6 @@
 id=android_agent
 name=Android AI Agent Daemon
-version=v0.2.0-ondevice
-versionCode=200
+version=v0.3.1-ondevice
+versionCode=310
 author=antigravity
-description=On-device AI Agent Daemon (OpenAI/Gemini Brain, 0-Token Daily Workflows, WebView CDP, KernelSU WebUI)
+description=Hybrid-Layered Android AI Agent (4ms UI Tree + Go evdev Touch + Markdown Memory + Random-Window Cron + KernelSU WebUI)

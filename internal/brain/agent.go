@@ -12,22 +12,34 @@ import (
 	"android-agent/internal/guard"
 )
 
-const SystemPrompt = `你是运行在用户小米 13（Android 16 / HyperOS 3.0）本机上的 AI Agent 大脑（android-agent v0.2.0-ondevice）。
-你能直接调用设备控制工具、WebView CDP 工具（Edge/Bing/京东 20ms DOM）以及 0-Token 原生日常任务引擎。
+const SystemPrompt = `你是运行在用户小米 13（Android 16 / HyperOS 3.0）本机上的 AI Agent 大脑（android-agent）。
+你能直接调用混合分层设备控制工具（4ms 内存 UI 树 + 纯 Go evdev 物理拟人触控 + 720p 视觉兜底）、WebView CDP 工具（Edge/Bing/京东 20ms DOM）、0-Token 原生日常任务引擎，以及端侧持久化 Markdown 记忆。
 
 核心规则与安全红线：
 1. 【优先省 Token 与速度】遇到「每日任务/微软积分/Bing/京东农场/领京豆」等请求时，优先直接调用原生 0-Token 工作流工具（run_daily_all / run_ms_rewards / run_jd_daily），不要用大模型一页页截屏盲点。
 2. 【绝不绕过验证码】只要看到任何滑块、人机验证（CAPTCHA）或登录失效弹窗，必须立即停止并告知用户在手机上亲自完成。
 3. 【尊重游戏风控守护】当 guard.state != "active"（如王者荣耀前台或手动暂停）时拒绝操作。
-4. 【不越权操作】绝不擅自下单支付、开通试用会员、下载第三方软件（如快手/百度极速版）、盗用他人买家秀照片或上传用户相册私图。
+4. 【交易与下单绝对停在确认页】严格遵守 SOUL.md 红线：浏览、加购后只要到达确认订单/支付/转账/开通会员页，必须立刻停手，绝对不能替用户点击最终下单或付款按钮，并在回复中明确写出「需要人工确认」。
 5. 【先 DOM 与 UI 树、最后看图】操作 Edge / Bing / 京东优先用 cdp_list_sockets + cdp_list_targets + cdp_command；操作美团、微信、系统设置等原生 App 优先用 phone_ui_tree + phone_tap_node + phone_scroll_node（纯文本快且极省 Token）；仅在控件树为空（自绘/游戏页面）或需要视觉核查时再调用 phone_screenshot。
-6. 回复简洁清晰，使用中文分点总结实际观测到的结果、数值与耗时。`
+6. 【善用自主记忆】当用户明确交代新偏好/习惯时，用 append_memory 写入 MEMORY.md；遇到页面适配踩坑或纠错经验时，用 append_memory 写入 LEARNINGS.md。
+7. 回复简洁清晰，使用中文分点总结实际观测到的结果、数值与耗时。`
+
+type ToolStep struct {
+	Step      int    `json:"step"`
+	Tool      string `json:"tool"`
+	Category  string `json:"category"` // "ui_tree" | "touch" | "cdp" | "vision" | "memory" | "workflow" | "system"
+	Summary   string `json:"summary,omitempty"`
+	IsError   bool   `json:"is_error,omitempty"`
+	ElapsedMs int64  `json:"elapsed_ms"`
+}
 
 type ChatTurnResult struct {
-	Reply      string   `json:"reply"`
-	ToolsUsed  []string `json:"tools_used,omitempty"`
-	Steps      int      `json:"steps"`
-	ElapsedSec float64  `json:"elapsed_sec"`
+	Reply             string     `json:"reply"`
+	ToolsUsed         []string   `json:"tools_used,omitempty"`
+	ToolTrace         []ToolStep `json:"tool_trace,omitempty"`
+	NeedsConfirmation bool       `json:"needs_confirmation,omitempty"`
+	Steps             int        `json:"steps"`
+	ElapsedSec        float64    `json:"elapsed_sec"`
 }
 
 type Agent struct {
@@ -35,6 +47,7 @@ type Agent struct {
 	cfg     config.LLMConfig
 	exec    ToolExecutor
 	guard   *guard.Guard
+	memory  *MemoryStore
 	history []ChatMessage
 }
 
@@ -44,6 +57,12 @@ func NewAgent(cfg config.LLMConfig, exec ToolExecutor, g *guard.Guard) *Agent {
 		exec:  exec,
 		guard: g,
 	}
+}
+
+func (a *Agent) SetMemoryStore(m *MemoryStore) {
+	a.mu.Lock()
+	a.memory = m
+	a.mu.Unlock()
 }
 
 func (a *Agent) UpdateConfig(cfg config.LLMConfig) {
@@ -86,8 +105,16 @@ func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, 
 	t0 := time.Now()
 	a.mu.Lock()
 	cfg := a.cfg
+	mem := a.memory
 	history := append([]ChatMessage(nil), a.history...)
 	a.mu.Unlock()
+
+	sysPrompt := SystemPrompt
+	if mem != nil {
+		if sec := mem.BuildPromptSection(); sec != "" {
+			sysPrompt += "\n\n" + sec
+		}
+	}
 
 	maxSteps := cfg.MaxSteps
 	if maxSteps <= 0 {
@@ -97,6 +124,7 @@ func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, 
 	history = append(history, ChatMessage{Role: "user", Text: userMessage})
 	tools := a.exec.ToolSpecs()
 	var toolsUsed []string
+	var trace []ToolStep
 	steps := 0
 
 	for steps < maxSteps {
@@ -104,7 +132,7 @@ func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, 
 			return nil, err
 		}
 		steps++
-		resp, err := callLLM(ctx, cfg, SystemPrompt, history, tools)
+		resp, err := callLLM(ctx, cfg, sysPrompt, history, tools)
 		if err != nil {
 			return nil, err
 		}
@@ -118,10 +146,12 @@ func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, 
 		if len(resp.ToolCalls) == 0 {
 			a.saveHistory(history)
 			return &ChatTurnResult{
-				Reply:      resp.Text,
-				ToolsUsed:  toolsUsed,
-				Steps:      steps,
-				ElapsedSec: float64(int(time.Since(t0).Seconds()*10)) / 10,
+				Reply:             resp.Text,
+				ToolsUsed:         toolsUsed,
+				ToolTrace:         trace,
+				NeedsConfirmation: replyNeedsConfirmation(resp.Text),
+				Steps:             steps,
+				ElapsedSec:        float64(int(time.Since(t0).Seconds()*10)) / 10,
 			}, nil
 		}
 
@@ -132,7 +162,16 @@ func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, 
 				}
 			}
 			toolsUsed = append(toolsUsed, tc.Name)
+			toolStart := time.Now()
 			out := a.exec.ExecuteTool(ctx, tc.Name, tc.Args)
+			trace = append(trace, ToolStep{
+				Step:      len(trace) + 1,
+				Tool:      tc.Name,
+				Category:  classifyToolCategory(tc.Name),
+				Summary:   summarizeToolOutcome(out),
+				IsError:   out.IsError,
+				ElapsedMs: time.Since(toolStart).Milliseconds(),
+			})
 			history = append(history, ChatMessage{
 				Role:       "tool",
 				ToolCallID: tc.ID,
@@ -144,12 +183,62 @@ func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, 
 	}
 
 	a.saveHistory(history)
+	reply := "已达到单轮最大工具调用步数限制，请查看当前结果或继续指示下一步。"
 	return &ChatTurnResult{
-		Reply:      "已达到单轮最大工具调用步数限制，请查看当前结果或继续指示下一步。",
-		ToolsUsed:  toolsUsed,
-		Steps:      steps,
-		ElapsedSec: float64(int(time.Since(t0).Seconds()*10)) / 10,
+		Reply:             reply,
+		ToolsUsed:         toolsUsed,
+		ToolTrace:         trace,
+		NeedsConfirmation: replyNeedsConfirmation(reply),
+		Steps:             steps,
+		ElapsedSec:        float64(int(time.Since(t0).Seconds()*10)) / 10,
 	}, nil
+}
+
+func classifyToolCategory(name string) string {
+	switch name {
+	case "phone_ui_tree":
+		return "ui_tree"
+	case "phone_tap", "phone_long_press", "phone_swipe", "phone_tap_node", "phone_scroll_node":
+		return "touch"
+	case "phone_screenshot":
+		return "vision"
+	case "cdp_list_sockets", "cdp_status", "cdp_list_targets", "cdp_command":
+		return "cdp"
+	case "read_memory", "append_memory":
+		return "memory"
+	case "run_daily_all", "run_ms_rewards", "run_jd_daily":
+		return "workflow"
+	default:
+		return "system"
+	}
+}
+
+func summarizeToolOutcome(out ToolOutput) string {
+	if len(out.ImageJPEG) > 0 {
+		return fmt.Sprintf("截屏视觉图像 (%d KB)", len(out.ImageJPEG)/1024)
+	}
+	first := strings.TrimSpace(out.Text)
+	if idx := strings.IndexByte(first, '\n'); idx >= 0 {
+		first = strings.TrimSpace(first[:idx])
+	}
+	r := []rune(first)
+	if len(r) > 72 {
+		return string(r[:71]) + "…"
+	}
+	return first
+}
+
+func replyNeedsConfirmation(reply string) bool {
+	if reply == "" {
+		return false
+	}
+	keywords := []string{"需要人工确认", "人工操作", "停在确认", "确认订单", "确认页", "自行付款", "亲自完成", "滑块", "验证码"}
+	for _, kw := range keywords {
+		if strings.Contains(reply, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Agent) saveHistory(h []ChatMessage) {
