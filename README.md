@@ -2,8 +2,8 @@
 
 小米 13（`fuxi` / Android 16 / API 36 / HyperOS 3.0 / KernelSU 3.3.1）原生低延迟 AI Agent 底座。
 
-- **当前状态**：**`v0.3.2-hardened` 安全与底层加固版 — 已实现三层混合引擎（`hybrid-layered-v2`：4ms 内存 UI 树 + 纯 Go `/dev/input/event7` Slot-8 拟人触控 + 720p 视觉兜底）、端侧 Markdown 记忆与随机时间窗 Cron 大脑、KernelSU/移动控制台 `/ui`，以及严格本机闭环安全加固**。
-- **架构亮点**：零外部 Go 依赖静态单文件（内嵌 `_ "time/tzdata"`），内置标准 **MCP Streamable HTTP (`2025-03-26`)** 服务端（`25` 个工具）、懒加载 `app_process64` 微内核（3 分钟空闲销毁 + 杂讯隔离 + 王者荣耀秒杀熔断）、`evdev` 亮屏解锁门禁、2MB 进程内日志轮转、DNS Rebinding/Origin 防护与本机 `127.0.0.1:8765` 默认监听。
+- **当前状态**：**`v0.3.3-streaming` 实时流式执行与 HyperOS 超级岛升级版 — 已实现 SSE 全链路实时步骤流 + 断线重放（Run Replay）+ 一键急停、DSH Go 风格可折叠呼吸时间线 `/ui`（含 KernelSU WebUI），以及零 Hook HyperOS 3.0 超级岛焦点通知实时进度反馈**。
+- **架构亮点**：零外部 Go 依赖静态单文件（内嵌 `_ "time/tzdata"`），内置标准 **MCP Streamable HTTP (`2025-03-26`)** 服务端（`25` 个工具）、懒加载 `app_process64` 微内核（3 分钟空闲销毁 + 杂讯隔离 + 王者荣耀秒杀熔断 + 焦点通知通道）、`evdev` 亮屏解锁门禁、2MB 进程内日志轮转、DNS Rebinding/Origin 防护与本机 `127.0.0.1:8765` 默认监听。
 
 ---
 
@@ -38,15 +38,19 @@
 │   ├── workflows/                     # 0-Token 原生日常工作流引擎（Edge/Bing 0截屏 CDP + 京东深链农场/刮京豆）
 │   │   ├── workflows.go
 │   │   └── workflows_test.go
-│   ├── brain/                         # 本机内置 LLM 大脑（OpenAI/Gemini 双协议 + 进程内 ToolExecutor + JobManager）
+│   ├── brain/                         # 本机内置 LLM 大脑（OpenAI/Gemini 双协议流式 SSE + Run Replay + 超级岛控制器 + ToolExecutor）
 │   │   ├── llm.go
 │   │   ├── agent.go
+│   │   ├── island.go                  # 零 Hook HyperOS 3.0 超级岛 & 静默焦点通知控制器（350ms 节流 + 3s 自动收起 + 熔断秒消）
+│   │   ├── memory.go
+│   │   ├── scheduler.go
+│   │   ├── island_test.go
 │   │   └── brain_test.go
 │   ├── webui/                         # 手机端暗黑模式移动 Web 控制台（//go:embed ui.html，支持添加到桌面）
 │   │   ├── webui.go
 │   │   └── ui.html
 │   └── mcp/
-│       ├── server.go                  # 标准 MCP Streamable HTTP (2025-03-26) + /ui + /api/v1/jobs/* + /api/v1/chat + /api/v1/llm/config
+│       ├── server.go                  # 标准 MCP Streamable HTTP (2025-03-26) + /ui + /api/v1/chat/{stream,events,cancel} + /api/v1/jobs/*
 │       └── server_test.go
 ├── cliphelper/
 │   ├── AgentClip.smali                # 适配 Android 16 IClipboard 的单次兜底剪贴板助手
@@ -122,6 +126,24 @@
 
 3. **兜底层（视觉与 Shell 保底）**
    - 遇到自绘页面/游戏/WebView（控件树为空）或微内核异常时，自动回退 `raw screencap` 720p JPEG（或 `cdp_*`）与 Shell 命令。
+
+---
+
+## 2.6 实时流式架构与零 Hook 超级岛（`v0.3.3-streaming`）
+
+为解决移动网页“发送后卡住、切走看不见进度”的痛点，`v0.3.3-streaming` 在零外部依赖下补齐了全链路流式体验：
+
+1. **服务端实时 SSE 与断线重放（Run Replay）**
+   - `internal/brain/llm.go`：原生支持 OpenAI 与 Gemini 双协议 `stream: true` 增量文本与流式 `tool_calls` 组装；若上游不支持流式或返回异常，自动无感回退非流式请求。
+   - `internal/brain/agent.go`：为 ReAct 多步循环新增结构化 `RunEvent` 事件流（`run_start` / `thinking` / `tool_start` / `tool_end` / `text_delta` / `needs_confirmation` / `done` / `cancelled` / `error`）与双环形内存缓冲（保留最近 128 个结构化步骤事件与 384 个文本增量）。
+   - `internal/mcp/server.go`：新增 `POST /api/v1/chat/stream`（支持标准 SSE 与 KSU Bridge 异步模式 `async: true`）、`GET /api/v1/chat/events?run_id=...&after_seq=...` 断线事件重放，以及 `POST /api/v1/chat/cancel` 运行中一键急停。
+
+2. **DSH Go 风格 `/ui` & KernelSU WebUI**
+   - 发送后即时弹出带绿色呼吸灯的实时步骤时间线（`正在调用 …`），支持折叠/展开已完成步骤、打字机流式回复、发送键切换红色 **停止 (`■`)** 急停，并在浏览器切后台/恢复（`visibilitychange` / `online` / 页面刷新）时自动通过 `sessionStorage` + `/api/v1/chat/events` 补齐全部进度，严格保持原有本机无外链 CSP 策略。
+
+3. **零 Hook HyperOS 3.0 超级岛焦点通知（`island.go` + `AgentKernel.smali`）**
+   - 不修改 `system_server` / `SystemUI`、不依赖 LSPosed Hook，直接利用常驻 `AgentKernel`（`uid=2000`）向 HyperOS 3.0 发送含 `miui.focus.enable` / `miui.focus.ticker` / `miui.focus.param`（`param_island`）的高权重静默焦点通知（实测 **5ms** 亮起顶部超级岛胶囊）：
+   - 空闲零打扰；执行期间 `350ms` 节流刷新；完成/取消 3 秒自动收起；触及 `SOUL.md` 付款/确认红线时保留提醒胶囊；王者荣耀进前台熔断时优先秒消超级岛再终止微内核。
 
 ---
 

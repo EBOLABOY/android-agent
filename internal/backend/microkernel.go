@@ -59,10 +59,19 @@ func (r *stderrRing) String() string {
 }
 
 type kernelRequest struct {
-	Cmd      string `json:"cmd"`
-	Text     string `json:"text,omitempty"`
-	MaxDepth int    `json:"max_depth,omitempty"`
-	MaxNodes int    `json:"max_nodes,omitempty"`
+	Cmd       string `json:"cmd"`
+	Text      string `json:"text,omitempty"`
+	MaxDepth  int    `json:"max_depth,omitempty"`
+	MaxNodes  int    `json:"max_nodes,omitempty"`
+	Tag       string `json:"tag,omitempty"`
+	ID        int    `json:"id,omitempty"`
+	Title     string `json:"title,omitempty"`
+	ShortText string `json:"short_text,omitempty"`
+	SubText   string `json:"sub_text,omitempty"`
+	Step      int    `json:"step,omitempty"`
+	Max       int    `json:"max,omitempty"`
+	Focus     *bool  `json:"focus,omitempty"`
+	Ongoing   *bool  `json:"ongoing,omitempty"`
 }
 
 type kernelResponse struct {

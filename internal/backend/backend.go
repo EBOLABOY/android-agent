@@ -23,6 +23,19 @@ type ScreenInfo struct {
 	Density int `json:"density"`
 }
 
+type LiveProgressSpec struct {
+	Tag       string
+	ID        int
+	Title     string
+	Text      string
+	ShortText string
+	SubText   string
+	Step      int
+	Max       int
+	Focus     bool
+	Ongoing   bool
+}
+
 // DeviceBackend abstracts low-level Android operations so Phase 1 (Root Shell + app_process64)
 // can be seamlessly replaced by Phase 2 (LSPosed @agent_sys in-memory daemon) without changing MCP.
 type DeviceBackend interface {
@@ -40,6 +53,8 @@ type DeviceBackend interface {
 	LaunchApp(ctx context.Context, pkg string) error
 	OpenDeepLink(ctx context.Context, uri, pkg string) error
 	PostNotification(ctx context.Context, tag, title, text string) error
+	UpdateLiveProgress(ctx context.Context, spec LiveProgressSpec) error
+	CancelLiveProgress(ctx context.Context, tag string, id int) error
 	UITree(ctx context.Context, opts UITreeOptions) (*UITreeResult, error)
 	TapNode(ctx context.Context, id int) (*UINode, int, int, error)
 	ScrollNode(ctx context.Context, id int, direction string, distance float64, durationMs int) ([4]int, [4]int, error)

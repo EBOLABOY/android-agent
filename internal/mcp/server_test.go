@@ -1,10 +1,12 @@
 package mcp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -19,6 +21,7 @@ import (
 	"time"
 
 	"android-agent/internal/backend"
+	"android-agent/internal/brain"
 	"android-agent/internal/cdp"
 	"android-agent/internal/config"
 	"android-agent/internal/guard"
@@ -32,6 +35,9 @@ type fakeBackend struct {
 	lastText         string
 	clip             string
 	microKernelStops int
+	liveUpdates      []backend.LiveProgressSpec
+	liveCancels      []string
+	eventLog         []string
 	cachedNodes      map[int]backend.UINode
 }
 
@@ -93,6 +99,20 @@ func (f *fakeBackend) ForegroundApp(_ context.Context) (backend.ForegroundInfo, 
 func (f *fakeBackend) LaunchApp(_ context.Context, _ string) error                   { return nil }
 func (f *fakeBackend) OpenDeepLink(_ context.Context, _, _ string) error        { return nil }
 func (f *fakeBackend) PostNotification(_ context.Context, _, _, _ string) error { return nil }
+func (f *fakeBackend) UpdateLiveProgress(_ context.Context, spec backend.LiveProgressSpec) error {
+	f.mu.Lock()
+	f.liveUpdates = append(f.liveUpdates, spec)
+	f.eventLog = append(f.eventLog, "update_live")
+	f.mu.Unlock()
+	return nil
+}
+func (f *fakeBackend) CancelLiveProgress(_ context.Context, tag string, id int) error {
+	f.mu.Lock()
+	f.liveCancels = append(f.liveCancels, fmt.Sprintf("%s#%d", tag, id))
+	f.eventLog = append(f.eventLog, "cancel_live")
+	f.mu.Unlock()
+	return nil
+}
 func (f *fakeBackend) UITree(_ context.Context, opts backend.UITreeOptions) (*backend.UITreeResult, error) {
 	raw := []backend.RawUINode{
 		{Cls: "android.widget.EditText", Text: "搜索商家、商品", Bounds: [4]int{60, 120, 960, 220}, Flags: "ce", Depth: 3},
@@ -135,6 +155,7 @@ func (f *fakeBackend) ScrollNode(_ context.Context, id int, direction string, di
 func (f *fakeBackend) StopMicroKernel(_ string) {
 	f.mu.Lock()
 	f.microKernelStops++
+	f.eventLog = append(f.eventLog, "stop_kernel")
 	f.mu.Unlock()
 }
 func (f *fakeBackend) MicroKernelRunning() bool { return false }
@@ -655,5 +676,256 @@ func TestSecurityHardeningOriginHostCSPSoulAndGuardChat(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("in-flight chat was not cancelled immediately by StopForGuard")
+	}
+}
+
+
+func (f *fakeBackend) snapshotEvents() ([]backend.LiveProgressSpec, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ups := make([]backend.LiveProgressSpec, len(f.liveUpdates))
+	copy(ups, f.liveUpdates)
+	ev := make([]string, len(f.eventLog))
+	copy(ev, f.eventLog)
+	return ups, ev
+}
+
+func TestStreamingChatReplayCancelAndGuardIslandClear(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := config.Default()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.BearerToken = "tok-stream-test-987654"
+	cfg.PauseFlagPath = ""
+	cfg.MemoryDir = filepath.Join(tmpDir, "memory")
+	cfg.CDPSocket = "nonexistent_test_cdp_socket_999"
+
+	var streamRound sync.Mutex
+	roundCount := 0
+	holdStarted := make(chan struct{}, 4)
+	releaseHold := make(chan struct{})
+
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		allText := ""
+		hasToolResult := false
+		for _, m := range body.Messages {
+			if role, _ := m["role"].(string); role == "tool" {
+				hasToolResult = true
+			}
+			if s, ok := m["content"].(string); ok {
+				allText += s + "\n"
+			}
+		}
+
+		if strings.Contains(allText, "阻塞直到取消") || strings.Contains(allText, "异步阻塞") {
+			select {
+			case holdStarted <- struct{}{}:
+			default:
+			}
+			select {
+			case <-r.Context().Done():
+			case <-releaseHold:
+			}
+			return
+		}
+
+		streamRound.Lock()
+		roundCount++
+		n := roundCount
+		streamRound.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		if n == 1 && !hasToolResult {
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc_ui\",\"type\":\"function\",\"function\":{\"name\":\"phone_ui_tree\",\"arguments\":\"{}\"}}]}}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"流式\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"完成\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer llmSrv.Close()
+	defer close(releaseHold)
+
+	cfg.LLM = config.LLMConfig{
+		Provider:   "openai",
+		BaseURL:    llmSrv.URL,
+		APIKey:     "sk-stream",
+		Model:      "stream-model",
+		TimeoutSec: 5,
+		MaxSteps:   4,
+	}
+
+	fb := &fakeBackend{}
+	det := &testDetector{}
+	g := guard.New(guard.Options{Packages: []string{"com.tencent.tmgp.sgame"}, PollInterval: time.Second, Detector: det})
+	srv := NewServer(cfg, fb, g, cdp.NewClient(cfg.CDPSocket), nil)
+	g.SetListener(srv)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	defer srv.Close()
+	baseURL := "http://" + srv.Addr()
+
+	// 1. POST /api/v1/chat/stream (SSE)
+	reqSSE, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/chat/stream", bytes.NewReader([]byte(`{"message":"流式检查当前界面"}`)))
+	reqSSE.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	reqSSE.Header.Set("Content-Type", "application/json")
+	respSSE, err := http.DefaultClient.Do(reqSSE)
+	if err != nil {
+		t.Fatalf("POST /api/v1/chat/stream err: %v", err)
+	}
+	if respSSE.StatusCode != http.StatusOK || !strings.Contains(respSSE.Header.Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("unexpected SSE headers/status: %d %v", respSSE.StatusCode, respSSE.Header)
+	}
+	var events []brain.RunEvent
+	scanner := bufio.NewScanner(respSSE.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "data: ") {
+			var ev brain.RunEvent
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err == nil {
+				events = append(events, ev)
+			}
+		}
+	}
+	respSSE.Body.Close()
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("SSE scanner err: %v", err)
+	}
+	if len(events) < 4 {
+		t.Fatalf("expected >=4 SSE events, got %+v", events)
+	}
+	runID := events[0].RunID
+	lastEv := events[len(events)-1]
+	if runID == "" || lastEv.Type != "done" || lastEv.Reply != "流式完成" {
+		t.Fatalf("unexpected SSE terminal event: %+v", lastEv)
+	}
+
+	// 2. GET /api/v1/chat/events?run_id=...&after_seq=1 (Run Replay)
+	reqRep, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/api/v1/chat/events?run_id=%s&after_seq=1", baseURL, runID), nil)
+	reqRep.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	respRep, err := http.DefaultClient.Do(reqRep)
+	if err != nil {
+		t.Fatalf("GET replay err: %v", err)
+	}
+	var snap brain.RunReplaySnapshot
+	_ = json.NewDecoder(respRep.Body).Decode(&snap)
+	respRep.Body.Close()
+	if snap.RunID != runID || !snap.Finished || snap.Active || len(snap.Events) == 0 {
+		t.Fatalf("unexpected replay snapshot: %+v", snap)
+	}
+	for _, ev := range snap.Events {
+		if ev.Seq <= 1 {
+			t.Fatalf("expected after_seq=1 filter to omit seq <= 1, got seq=%d", ev.Seq)
+		}
+	}
+
+	// 3. Async mode (202 Accepted) + POST /api/v1/chat/cancel
+	reqAsync, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/chat/stream", bytes.NewReader([]byte(`{"message":"异步阻塞测试","async":true}`)))
+	reqAsync.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	reqAsync.Header.Set("Content-Type", "application/json")
+	respAsync, err := http.DefaultClient.Do(reqAsync)
+	if err != nil {
+		t.Fatalf("async stream err: %v", err)
+	}
+	var asyncResp struct {
+		OK    bool   `json:"ok"`
+		RunID string `json:"run_id"`
+	}
+	_ = json.NewDecoder(respAsync.Body).Decode(&asyncResp)
+	respAsync.Body.Close()
+	if respAsync.StatusCode != http.StatusAccepted || !asyncResp.OK || asyncResp.RunID == "" {
+		t.Fatalf("expected 202 run_id, got %d %+v", respAsync.StatusCode, asyncResp)
+	}
+	<-holdStarted
+
+	reqCancel, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/chat/cancel", bytes.NewReader([]byte(`{}`)))
+	reqCancel.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	reqCancel.Header.Set("Content-Type", "application/json")
+	respCancel, err := http.DefaultClient.Do(reqCancel)
+	if err != nil {
+		t.Fatalf("POST cancel err: %v", err)
+	}
+	var cancelBody struct {
+		OK        bool `json:"ok"`
+		Cancelled bool `json:"cancelled"`
+	}
+	_ = json.NewDecoder(respCancel.Body).Decode(&cancelBody)
+	respCancel.Body.Close()
+	if respCancel.StatusCode != http.StatusOK || !cancelBody.OK || !cancelBody.Cancelled {
+		t.Fatalf("unexpected cancel response: %d %+v", respCancel.StatusCode, cancelBody)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		reqCheck, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/api/v1/chat/events?run_id=%s&after_seq=0", baseURL, asyncResp.RunID), nil)
+		reqCheck.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+		rCheck, err := http.DefaultClient.Do(reqCheck)
+		if err == nil {
+			var s2 brain.RunReplaySnapshot
+			_ = json.NewDecoder(rCheck.Body).Decode(&s2)
+			rCheck.Body.Close()
+			if s2.Finished {
+				break
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// 4. Active SSE run + StopForGuard must clear Super Island BEFORE stopping microkernel
+	sseCancelTestDone := make(chan int, 1)
+	go func() {
+		reqGuard, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/chat/stream", bytes.NewReader([]byte(`{"message":"阻塞直到取消"}`)))
+		reqGuard.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+		reqGuard.Header.Set("Content-Type", "application/json")
+		respGuard, err := http.DefaultClient.Do(reqGuard)
+		if err != nil {
+			sseCancelTestDone <- -1
+			return
+		}
+		io.Copy(io.Discard, respGuard.Body)
+		respGuard.Body.Close()
+		sseCancelTestDone <- respGuard.StatusCode
+	}()
+
+	<-holdStarted
+	// Wait briefly until run_start triggers UpdateLiveProgress
+	waitLive := time.Now().Add(1 * time.Second)
+	for time.Now().Before(waitLive) {
+		ups, _ := fb.snapshotEvents()
+		if len(ups) >= 3 { // run1 + run2 + run3
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	det.set("com.tencent.tmgp.sgame")
+	g.CheckOnce(context.Background())
+
+	select {
+	case <-sseCancelTestDone:
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("active streaming run was not aborted by StopForGuard")
+	}
+
+	_, evLog := fb.snapshotEvents()
+	cancelIdx, stopIdx := -1, -1
+	for i := len(evLog) - 1; i >= 0; i-- {
+		if stopIdx == -1 && evLog[i] == "stop_kernel" {
+			stopIdx = i
+		}
+		if cancelIdx == -1 && evLog[i] == "cancel_live" {
+			cancelIdx = i
+		}
+		if stopIdx != -1 && cancelIdx != -1 {
+			break
+		}
+	}
+	if cancelIdx == -1 || stopIdx == -1 || cancelIdx > stopIdx {
+		t.Fatalf("expected CancelLiveProgress before StopMicroKernel in StopForGuard, got eventLog=%v", evLog)
 	}
 }

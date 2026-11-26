@@ -6,6 +6,10 @@
 .field private static sThread:Landroid/os/HandlerThread;
 .field private static sClip:Landroid/content/IClipboard;
 .field private static sOut:Ljava/io/PrintStream;
+.field private static sCtx:Landroid/content/Context;
+.field private static sNM:Landroid/app/INotificationManager;
+.field private static sIcon:Landroid/graphics/drawable/Icon;
+.field private static sChanReady:Z
 
 .method public constructor <init>()V
     .locals 0
@@ -743,6 +747,305 @@
     return-object v0
 .end method
 
+.method private static ensureNotifReady()V
+    .locals 5
+    .annotation system Ldalvik/annotation/Throws;
+        value = {
+            Ljava/lang/Throwable;
+        }
+    .end annotation
+
+    sget-object v0, LAgentKernel;->sNM:Landroid/app/INotificationManager;
+    if-nez v0, :nm_ok
+    const-string v0, "notification"
+    invoke-static {v0}, Landroid/os/ServiceManager;->getService(Ljava/lang/String;)Landroid/os/IBinder;
+    move-result-object v0
+    if-eqz v0, :nm_unavail
+    invoke-static {v0}, Landroid/app/INotificationManager$Stub;->asInterface(Landroid/os/IBinder;)Landroid/app/INotificationManager;
+    move-result-object v0
+    sput-object v0, LAgentKernel;->sNM:Landroid/app/INotificationManager;
+    goto :nm_ok
+
+    :nm_unavail
+    new-instance v0, Ljava/lang/RuntimeException;
+    const-string v1, "notification service unavailable"
+    invoke-direct {v0, v1}, Ljava/lang/RuntimeException;-><init>(Ljava/lang/String;)V
+    throw v0
+
+    :nm_ok
+    sget-object v0, LAgentKernel;->sCtx:Landroid/content/Context;
+    if-nez v0, :ctx_ok
+    invoke-static {}, Landroid/app/ActivityThread;->systemMain()Landroid/app/ActivityThread;
+    move-result-object v0
+    if-eqz v0, :ctx_ok
+    invoke-virtual {v0}, Landroid/app/ActivityThread;->getSystemContext()Landroid/app/ContextImpl;
+    move-result-object v0
+    if-eqz v0, :ctx_ok
+    :try_pkg_ctx
+    const-string v1, "com.android.shell"
+    const/4 v2, 0x0
+    invoke-virtual {v0, v1, v2}, Landroid/content/Context;->createPackageContext(Ljava/lang/String;I)Landroid/content/Context;
+    move-result-object v1
+    if-eqz v1, :use_sys_ctx
+    move-object v0, v1
+    :try_end_pkg_ctx
+    .catch Ljava/lang/Throwable; {:try_pkg_ctx .. :try_end_pkg_ctx} :use_sys_ctx
+    :use_sys_ctx
+    sput-object v0, LAgentKernel;->sCtx:Landroid/content/Context;
+
+    :ctx_ok
+    sget-object v0, LAgentKernel;->sIcon:Landroid/graphics/drawable/Icon;
+    if-nez v0, :icon_ok
+    sget-object v0, Landroid/graphics/Bitmap$Config;->ARGB_8888:Landroid/graphics/Bitmap$Config;
+    const/16 v1, 0x30
+    invoke-static {v1, v1, v0}, Landroid/graphics/Bitmap;->createBitmap(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;
+    move-result-object v0
+    const v1, -0xf15a17
+    invoke-virtual {v0, v1}, Landroid/graphics/Bitmap;->eraseColor(I)V
+    invoke-static {v0}, Landroid/graphics/drawable/Icon;->createWithBitmap(Landroid/graphics/Bitmap;)Landroid/graphics/drawable/Icon;
+    move-result-object v0
+    sput-object v0, LAgentKernel;->sIcon:Landroid/graphics/drawable/Icon;
+
+    :icon_ok
+    sget-boolean v0, LAgentKernel;->sChanReady:Z
+    if-nez v0, :done_ready
+    sget-object v0, LAgentKernel;->sNM:Landroid/app/INotificationManager;
+    new-instance v1, Landroid/app/NotificationChannel;
+    const-string v2, "agent_live_progress"
+    const-string v3, "Agent 实时进度"
+    const/4 v4, 0x3
+    invoke-direct {v1, v2, v3, v4}, Landroid/app/NotificationChannel;-><init>(Ljava/lang/String;Ljava/lang/CharSequence;I)V
+    const/4 v2, 0x0
+    invoke-virtual {v1, v2, v2}, Landroid/app/NotificationChannel;->setSound(Landroid/net/Uri;Landroid/media/AudioAttributes;)V
+    const/4 v2, 0x0
+    invoke-virtual {v1, v2}, Landroid/app/NotificationChannel;->enableVibration(Z)V
+    invoke-virtual {v1, v2}, Landroid/app/NotificationChannel;->setShowBadge(Z)V
+
+    invoke-static {v1}, Ljava/util/Collections;->singletonList(Ljava/lang/Object;)Ljava/util/List;
+    move-result-object v1
+    new-instance v2, Landroid/content/pm/ParceledListSlice;
+    invoke-direct {v2, v1}, Landroid/content/pm/ParceledListSlice;-><init>(Ljava/util/List;)V
+    const-string v1, "com.android.shell"
+    invoke-interface {v0, v1, v2}, Landroid/app/INotificationManager;->createNotificationChannels(Ljava/lang/String;Landroid/content/pm/ParceledListSlice;)V
+    const/4 v0, 0x1
+    sput-boolean v0, LAgentKernel;->sChanReady:Z
+
+    :done_ready
+    return-void
+.end method
+
+.method private static buildFocusParamJson(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
+    .locals 6
+    .annotation system Ldalvik/annotation/Throws;
+        value = {
+            Lorg/json/JSONException;
+        }
+    .end annotation
+
+    new-instance v0, Lorg/json/JSONObject;
+    invoke-direct {v0}, Lorg/json/JSONObject;-><init>()V
+
+    new-instance v1, Lorg/json/JSONObject;
+    invoke-direct {v1}, Lorg/json/JSONObject;-><init>()V
+    const-string v2, "business"
+    const-string v3, "agent_live"
+    invoke-virtual {v1, v2, v3}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+    const-string v2, "protocol"
+    const/4 v3, 0x1
+    invoke-virtual {v1, v2, v3}, Lorg/json/JSONObject;->put(Ljava/lang/String;I)Lorg/json/JSONObject;
+    const-string v2, "ticker"
+    invoke-virtual {v1, v2, p2}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+    const-string v2, "enableFloat"
+    const/4 v4, 0x0
+    invoke-virtual {v1, v2, v4}, Lorg/json/JSONObject;->put(Ljava/lang/String;Z)Lorg/json/JSONObject;
+    const-string v2, "updatable"
+    invoke-virtual {v1, v2, v3}, Lorg/json/JSONObject;->put(Ljava/lang/String;Z)Lorg/json/JSONObject;
+    const-string v2, "isShowNotification"
+    invoke-virtual {v1, v2, v3}, Lorg/json/JSONObject;->put(Ljava/lang/String;Z)Lorg/json/JSONObject;
+
+    new-instance v2, Lorg/json/JSONObject;
+    invoke-direct {v2}, Lorg/json/JSONObject;-><init>()V
+    const-string v4, "title"
+    invoke-virtual {v2, v4, p0}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+    const-string v4, "content"
+    invoke-virtual {v2, v4, p1}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+    const-string v4, "type"
+    const/4 v5, 0x2
+    invoke-virtual {v2, v4, v5}, Lorg/json/JSONObject;->put(Ljava/lang/String;I)Lorg/json/JSONObject;
+    const-string v4, "baseInfo"
+    invoke-virtual {v1, v4, v2}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+
+    new-instance v2, Lorg/json/JSONObject;
+    invoke-direct {v2}, Lorg/json/JSONObject;-><init>()V
+    const-string v4, "title"
+    invoke-virtual {v2, v4, p2}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+    const-string v4, "content"
+    invoke-virtual {v2, v4, p3}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+
+    new-instance v4, Lorg/json/JSONObject;
+    invoke-direct {v4}, Lorg/json/JSONObject;-><init>()V
+    const-string v5, "type"
+    invoke-virtual {v4, v5, v3}, Lorg/json/JSONObject;->put(Ljava/lang/String;I)Lorg/json/JSONObject;
+    const-string v5, "textInfo"
+    invoke-virtual {v4, v5, v2}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+
+    new-instance v2, Lorg/json/JSONObject;
+    invoke-direct {v2}, Lorg/json/JSONObject;-><init>()V
+    const-string v5, "imageTextInfoLeft"
+    invoke-virtual {v2, v5, v4}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+
+    new-instance v4, Lorg/json/JSONObject;
+    invoke-direct {v4}, Lorg/json/JSONObject;-><init>()V
+    const-string v5, "title"
+    invoke-virtual {v4, v5, p2}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+
+    new-instance v5, Lorg/json/JSONObject;
+    invoke-direct {v5}, Lorg/json/JSONObject;-><init>()V
+    const-string p0, "combinePicInfo"
+    invoke-virtual {v5, p0, v4}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+
+    new-instance v4, Lorg/json/JSONObject;
+    invoke-direct {v4}, Lorg/json/JSONObject;-><init>()V
+    const-string p0, "islandProperty"
+    invoke-virtual {v4, p0, v3}, Lorg/json/JSONObject;->put(Ljava/lang/String;I)Lorg/json/JSONObject;
+    const-string p0, "bigIslandArea"
+    invoke-virtual {v4, p0, v2}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+    const-string p0, "smallIslandArea"
+    invoke-virtual {v4, p0, v5}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+
+    const-string p0, "param_island"
+    invoke-virtual {v1, p0, v4}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+    const-string p0, "param_v2"
+    invoke-virtual {v0, p0, v1}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+
+    invoke-virtual {v0}, Lorg/json/JSONObject;->toString()Ljava/lang/String;
+    move-result-object v0
+    return-object v0
+.end method
+
+.method private static handleNotifyProgress(Lorg/json/JSONObject;)Ljava/lang/String;
+    .locals 13
+    .annotation system Ldalvik/annotation/Throws;
+        value = {
+            Ljava/lang/Throwable;
+        }
+    .end annotation
+
+    invoke-static {}, LAgentKernel;->ensureNotifReady()V
+    sget-object v0, LAgentKernel;->sNM:Landroid/app/INotificationManager;
+    sget-object v1, LAgentKernel;->sCtx:Landroid/content/Context;
+    sget-object v2, LAgentKernel;->sIcon:Landroid/graphics/drawable/Icon;
+
+    const-string v3, "tag"
+    const-string v4, "agent_live"
+    invoke-virtual {p0, v3, v4}, Lorg/json/JSONObject;->optString(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
+    move-result-object v7
+
+    const-string v3, "id"
+    const/16 v4, 0x26ac
+    invoke-virtual {p0, v3, v4}, Lorg/json/JSONObject;->optInt(Ljava/lang/String;I)I
+    move-result v8
+
+    const-string v3, "title"
+    const-string v4, "🤖 Agent 执行中"
+    invoke-virtual {p0, v3, v4}, Lorg/json/JSONObject;->optString(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
+    move-result-object v9
+
+    const-string v3, "text"
+    const-string v4, ""
+    invoke-virtual {p0, v3, v4}, Lorg/json/JSONObject;->optString(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
+    move-result-object v10
+
+    const-string v3, "short_text"
+    invoke-virtual {p0, v3, v9}, Lorg/json/JSONObject;->optString(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
+    move-result-object v11
+
+    const-string v3, "sub_text"
+    const-string v4, "Agent"
+    invoke-virtual {p0, v3, v4}, Lorg/json/JSONObject;->optString(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
+    move-result-object v12
+
+    new-instance v3, Landroid/app/Notification$Builder;
+    const-string v4, "agent_live_progress"
+    invoke-direct {v3, v1, v4}, Landroid/app/Notification$Builder;-><init>(Landroid/content/Context;Ljava/lang/String;)V
+    invoke-virtual {v3, v2}, Landroid/app/Notification$Builder;->setSmallIcon(Landroid/graphics/drawable/Icon;)Landroid/app/Notification$Builder;
+    invoke-virtual {v3, v9}, Landroid/app/Notification$Builder;->setContentTitle(Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;
+    invoke-virtual {v3, v10}, Landroid/app/Notification$Builder;->setContentText(Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;
+
+    const/4 v4, 0x1
+    const-string v5, "ongoing"
+    invoke-virtual {p0, v5, v4}, Lorg/json/JSONObject;->optBoolean(Ljava/lang/String;Z)Z
+    move-result v5
+    invoke-virtual {v3, v5}, Landroid/app/Notification$Builder;->setOngoing(Z)Landroid/app/Notification$Builder;
+    invoke-virtual {v3, v4}, Landroid/app/Notification$Builder;->setOnlyAlertOnce(Z)Landroid/app/Notification$Builder;
+    invoke-virtual {v3, v4}, Landroid/app/Notification$Builder;->setShowWhen(Z)Landroid/app/Notification$Builder;
+
+    const-string v5, "step"
+    const/4 v6, 0x0
+    invoke-virtual {p0, v5, v6}, Lorg/json/JSONObject;->optInt(Ljava/lang/String;I)I
+    move-result v5
+    const-string v1, "max"
+    invoke-virtual {p0, v1, v6}, Lorg/json/JSONObject;->optInt(Ljava/lang/String;I)I
+    move-result v1
+    if-lez v1, :skip_prog
+    invoke-virtual {v3, v1, v5, v6}, Landroid/app/Notification$Builder;->setProgress(IIZ)Landroid/app/Notification$Builder;
+
+    :skip_prog
+    const-string v1, "focus"
+    invoke-virtual {p0, v1, v4}, Lorg/json/JSONObject;->optBoolean(Ljava/lang/String;Z)Z
+    move-result v1
+    if-eqz v1, :skip_focus
+    new-instance v5, Landroid/os/Bundle;
+    invoke-direct {v5}, Landroid/os/Bundle;-><init>()V
+    const-string v1, "miui.focus.enable"
+    invoke-virtual {v5, v1, v4}, Landroid/os/Bundle;->putBoolean(Ljava/lang/String;Z)V
+    const-string v1, "miui.focus.ticker"
+    invoke-virtual {v5, v1, v11}, Landroid/os/Bundle;->putString(Ljava/lang/String;Ljava/lang/String;)V
+    invoke-static {v9, v10, v11, v12}, LAgentKernel;->buildFocusParamJson(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
+    move-result-object v1
+    const-string v2, "miui.focus.param"
+    invoke-virtual {v5, v2, v1}, Landroid/os/Bundle;->putString(Ljava/lang/String;Ljava/lang/String;)V
+    invoke-virtual {v3, v5}, Landroid/app/Notification$Builder;->addExtras(Landroid/os/Bundle;)Landroid/app/Notification$Builder;
+
+    :skip_focus
+    invoke-virtual {v3}, Landroid/app/Notification$Builder;->build()Landroid/app/Notification;
+    move-result-object v5
+
+    const-string v1, "com.android.shell"
+    const-string v2, "com.android.shell"
+    move-object v3, v7
+    move v4, v8
+    invoke-interface/range {v0 .. v6}, Landroid/app/INotificationManager;->enqueueNotificationWithTag(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILandroid/app/Notification;I)V
+    const-string v0, "{\"ok\":true}"
+    return-object v0
+.end method
+
+.method private static handleNotifyCancel(Lorg/json/JSONObject;)Ljava/lang/String;
+    .locals 6
+    .annotation system Ldalvik/annotation/Throws;
+        value = {
+            Ljava/lang/Throwable;
+        }
+    .end annotation
+
+    invoke-static {}, LAgentKernel;->ensureNotifReady()V
+    sget-object v0, LAgentKernel;->sNM:Landroid/app/INotificationManager;
+    const-string v1, "tag"
+    const-string v2, "agent_live"
+    invoke-virtual {p0, v1, v2}, Lorg/json/JSONObject;->optString(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
+    move-result-object v3
+    const-string v1, "id"
+    const/16 v2, 0x26ac
+    invoke-virtual {p0, v1, v2}, Lorg/json/JSONObject;->optInt(Ljava/lang/String;I)I
+    move-result v4
+    const-string v1, "com.android.shell"
+    const-string v2, "com.android.shell"
+    const/4 v5, 0x0
+    invoke-interface/range {v0 .. v5}, Landroid/app/INotificationManager;->cancelNotificationWithTag(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;II)V
+    const-string v0, "{\"ok\":true}"
+    return-object v0
+.end method
+
 .method private static stdioLoop()V
     .locals 5
     .annotation system Ldalvik/annotation/Throws;
@@ -820,8 +1123,26 @@
     const-string v4, "clip_set"
     invoke-virtual {v4, v1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
     move-result v4
-    if-eqz v4, :chk_quit
+    if-eqz v4, :chk_notify_prog
     invoke-static {v3}, LAgentKernel;->handleClipSet(Lorg/json/JSONObject;)Ljava/lang/String;
+    move-result-object v1
+    goto :send_resp
+
+    :chk_notify_prog
+    const-string v4, "notify_progress"
+    invoke-virtual {v4, v1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+    move-result v4
+    if-eqz v4, :chk_notify_cancel
+    invoke-static {v3}, LAgentKernel;->handleNotifyProgress(Lorg/json/JSONObject;)Ljava/lang/String;
+    move-result-object v1
+    goto :send_resp
+
+    :chk_notify_cancel
+    const-string v4, "notify_cancel"
+    invoke-virtual {v4, v1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+    move-result v4
+    if-eqz v4, :chk_quit
+    invoke-static {v3}, LAgentKernel;->handleNotifyCancel(Lorg/json/JSONObject;)Ljava/lang/String;
     move-result-object v1
     goto :send_resp
 

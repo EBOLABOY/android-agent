@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -31,12 +32,198 @@ type ToolStep struct {
 	Step      int    `json:"step"`
 	Tool      string `json:"tool"`
 	Category  string `json:"category"` // "ui_tree" | "touch" | "cdp" | "vision" | "memory" | "workflow" | "system"
+	Label     string `json:"label,omitempty"`
 	Summary   string `json:"summary,omitempty"`
 	IsError   bool   `json:"is_error,omitempty"`
 	ElapsedMs int64  `json:"elapsed_ms"`
 }
 
+// RunEvent is emitted in real time during an Agent turn and stored in runEventStore for Run Replay.
+type RunEvent struct {
+	RunID             string     `json:"run_id"`
+	Seq               int        `json:"seq"`
+	Type              string     `json:"type"` // run_start | thinking | tool_start | tool_end | text_delta | needs_confirmation | done | cancelled | error
+	TS                string     `json:"ts"`
+	Step              int        `json:"step,omitempty"`
+	Steps             int        `json:"steps,omitempty"`
+	MaxSteps          int        `json:"max_steps,omitempty"`
+	Tool              string     `json:"tool,omitempty"`
+	Category          string     `json:"category,omitempty"`
+	Label             string     `json:"label,omitempty"`
+	Summary           string     `json:"summary,omitempty"`
+	Delta             string     `json:"delta,omitempty"`
+	Reply             string     `json:"reply,omitempty"`
+	Error             string     `json:"error,omitempty"`
+	IsError           bool       `json:"is_error,omitempty"`
+	ElapsedMs         int64      `json:"elapsed_ms,omitempty"`
+	ElapsedSec        float64    `json:"elapsed_sec,omitempty"`
+	NeedsConfirmation bool       `json:"needs_confirmation,omitempty"`
+	ToolsUsed         []string   `json:"tools_used,omitempty"`
+	ToolTrace         []ToolStep `json:"tool_trace,omitempty"`
+}
+
+type RunReplaySnapshot struct {
+	RunID       string     `json:"run_id"`
+	UserMessage string     `json:"user_message,omitempty"`
+	Active      bool       `json:"active"`
+	Finished    bool       `json:"finished"`
+	LastSeq     int        `json:"last_seq"`
+	Events      []RunEvent `json:"events"`
+}
+
+type EventSink func(ev RunEvent)
+
+const (
+	maxReplayStepEvents  = 128
+	maxReplayDeltaEvents = 384
+)
+
+// runEventStore keeps an in-memory replay buffer for the latest Agent run so mobile clients
+// that get suspended when switching to another App can catch up seamlessly on resume.
+type runEventStore struct {
+	mu          sync.Mutex
+	runID       string
+	userMessage string
+	active      bool
+	finished    bool
+	lastSeq     int
+	steps       []RunEvent // structural events (run_start/thinking/tool_start/tool_end/needs_confirmation/done/cancelled/error)
+	deltas      []RunEvent // text_delta events
+	subs        map[int]chan RunEvent
+	nextSubID   int
+}
+
+func newRunEventStore() *runEventStore {
+	return &runEventStore{
+		subs: make(map[int]chan RunEvent),
+	}
+}
+
+func (s *runEventStore) beginRun(runID, userMessage string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runID = runID
+	s.userMessage = userMessage
+	s.active = true
+	s.finished = false
+	s.lastSeq = 0
+	s.steps = s.steps[:0]
+	s.deltas = s.deltas[:0]
+	for id, ch := range s.subs {
+		close(ch)
+		delete(s.subs, id)
+	}
+}
+
+func (s *runEventStore) emit(ev RunEvent) RunEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ev.RunID = s.runID
+	s.lastSeq++
+	ev.Seq = s.lastSeq
+	if ev.TS == "" {
+		ev.TS = time.Now().Format(time.RFC3339Nano)
+	}
+	if ev.Type == "text_delta" {
+		s.deltas = append(s.deltas, ev)
+		if len(s.deltas) > maxReplayDeltaEvents {
+			s.deltas = append([]RunEvent(nil), s.deltas[len(s.deltas)-maxReplayDeltaEvents:]...)
+		}
+	} else {
+		s.steps = append(s.steps, ev)
+		if len(s.steps) > maxReplayStepEvents {
+			s.steps = append([]RunEvent(nil), s.steps[len(s.steps)-maxReplayStepEvents:]...)
+		}
+		if ev.Type == "done" || ev.Type == "cancelled" || ev.Type == "error" {
+			s.active = false
+			s.finished = true
+		}
+	}
+
+	for id, ch := range s.subs {
+		select {
+		case ch <- ev:
+		default:
+			// Slow/disconnected subscriber: close channel so it switches cleanly to replay polling.
+			close(ch)
+			delete(s.subs, id)
+		}
+	}
+	return ev
+}
+
+func (s *runEventStore) snapshot(runID string, afterSeq int) RunReplaySnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.runID == "" || (runID != "" && runID != s.runID) {
+		return RunReplaySnapshot{
+			RunID:  runID,
+			Events: []RunEvent{},
+		}
+	}
+	events := s.collectAfterLocked(afterSeq)
+	return RunReplaySnapshot{
+		RunID:       s.runID,
+		UserMessage: s.userMessage,
+		Active:      s.active,
+		Finished:    s.finished,
+		LastSeq:     s.lastSeq,
+		Events:      events,
+	}
+}
+
+func (s *runEventStore) subscribe(runID string, afterSeq int) (RunReplaySnapshot, <-chan RunEvent, func(), bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.runID == "" || (runID != "" && runID != s.runID) {
+		return RunReplaySnapshot{RunID: runID, Events: []RunEvent{}}, nil, func() {}, false
+	}
+	snap := RunReplaySnapshot{
+		RunID:       s.runID,
+		UserMessage: s.userMessage,
+		Active:      s.active,
+		Finished:    s.finished,
+		LastSeq:     s.lastSeq,
+		Events:      s.collectAfterLocked(afterSeq),
+	}
+	if s.finished {
+		return snap, nil, func() {}, true
+	}
+	s.nextSubID++
+	id := s.nextSubID
+	ch := make(chan RunEvent, 128)
+	s.subs[id] = ch
+	unsub := func() {
+		s.mu.Lock()
+		if existing, ok := s.subs[id]; ok {
+			close(existing)
+			delete(s.subs, id)
+		}
+		s.mu.Unlock()
+	}
+	return snap, ch, unsub, true
+}
+
+func (s *runEventStore) collectAfterLocked(afterSeq int) []RunEvent {
+	out := make([]RunEvent, 0, 32)
+	for _, ev := range s.steps {
+		if ev.Seq > afterSeq {
+			out = append(out, ev)
+		}
+	}
+	for _, ev := range s.deltas {
+		if ev.Seq > afterSeq {
+			out = append(out, ev)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Seq < out[j].Seq
+	})
+	return out
+}
+
 type ChatTurnResult struct {
+	RunID             string     `json:"run_id,omitempty"`
 	Reply             string     `json:"reply"`
 	ToolsUsed         []string   `json:"tools_used,omitempty"`
 	ToolTrace         []ToolStep `json:"tool_trace,omitempty"`
@@ -51,20 +238,45 @@ type Agent struct {
 	activeMu     sync.Mutex
 	activeCancel context.CancelFunc
 	activeReason string
+	runSeq       uint64
 
-	cfg     config.LLMConfig
-	exec    ToolExecutor
-	guard   *guard.Guard
-	memory  *MemoryStore
-	history []ChatMessage
+	cfg         config.LLMConfig
+	exec        ToolExecutor
+	guard       *guard.Guard
+	memory      *MemoryStore
+	history     []ChatMessage
+	events      *runEventStore
+	obsMu       sync.RWMutex
+	obsObserver EventSink
 }
 
 func NewAgent(cfg config.LLMConfig, exec ToolExecutor, g *guard.Guard) *Agent {
 	return &Agent{
-		cfg:   cfg,
-		exec:  exec,
-		guard: g,
+		cfg:    cfg,
+		exec:   exec,
+		guard:  g,
+		events: newRunEventStore(),
 	}
+}
+
+func (a *Agent) SetEventObserver(fn EventSink) {
+	a.obsMu.Lock()
+	a.obsObserver = fn
+	a.obsMu.Unlock()
+}
+
+func (a *Agent) IsRunning() bool {
+	a.activeMu.Lock()
+	defer a.activeMu.Unlock()
+	return a.activeCancel != nil
+}
+
+func (a *Agent) ReplayEvents(runID string, afterSeq int) RunReplaySnapshot {
+	return a.events.snapshot(strings.TrimSpace(runID), afterSeq)
+}
+
+func (a *Agent) SubscribeRun(runID string, afterSeq int) (RunReplaySnapshot, <-chan RunEvent, func(), bool) {
+	return a.events.subscribe(strings.TrimSpace(runID), afterSeq)
 }
 
 func (a *Agent) SetMemoryStore(m *MemoryStore) {
@@ -115,6 +327,56 @@ func (a *Agent) CancelActive(reason string) bool {
 }
 
 func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, error) {
+	return a.ChatStream(ctx, userMessage, nil)
+}
+
+func (a *Agent) nextRunID() string {
+	a.mu.Lock()
+	a.runSeq++
+	id := fmt.Sprintf("run-%d-%d", time.Now().Unix(), a.runSeq)
+	a.mu.Unlock()
+	return id
+}
+
+func (a *Agent) dispatchEvent(sink EventSink, ev RunEvent) {
+	recorded := a.events.emit(ev)
+	if sink != nil {
+		sink(recorded)
+	}
+	a.obsMu.RLock()
+	obs := a.obsObserver
+	a.obsMu.RUnlock()
+	if obs != nil {
+		obs(recorded)
+	}
+}
+
+// StartChatAsync starts a detached background ReAct turn and immediately returns its run_id
+// so SSE subscribers or mobile webviews that suspend can detach/reattach cleanly without losing execution.
+func (a *Agent) StartChatAsync(userMessage string) (string, error) {
+	userMessage = strings.TrimSpace(userMessage)
+	if userMessage == "" {
+		return "", errors.New("message is empty")
+	}
+	if a.guard != nil {
+		if blocked, reason := a.guard.IsActionBlocked(); blocked {
+			return "", fmt.Errorf("agent guard active: %s", reason)
+		}
+	}
+	if !a.chatMu.TryLock() {
+		return "", ErrChatBusy
+	}
+
+	runID := a.nextRunID()
+	a.events.beginRun(runID, userMessage)
+	go func() {
+		defer a.chatMu.Unlock()
+		_, _ = a.runLocked(context.Background(), runID, userMessage, nil)
+	}()
+	return runID, nil
+}
+
+func (a *Agent) ChatStream(ctx context.Context, userMessage string, sink EventSink) (*ChatTurnResult, error) {
 	userMessage = strings.TrimSpace(userMessage)
 	if userMessage == "" {
 		return nil, errors.New("message is empty")
@@ -129,6 +391,12 @@ func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, 
 	}
 	defer a.chatMu.Unlock()
 
+	runID := a.nextRunID()
+	a.events.beginRun(runID, userMessage)
+	return a.runLocked(ctx, runID, userMessage, sink)
+}
+
+func (a *Agent) runLocked(ctx context.Context, runID, userMessage string, sink EventSink) (*ChatTurnResult, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	a.activeMu.Lock()
 	a.activeCancel = cancel
@@ -170,20 +438,76 @@ func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, 
 	repeatCount := 0
 	repeatErrCount := 0
 
+	a.dispatchEvent(sink, RunEvent{
+		Type:     "run_start",
+		MaxSteps: maxSteps,
+		Summary:  userMessage,
+	})
+
+	finishCancelled := func(err error) (*ChatTurnResult, error) {
+		a.activeMu.Lock()
+		reason := a.activeReason
+		a.activeMu.Unlock()
+		msg := "任务已停止"
+		if reason != "" {
+			msg = fmt.Sprintf("任务已停止 (%s)", reason)
+		}
+		a.dispatchEvent(sink, RunEvent{
+			Type:       "cancelled",
+			Error:      msg,
+			ElapsedSec: float64(int(time.Since(t0).Seconds()*10)) / 10,
+			Steps:      steps,
+			ToolsUsed:  toolsUsed,
+			ToolTrace:  trace,
+		})
+		if reason != "" {
+			return nil, fmt.Errorf("chat cancelled (%s): %w", reason, err)
+		}
+		return nil, err
+	}
+
+	finishErr := func(err error) (*ChatTurnResult, error) {
+		if runCtx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(runCtx.Err(), context.Canceled)) {
+			return finishCancelled(err)
+		}
+		a.dispatchEvent(sink, RunEvent{
+			Type:       "error",
+			Error:      err.Error(),
+			ElapsedSec: float64(int(time.Since(t0).Seconds()*10)) / 10,
+			Steps:      steps,
+			ToolsUsed:  toolsUsed,
+			ToolTrace:  trace,
+		})
+		return nil, err
+	}
+
 	for steps < maxSteps {
 		if err := runCtx.Err(); err != nil {
-			a.activeMu.Lock()
-			reason := a.activeReason
-			a.activeMu.Unlock()
-			if reason != "" {
-				return nil, fmt.Errorf("chat cancelled (%s): %w", reason, err)
-			}
-			return nil, err
+			return finishCancelled(err)
 		}
 		steps++
-		resp, err := callLLM(runCtx, cfg, sysPrompt, history, tools)
+		a.dispatchEvent(sink, RunEvent{
+			Type:     "thinking",
+			Step:     steps,
+			MaxSteps: maxSteps,
+			Summary:  fmt.Sprintf("第 %d 步推理规划中...", steps),
+		})
+
+		resp, err := callLLMStream(runCtx, cfg, sysPrompt, history, tools, StreamCallbacks{
+			OnTextDelta: func(delta string) {
+				if delta == "" {
+					return
+				}
+				a.dispatchEvent(sink, RunEvent{
+					Type:     "text_delta",
+					Step:     steps,
+					MaxSteps: maxSteps,
+					Delta:    delta,
+				})
+			},
+		})
 		if err != nil {
-			return nil, err
+			return finishErr(err)
 		}
 
 		history = append(history, ChatMessage{
@@ -194,25 +518,61 @@ func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, 
 
 		if len(resp.ToolCalls) == 0 {
 			a.saveHistory(history)
+			needsConfirm := replyNeedsConfirmation(resp.Text)
+			if needsConfirm {
+				a.dispatchEvent(sink, RunEvent{
+					Type:              "needs_confirmation",
+					Step:              steps,
+					MaxSteps:          maxSteps,
+					NeedsConfirmation: true,
+					Summary:           "需要人工确认",
+				})
+			}
+			elapsed := float64(int(time.Since(t0).Seconds()*10)) / 10
+			a.dispatchEvent(sink, RunEvent{
+				Type:              "done",
+				Step:              steps,
+				MaxSteps:          maxSteps,
+				Reply:             resp.Text,
+				NeedsConfirmation: needsConfirm,
+				ElapsedSec:        elapsed,
+				ToolsUsed:         toolsUsed,
+				ToolTrace:         trace,
+			})
 			return &ChatTurnResult{
+				RunID:             runID,
 				Reply:             resp.Text,
 				ToolsUsed:         toolsUsed,
 				ToolTrace:         trace,
-				NeedsConfirmation: replyNeedsConfirmation(resp.Text),
+				NeedsConfirmation: needsConfirm,
 				Steps:             steps,
-				ElapsedSec:        float64(int(time.Since(t0).Seconds()*10)) / 10,
+				ElapsedSec:        elapsed,
 			}, nil
 		}
 
 		for _, tc := range resp.ToolCalls {
 			if a.guard != nil {
 				if blocked, reason := a.guard.IsActionBlocked(); blocked {
-					return nil, fmt.Errorf("stopped by guard: %s", reason)
+					err := fmt.Errorf("stopped by guard: %s", reason)
+					return finishCancelled(err)
 				}
 			}
+			cat := classifyToolCategory(tc.Name)
+			uiDesc, islandShort := friendlyToolDescriptions(tc.Name, tc.Args)
+			a.dispatchEvent(sink, RunEvent{
+				Type:     "tool_start",
+				Step:     steps,
+				MaxSteps: maxSteps,
+				Tool:     tc.Name,
+				Category: cat,
+				Label:    islandShort,
+				Summary:  uiDesc,
+			})
+
 			toolsUsed = append(toolsUsed, tc.Name)
 			toolStart := time.Now()
 			out := a.exec.ExecuteTool(runCtx, tc.Name, tc.Args)
+			elapsedMs := time.Since(toolStart).Milliseconds()
 
 			sigBytes, _ := json.Marshal(tc.Args)
 			sig := tc.Name + ":" + string(sigBytes)
@@ -238,14 +598,30 @@ func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, 
 				toolText += "\n[系统防死循环提示] 检测到连续重复调用相同工具且未取得进展，请立即更换操作策略（如滑动、截屏兜底）或直接向用户汇报当前状态。"
 			}
 
-			trace = append(trace, ToolStep{
+			stepSum := summarizeToolOutcome(out)
+			stepEntry := ToolStep{
 				Step:      len(trace) + 1,
 				Tool:      tc.Name,
-				Category:  classifyToolCategory(tc.Name),
-				Summary:   summarizeToolOutcome(out),
+				Category:  cat,
+				Label:     uiDesc,
+				Summary:   stepSum,
 				IsError:   out.IsError,
-				ElapsedMs: time.Since(toolStart).Milliseconds(),
+				ElapsedMs: elapsedMs,
+			}
+			trace = append(trace, stepEntry)
+
+			a.dispatchEvent(sink, RunEvent{
+				Type:      "tool_end",
+				Step:      steps,
+				MaxSteps:  maxSteps,
+				Tool:      tc.Name,
+				Category:  cat,
+				Label:     uiDesc,
+				Summary:   stepSum,
+				IsError:   out.IsError,
+				ElapsedMs: elapsedMs,
 			})
+
 			history = append(history, ChatMessage{
 				Role:       "tool",
 				ToolCallID: tc.ID,
@@ -258,14 +634,104 @@ func (a *Agent) Chat(ctx context.Context, userMessage string) (*ChatTurnResult, 
 
 	a.saveHistory(history)
 	reply := "已达到单轮最大工具调用步数限制，请查看当前结果或继续指示下一步。"
+	elapsed := float64(int(time.Since(t0).Seconds()*10)) / 10
+	needsConfirm := replyNeedsConfirmation(reply)
+	a.dispatchEvent(sink, RunEvent{
+		Type:              "done",
+		Step:              steps,
+		MaxSteps:          maxSteps,
+		Reply:             reply,
+		NeedsConfirmation: needsConfirm,
+		ElapsedSec:        elapsed,
+		ToolsUsed:         toolsUsed,
+		ToolTrace:         trace,
+	})
 	return &ChatTurnResult{
+		RunID:             runID,
 		Reply:             reply,
 		ToolsUsed:         toolsUsed,
 		ToolTrace:         trace,
-		NeedsConfirmation: replyNeedsConfirmation(reply),
+		NeedsConfirmation: needsConfirm,
 		Steps:             steps,
-		ElapsedSec:        float64(int(time.Since(t0).Seconds()*10)) / 10,
+		ElapsedSec:        elapsed,
 	}, nil
+}
+
+func friendlyToolDescriptions(toolName string, args map[string]any) (string, string) {
+	switch toolName {
+	case "phone_ui_tree":
+		return "正在解析当前界面控件树...", "读界面"
+	case "phone_tap_node":
+		if id, ok := args["id"]; ok {
+			return fmt.Sprintf("正在点击控件 [%v]...", id), fmt.Sprintf("点#%v", id)
+		}
+		return "正在点击界面控件...", "点控件"
+	case "phone_tap":
+		return fmt.Sprintf("正在点击坐标 (%v, %v)...", args["x"], args["y"]), "点击"
+	case "phone_long_press":
+		return fmt.Sprintf("正在长按坐标 (%v, %v)...", args["x"], args["y"]), "长按"
+	case "phone_scroll_node":
+		dir, _ := args["direction"].(string)
+		if dir == "" {
+			dir = "down"
+		}
+		return fmt.Sprintf("正在向 %s 滑动页面...", dir), "滑页面"
+	case "phone_swipe":
+		return "正在执行拟人滑动...", "滑动"
+	case "phone_input_text":
+		return "正在输入文本内容...", "输入"
+	case "phone_keyevent":
+		return fmt.Sprintf("正在发送按键 %v...", args["keycode"]), "按键"
+	case "phone_screenshot":
+		return "正在截屏视觉兜底...", "截屏"
+	case "phone_launch_app":
+		pkg, _ := args["package"].(string)
+		appName := friendlyPackageName(pkg)
+		return fmt.Sprintf("正在打开 %s...", appName), "开" + appName
+	case "phone_foreground_app":
+		return "正在查询前台应用...", "查前台"
+	case "cdp_list_sockets", "cdp_list_targets", "cdp_status":
+		return "正在探测 WebView CDP 页面...", "查DOM"
+	case "cdp_command":
+		return fmt.Sprintf("正在执行 CDP %v...", args["method"]), "控DOM"
+	case "read_memory":
+		return "正在读取端侧记忆...", "读记忆"
+	case "append_memory":
+		return "正在写入端侧记忆...", "写记忆"
+	case "run_daily_all":
+		return "正在运行每日一键全清 (0-Token)...", "全清"
+	case "run_ms_rewards":
+		return "正在运行微软积分任务...", "微软分"
+	case "run_jd_daily":
+		return "正在运行京东日常任务...", "京东豆"
+	default:
+		return fmt.Sprintf("正在调用 %s...", toolName), toolName
+	}
+}
+
+func friendlyPackageName(pkg string) string {
+	switch strings.TrimSpace(pkg) {
+	case "com.sankuai.meituan":
+		return "美团"
+	case "com.jingdong.app.mall":
+		return "京东"
+	case "com.tencent.mm":
+		return "微信"
+	case "com.eg.android.AlipayGphone":
+		return "支付宝"
+	case "com.microsoft.emmx":
+		return "Edge"
+	case "com.microsoft.bing":
+		return "Bing"
+	case "com.taobao.taobao":
+		return "淘宝"
+	default:
+		if pkg == "" {
+			return "应用"
+		}
+		parts := strings.Split(pkg, ".")
+		return parts[len(parts)-1]
+	}
 }
 
 func classifyToolCategory(name string) string {

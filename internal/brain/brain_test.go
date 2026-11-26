@@ -106,6 +106,10 @@ func TestGeminiAgentTwoStepToolCall(t *testing.T) {
 		if r.Header.Get("x-goog-api-key") != "gem-secret" {
 			t.Fatalf("missing gemini key header")
 		}
+		if strings.HasSuffix(r.URL.Path, "/models/gemini-2.5-flash:streamGenerateContent") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		if !strings.HasSuffix(r.URL.Path, "/models/gemini-2.5-flash:generateContent") {
 			t.Fatalf("unexpected gemini path: %s", r.URL.Path)
 		}
@@ -288,5 +292,253 @@ func TestAgentLLMRetryAndLoopDetection(t *testing.T) {
 	}
 	if !strings.Contains(res.Reply, "防死循环") {
 		t.Fatalf("unexpected reply: %q", res.Reply)
+	}
+}
+
+
+func TestOpenAIStreamDeltasAndToolCalls(t *testing.T) {
+	var round atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Stream bool `json:"stream"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if !req.Stream {
+			t.Fatalf("expected stream=true on streaming test request")
+		}
+		n := round.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if n == 1 {
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc_stream_1\",\"type\":\"function\",\"function\":{\"name\":\"phone_\",\"arguments\":\"{\"}}]}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"status\",\"arguments\":\"}\"}}]}}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"当前\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"设备正常\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	exec := &mockExec{}
+	ag := NewAgent(config.LLMConfig{
+		Provider: "openai",
+		BaseURL:  srv.URL,
+		APIKey:   "sk-stream",
+		Model:    "stream-model",
+		MaxSteps: 4,
+	}, exec, nil)
+
+	var got []RunEvent
+	res, err := ag.ChatStream(context.Background(), "流式检查", func(ev RunEvent) {
+		got = append(got, ev)
+	})
+	if err != nil {
+		t.Fatalf("ChatStream failed: %v", err)
+	}
+	if res.Reply != "当前设备正常" || exec.called.Load() != 1 {
+		t.Fatalf("unexpected stream result=%+v called=%d", res, exec.called.Load())
+	}
+
+	var deltas strings.Builder
+	var sawToolStart, sawToolEnd, sawDone bool
+	for _, ev := range got {
+		switch ev.Type {
+		case "text_delta":
+			deltas.WriteString(ev.Delta)
+		case "tool_start":
+			if ev.Tool == "phone_status" {
+				sawToolStart = true
+			}
+		case "tool_end":
+			if ev.Tool == "phone_status" {
+				sawToolEnd = true
+			}
+		case "done":
+			sawDone = true
+		}
+	}
+	if deltas.String() != "当前设备正常" || !sawToolStart || !sawToolEnd || !sawDone {
+		t.Fatalf("missing expected streamed events: deltas=%q toolStart=%v toolEnd=%v done=%v", deltas.String(), sawToolStart, sawToolEnd, sawDone)
+	}
+}
+
+func TestOpenAIStreamNonSSEAndErrorFallback(t *testing.T) {
+	t.Run("non-sse json response", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{"role": "assistant", "content": "非流式JSON兼容"},
+				}},
+			})
+		}))
+		defer srv.Close()
+
+		var deltas strings.Builder
+		resp, err := callLLMStream(context.Background(), config.LLMConfig{
+			Provider: "openai",
+			BaseURL:  srv.URL,
+			APIKey:   "sk-test",
+			Model:    "m1",
+		}, "sys", []ChatMessage{{Role: "user", Text: "hi"}}, nil, StreamCallbacks{
+			OnTextDelta: func(d string) { deltas.WriteString(d) },
+		})
+		if err != nil {
+			t.Fatalf("callLLMStream failed: %v", err)
+		}
+		if resp.Text != "非流式JSON兼容" || deltas.String() != "非流式JSON兼容" {
+			t.Fatalf("unexpected non-SSE fallback: resp=%+v deltas=%q", resp, deltas.String())
+		}
+	})
+
+	t.Run("stream http error falls back to non-stream", func(t *testing.T) {
+		var attempts atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				Stream bool `json:"stream"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			attempts.Add(1)
+			if req.Stream {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"stream unsupported"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{"role": "assistant", "content": "回退成功"},
+				}},
+			})
+		}))
+		defer srv.Close()
+
+		resp, err := callLLMStream(context.Background(), config.LLMConfig{
+			Provider: "openai",
+			BaseURL:  srv.URL,
+			APIKey:   "sk-test",
+			Model:    "m1",
+		}, "sys", []ChatMessage{{Role: "user", Text: "hi"}}, nil, StreamCallbacks{})
+		if err != nil {
+			t.Fatalf("expected graceful fallback, got err=%v", err)
+		}
+		if resp.Text != "回退成功" || attempts.Load() != 2 {
+			t.Fatalf("unexpected fallback result=%+v attempts=%d", resp, attempts.Load())
+		}
+	})
+}
+
+func TestGeminiSSEStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "streamGenerateContent") || r.URL.Query().Get("alt") != "sse" {
+			t.Fatalf("expected streamGenerateContent?alt=sse, got %s", r.URL.String())
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"你好\"}]}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Gemini\"}]}}]}\n\n"))
+	}))
+	defer srv.Close()
+
+	var deltas strings.Builder
+	resp, err := callLLMStream(context.Background(), config.LLMConfig{
+		Provider: "gemini",
+		BaseURL:  srv.URL,
+		APIKey:   "gm-key",
+		Model:    "gemini-2.5-flash",
+	}, "sys", []ChatMessage{{Role: "user", Text: "hi"}}, nil, StreamCallbacks{
+		OnTextDelta: func(d string) { deltas.WriteString(d) },
+	})
+	if err != nil {
+		t.Fatalf("Gemini SSE failed: %v", err)
+	}
+	if resp.Text != "你好Gemini" || deltas.String() != "你好Gemini" {
+		t.Fatalf("unexpected Gemini SSE output: resp=%+v deltas=%q", resp, deltas.String())
+	}
+}
+
+func TestAgentStartChatAsyncReplayAndCancel(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	ag := NewAgent(config.LLMConfig{
+		Provider:   "openai",
+		BaseURL:    srv.URL,
+		APIKey:     "sk-test",
+		Model:      "m1",
+		TimeoutSec: 5,
+	}, &mockExec{}, nil)
+
+	runID, err := ag.StartChatAsync("长耗时任务")
+	if err != nil || runID == "" {
+		t.Fatalf("StartChatAsync failed: runID=%q err=%v", runID, err)
+	}
+	snap, ch, unsub, ok := ag.SubscribeRun(runID, 0)
+	if !ok {
+		t.Fatalf("expected SubscribeRun to find %s", runID)
+	}
+	defer unsub()
+	if snap.RunID != runID {
+		t.Fatalf("unexpected runID in snapshot: %+v", snap)
+	}
+
+	<-started
+	if !ag.IsRunning() {
+		t.Fatal("expected IsRunning() true while LLM call is blocked")
+	}
+	if !ag.CancelActive("user stop") {
+		t.Fatal("expected CancelActive to cancel active async run")
+	}
+
+	deadline := time.After(2 * time.Second)
+	sawCancelled := false
+	for _, ev := range snap.Events {
+		if ev.Type == "cancelled" {
+			sawCancelled = true
+		}
+	}
+	for !sawCancelled {
+		select {
+		case ev, more := <-ch:
+			if !more {
+				goto checkReplay
+			}
+			if ev.Type == "cancelled" {
+				sawCancelled = true
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for cancelled event from SubscribeRun")
+		}
+	}
+
+checkReplay:
+	if !sawCancelled {
+		t.Fatal("expected cancelled event from subscriber")
+	}
+	replay := ag.ReplayEvents(runID, 0)
+	if !replay.Finished || replay.Active {
+		t.Fatalf("expected finished replay snapshot after cancel, got %+v", replay)
+	}
+	foundReplayCancel := false
+	for _, ev := range replay.Events {
+		if ev.Type == "cancelled" {
+			foundReplayCancel = true
+		}
+	}
+	if !foundReplayCancel {
+		t.Fatalf("expected cancelled event in ReplayEvents: %+v", replay.Events)
 	}
 }

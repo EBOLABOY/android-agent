@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,9 +31,38 @@ import (
 
 const (
 	ServerName          = "android-agent"
-	ServerVersion       = "0.3.2-hardened"
+	ServerVersion       = "0.3.3-streaming"
 	DefaultProtoVersion = "2025-03-26"
 )
+
+type backendIslandAdapter struct {
+	be backend.DeviceBackend
+}
+
+func (a *backendIslandAdapter) UpdateLiveProgress(ctx context.Context, u brain.LiveProgressUpdate) error {
+	if a == nil || a.be == nil {
+		return nil
+	}
+	return a.be.UpdateLiveProgress(ctx, backend.LiveProgressSpec{
+		Tag:       u.Tag,
+		ID:        u.ID,
+		Title:     u.Title,
+		Text:      u.Text,
+		ShortText: u.ShortText,
+		SubText:   u.SubText,
+		Step:      u.Step,
+		Max:       u.Max,
+		Focus:     u.Focus,
+		Ongoing:   u.Ongoing,
+	})
+}
+
+func (a *backendIslandAdapter) CancelLiveProgress(ctx context.Context, tag string, id int) error {
+	if a == nil || a.be == nil {
+		return nil
+	}
+	return a.be.CancelLiveProgress(ctx, tag, id)
+}
 
 type Server struct {
 	cfg        *config.Config
@@ -43,6 +73,7 @@ type Server struct {
 	runner     *workflows.Runner
 	memory     *brain.MemoryStore
 	agent      *brain.Agent
+	island     *brain.IslandController
 	jobs       *brain.JobManager
 	scheduler  *brain.Scheduler
 	started    time.Time
@@ -88,6 +119,8 @@ func NewServer(cfg *config.Config, be backend.DeviceBackend, g *guard.Guard, cdp
 	_ = s.memory.EnsureDefaults()
 	s.agent = brain.NewAgent(cfg.LLM, s, g)
 	s.agent.SetMemoryStore(s.memory)
+	s.island = brain.NewIslandController(&backendIslandAdapter{be: be})
+	s.agent.SetEventObserver(s.island.HandleEvent)
 	s.scheduler = brain.NewScheduler(cfg.Schedule, g, s.jobs, "", s.runWorkflowJob, logger)
 
 	apiMux := http.NewServeMux()
@@ -100,6 +133,9 @@ func NewServer(cfg *config.Config, be backend.DeviceBackend, g *guard.Guard, cdp
 	apiMux.HandleFunc("/api/v1/jobs/run", s.handleJobRun)
 	apiMux.HandleFunc("/api/v1/jobs/cancel", s.handleJobCancel)
 	apiMux.HandleFunc("/api/v1/chat", s.handleChat)
+	apiMux.HandleFunc("/api/v1/chat/stream", s.handleChatStream)
+	apiMux.HandleFunc("/api/v1/chat/events", s.handleChatEvents)
+	apiMux.HandleFunc("/api/v1/chat/cancel", s.handleChatCancel)
 	apiMux.HandleFunc("/api/v1/chat/history", s.handleChatHistory)
 	apiMux.HandleFunc("/api/v1/chat/clear", s.handleChatClear)
 	apiMux.HandleFunc("/api/v1/llm/config", s.handleLLMConfig)
@@ -179,6 +215,9 @@ func (s *Server) StopForGuard(reason string) {
 	if s.jobs != nil {
 		s.jobs.Cancel("guard blocked: " + reason)
 	}
+	if s.island != nil {
+		s.island.ClearImmediate(reason)
+	}
 	if s.backend != nil {
 		s.backend.StopMicroKernel(reason)
 	}
@@ -230,6 +269,9 @@ func (s *Server) Addr() string {
 func (s *Server) Close() {
 	if s.agent != nil {
 		s.agent.CancelActive("server shutdown")
+	}
+	if s.island != nil {
+		s.island.ClearImmediate("server shutdown")
 	}
 	if s.backend != nil {
 		s.backend.StopMicroKernel("server shutdown")
@@ -376,8 +418,10 @@ func (s *Server) buildStatus(ctx context.Context) map[string]any {
 		"touch":               s.backend.TouchStatus(),
 		"uptime_sec":          int64(time.Since(s.started).Seconds()),
 		"listen_addr":  s.cfg.ListenAddr,
-		"guard":        s.guard.Status(),
-		"cdp":          s.cdp.Probe(ctx),
+		"guard":               s.guard.Status(),
+		"island":              s.island.Status(),
+		"chat_active":         s.agent.IsRunning(),
+		"cdp":                 s.cdp.Probe(ctx),
 		"sys_socket":   "@" + strings.TrimPrefix(s.cfg.SysSocket, "@"),
 		"sys_phase2":   "planned (not enabled in phase 1)",
 		"default_shot": map[string]int{"width": s.cfg.ScreenshotWidth, "jpeg_quality": s.cfg.ScreenshotJPEGQuality},
@@ -500,6 +544,151 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Message string `json:"message"`
+		Async   bool   `json:"async"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+		return
+	}
+
+	runID, err := s.agent.StartChatAsync(body.Message)
+	if err != nil {
+		if errors.Is(err, brain.ErrChatBusy) {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	if body.Async {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"ok":     true,
+			"run_id": runID,
+		})
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	snap, ch, unsub, found := s.agent.SubscribeRun(runID, 0)
+	if !found {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "run not found"})
+		return
+	}
+	defer unsub()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	s.sseMu.Lock()
+	s.nextSSEID++
+	sseID := s.nextSSEID
+	s.sseCancels[sseID] = cancel
+	s.sseMu.Unlock()
+	defer func() {
+		cancel()
+		s.sseMu.Lock()
+		delete(s.sseCancels, sseID)
+		s.sseMu.Unlock()
+	}()
+
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	writeSSE := func(ev brain.RunEvent) bool {
+		b, merr := json.Marshal(ev)
+		if merr != nil {
+			return true
+		}
+		if _, werr := fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", ev.Seq, ev.Type, b); werr != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+
+	for _, ev := range snap.Events {
+		if !writeSSE(ev) {
+			return
+		}
+		if ev.Type == "done" || ev.Type == "cancelled" || ev.Type == "error" {
+			return
+		}
+	}
+	if snap.Finished || ch == nil {
+		return
+	}
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, werr := io.WriteString(w, ": heartbeat\n\n"); werr != nil {
+				return
+			}
+			flusher.Flush()
+		case ev, more := <-ch:
+			if !more {
+				return
+			}
+			if !writeSSE(ev) {
+				return
+			}
+			if ev.Type == "done" || ev.Type == "cancelled" || ev.Type == "error" {
+				return
+			}
+		}
+	}
+}
+
+func (s *Server) handleChatEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	q := r.URL.Query()
+	runID := strings.TrimSpace(q.Get("run_id"))
+	afterSeq := 0
+	if rawSeq := strings.TrimSpace(q.Get("after_seq")); rawSeq != "" {
+		if n, err := strconv.Atoi(rawSeq); err == nil && n >= 0 {
+			afterSeq = n
+		}
+	}
+	snap := s.agent.ReplayEvents(runID, afterSeq)
+	writeJSON(w, http.StatusOK, snap)
+}
+
+func (s *Server) handleChatCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	cancelled := s.agent.CancelActive("manual UI stop")
+	if s.island != nil && !cancelled && !s.agent.IsRunning() {
+		s.island.ClearImmediate("manual UI stop")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"cancelled": cancelled,
+	})
 }
 
 func (s *Server) handleChatHistory(w http.ResponseWriter, r *http.Request) {

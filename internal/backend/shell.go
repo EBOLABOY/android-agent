@@ -910,3 +910,44 @@ func (b *ShellBackend) PostNotification(ctx context.Context, tag, title, text st
 	}
 	return nil
 }
+
+func (b *ShellBackend) UpdateLiveProgress(ctx context.Context, spec LiveProgressSpec) error {
+	if b.kernel == nil {
+		return b.PostNotification(ctx, spec.Tag, spec.Title, spec.Text)
+	}
+	focus := spec.Focus
+	ongoing := spec.Ongoing
+	cctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+	_, err := b.kernel.Call(cctx, kernelRequest{
+		Cmd:       "notify_progress",
+		Tag:       spec.Tag,
+		ID:        spec.ID,
+		Title:     spec.Title,
+		Text:      spec.Text,
+		ShortText: spec.ShortText,
+		SubText:   spec.SubText,
+		Step:      spec.Step,
+		Max:       spec.Max,
+		Focus:     &focus,
+		Ongoing:   &ongoing,
+	})
+	if err != nil {
+		return b.PostNotification(cctx, spec.Tag, spec.Title, spec.Text)
+	}
+	return nil
+}
+
+func (b *ShellBackend) CancelLiveProgress(ctx context.Context, tag string, id int) error {
+	if b.kernel == nil {
+		return nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
+	defer cancel()
+	_, err := b.kernel.Call(cctx, kernelRequest{
+		Cmd: "notify_cancel",
+		Tag: tag,
+		ID:  id,
+	})
+	return err
+}
