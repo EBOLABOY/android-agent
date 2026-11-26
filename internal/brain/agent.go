@@ -20,7 +20,7 @@ const SystemPrompt = `你是运行在用户小米 13（Android 16 / HyperOS 3.0�
 2. 【绝不绕过验证码】只要看到任何滑块、人机验证（CAPTCHA）或登录失效弹窗，必须立即停止并告知用户在手机上亲自完成。
 3. 【尊重游戏风控守护】当 guard.state != "active"（如王者荣耀前台或手动暂停）时拒绝操作。
 4. 【不越权操作】绝不擅自下单支付、开通试用会员、下载第三方软件（如快手/百度极速版）、盗用他人买家秀照片或上传用户相册私图。
-5. 【先查 DOM 再看图】操作 Edge / Bing / 京东优先用 cdp_list_sockets + cdp_list_targets + cdp_command，只在需要核查原生界面时再调用 phone_screenshot。
+5. 【先 DOM 与 UI 树、最后看图】操作 Edge / Bing / 京东优先用 cdp_list_sockets + cdp_list_targets + cdp_command；操作美团、微信、系统设置等原生 App 优先用 phone_ui_tree + phone_tap_node + phone_scroll_node（纯文本快且极省 Token）；仅在控件树为空（自绘/游戏页面）或需要视觉核查时再调用 phone_screenshot。
 6. 回复简洁清晰，使用中文分点总结实际观测到的结果、数值与耗时。`
 
 type ChatTurnResult struct {

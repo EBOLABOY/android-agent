@@ -68,6 +68,14 @@ type ShellBackend struct {
 	clipMu          sync.Mutex
 	clipHelperReady bool
 
+	kernel *MicroKernel
+
+	uiCacheMu  sync.RWMutex
+	uiCache    map[int]UINode
+	uiCachePkg string
+	uiCacheW   int
+	uiCacheH   int
+
 	screenMu     sync.RWMutex
 	cachedScreen ScreenInfo
 }
@@ -79,14 +87,17 @@ func NewShellBackend(clipHelperPath string, shellTimeout time.Duration) *ShellBa
 	if shellTimeout <= 0 {
 		shellTimeout = 10 * time.Second
 	}
-	return &ShellBackend{
+	b := &ShellBackend{
 		clipHelperPath: clipHelperPath,
 		shellTimeout:   shellTimeout,
+		uiCache:        make(map[int]UINode),
 	}
+	b.kernel = NewMicroKernel(b.ensureClipHelper, defaultKernelIdleTimeout)
+	return b
 }
 
 func (b *ShellBackend) Name() string {
-	return "shell-fallback-phase1"
+	return "hybrid-layered-v2"
 }
 
 func (b *ShellBackend) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -312,12 +323,16 @@ func (b *ShellBackend) ensureClipHelper() (string, error) {
 	defer b.clipMu.Unlock()
 
 	if b.clipHelperReady {
-		if st, err := os.Stat(b.clipHelperPath); err == nil && st.Size() == int64(len(embeddedClipHelperJar)) {
+		if fileMatchesBytes(b.clipHelperPath, embeddedClipHelperJar) {
 			return b.clipHelperPath, nil
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(b.clipHelperPath), 0o755); err != nil {
 		return "", fmt.Errorf("mkdir cliphelper dir: %w", err)
+	}
+	if fileMatchesBytes(b.clipHelperPath, embeddedClipHelperJar) {
+		b.clipHelperReady = true
+		return b.clipHelperPath, nil
 	}
 	tmpPath := b.clipHelperPath + ".tmp"
 	if err := os.WriteFile(tmpPath, embeddedClipHelperJar, 0o644); err != nil {
@@ -378,12 +393,156 @@ func (b *ShellBackend) runClipHelper(ctx context.Context, action string, stdin s
 }
 
 func (b *ShellBackend) SetClipboard(ctx context.Context, text string) error {
+	cctx, cancel := b.withTimeout(ctx)
+	defer cancel()
+	if b.kernel != nil {
+		if _, err := b.kernel.Call(cctx, kernelRequest{Cmd: "clip_set", Text: text}); err == nil {
+			return nil
+		}
+	}
 	_, err := b.runClipHelper(ctx, "set", text)
 	return err
 }
 
 func (b *ShellBackend) GetClipboard(ctx context.Context) (string, error) {
+	cctx, cancel := b.withTimeout(ctx)
+	defer cancel()
+	if b.kernel != nil {
+		if resp, err := b.kernel.Call(cctx, kernelRequest{Cmd: "clip_get"}); err == nil {
+			return resp.Text, nil
+		}
+	}
 	return b.runClipHelper(ctx, "get", "")
+}
+
+func (b *ShellBackend) StopMicroKernel(reason string) {
+	if b.kernel != nil {
+		b.kernel.Stop(reason)
+	}
+	b.uiCacheMu.Lock()
+	b.uiCache = make(map[int]UINode)
+	b.uiCachePkg = ""
+	b.uiCacheMu.Unlock()
+}
+
+func (b *ShellBackend) MicroKernelRunning() bool {
+	return b.kernel != nil && b.kernel.Running()
+}
+
+func (b *ShellBackend) UITree(ctx context.Context, opts UITreeOptions) (*UITreeResult, error) {
+	opts = opts.normalized()
+	cctx, cancel := b.withTimeout(ctx)
+	defer cancel()
+
+	start := time.Now()
+	resp, err := b.kernel.Call(cctx, kernelRequest{
+		Cmd:      "ui_tree",
+		MaxDepth: opts.MaxDepth,
+		MaxNodes: opts.MaxNodes,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	screenW, screenH := resp.Width, resp.Height
+	if screenW <= 0 || screenH <= 0 {
+		b.screenMu.RLock()
+		screenW, screenH = b.cachedScreen.Width, b.cachedScreen.Height
+		b.screenMu.RUnlock()
+		if screenW <= 0 || screenH <= 0 {
+			if scr, serr := b.ScreenInfo(cctx); serr == nil {
+				screenW, screenH = scr.Width, scr.Height
+			} else {
+				screenW, screenH = 1080, 2400
+			}
+		}
+	}
+
+	res := PurifyUITree(resp.Nodes, resp.Package, screenW, screenH, opts)
+	res.ElapsedMs = time.Since(start).Milliseconds()
+	if resp.RawCount > res.RawCount {
+		res.RawCount = resp.RawCount
+	}
+	if resp.Truncated {
+		res.Truncated = true
+	}
+
+	b.uiCacheMu.Lock()
+	b.uiCache = make(map[int]UINode, len(res.Nodes))
+	for _, n := range res.Nodes {
+		b.uiCache[n.ID] = n
+	}
+	b.uiCachePkg = res.Package
+	b.uiCacheW = res.ScreenWidth
+	b.uiCacheH = res.ScreenHeight
+	b.uiCacheMu.Unlock()
+
+	return res, nil
+}
+
+func (b *ShellBackend) TapNode(ctx context.Context, id int) (*UINode, int, int, error) {
+	b.uiCacheMu.RLock()
+	node, ok := b.uiCache[id]
+	sw, sh := b.uiCacheW, b.uiCacheH
+	b.uiCacheMu.RUnlock()
+	if !ok {
+		return nil, 0, 0, fmt.Errorf("ui node id %d not found in cache; call phone_ui_tree first", id)
+	}
+	x, y := TapPointForNode(node, sw, sh)
+	if err := b.Tap(ctx, x, y); err != nil {
+		return &node, x, y, err
+	}
+	return &node, x, y, nil
+}
+
+func (b *ShellBackend) ScrollNode(ctx context.Context, id int, direction string, distance float64, durationMs int) ([4]int, [4]int, error) {
+	var bounds [4]int
+	b.uiCacheMu.RLock()
+	sw, sh := b.uiCacheW, b.uiCacheH
+	if id > 0 {
+		node, ok := b.uiCache[id]
+		if !ok {
+			b.uiCacheMu.RUnlock()
+			return bounds, [4]int{}, fmt.Errorf("ui node id %d not found in cache; call phone_ui_tree first", id)
+		}
+		bounds = node.Bounds
+	} else {
+		bestArea := 0
+		for _, n := range b.uiCache {
+			if !n.Scrollable {
+				continue
+			}
+			area := (n.Bounds[2] - n.Bounds[0]) * (n.Bounds[3] - n.Bounds[1])
+			if area > bestArea {
+				bestArea = area
+				bounds = n.Bounds
+			}
+		}
+	}
+	b.uiCacheMu.RUnlock()
+
+	if bounds[2] <= bounds[0] || bounds[3] <= bounds[1] {
+		if sw <= 0 || sh <= 0 {
+			if scr, err := b.ScreenInfo(ctx); err == nil {
+				sw, sh = scr.Width, scr.Height
+			} else {
+				sw, sh = 1080, 2400
+			}
+		}
+		bounds = [4]int{60, 260, sw - 60, sh - 240}
+	}
+
+	x1, y1, x2, y2, err := ScrollCoordsForBounds(bounds, direction, distance)
+	if err != nil {
+		return bounds, [4]int{}, err
+	}
+	if durationMs <= 0 {
+		durationMs = 340
+	}
+	if err := b.Swipe(ctx, x1, y1, x2, y2, durationMs); err != nil {
+		return bounds, [4]int{x1, y1, x2, y2}, err
+	}
+	return bounds, [4]int{x1, y1, x2, y2}, nil
 }
 
 func (b *ShellBackend) ForegroundApp(ctx context.Context) (ForegroundInfo, error) {

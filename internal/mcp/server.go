@@ -157,6 +157,9 @@ func (s *Server) StopForGuard(reason string) {
 	if s.jobs != nil {
 		s.jobs.Cancel("guard blocked: " + reason)
 	}
+	if s.backend != nil {
+		s.backend.StopMicroKernel(reason)
+	}
 	s.cancelAllSSE()
 	s.srvMu.Lock()
 	hs := s.httpServer
@@ -203,6 +206,9 @@ func (s *Server) Addr() string {
 
 // Close permanently shuts down the server.
 func (s *Server) Close() {
+	if s.backend != nil {
+		s.backend.StopMicroKernel("server shutdown")
+	}
 	s.cancelAllSSE()
 	s.srvMu.Lock()
 	s.closed = true
@@ -258,10 +264,11 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) buildStatus(ctx context.Context) map[string]any {
 	resp := map[string]any{
-		"server":       ServerName,
-		"version":      ServerVersion,
-		"backend":      s.backend.Name(),
-		"uptime_sec":   int64(time.Since(s.started).Seconds()),
+		"server":              ServerName,
+		"version":             ServerVersion,
+		"backend":             s.backend.Name(),
+		"microkernel_running": s.backend.MicroKernelRunning(),
+		"uptime_sec":          int64(time.Since(s.started).Seconds()),
 		"listen_addr":  s.cfg.ListenAddr,
 		"guard":        s.guard.Status(),
 		"cdp":          s.cdp.Probe(ctx),
@@ -805,6 +812,66 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		}
 		return textJSONResult(map[string]any{"ok": true, "x": px, "y": py}, false)
 
+	case "phone_ui_tree":
+		opts := backend.UITreeOptions{
+			MaxDepth:  getInt(args, "max_depth", 0),
+			MaxNodes:  getInt(args, "max_nodes", 0),
+			MaxTokens: getInt(args, "max_tokens", 0),
+		}
+		res, err := s.backend.UITree(ctx, opts)
+		if err != nil {
+			return textErrorResult(fmt.Sprintf("ui_tree unavailable (%v); fall back to phone_screenshot or cdp_*", err))
+		}
+		outText := fmt.Sprintf("Timing: %dms | raw=%d | truncated=%v\n%s", res.ElapsedMs, res.RawCount, res.Truncated, res.Text)
+		if res.Empty && res.FallbackHint != "" {
+			outText += "\nHint: " + res.FallbackHint
+		}
+		return map[string]any{
+			"content": []map[string]any{
+				{"type": "text", "text": outText},
+			},
+			"isError": false,
+		}
+
+	case "phone_tap_node":
+		id, ok := getIntStrict(args, "id")
+		if !ok || id <= 0 {
+			return textErrorResult("positive integer node id is required")
+		}
+		node, x, y, err := s.backend.TapNode(ctx, id)
+		if err != nil {
+			return textErrorResult(err.Error())
+		}
+		return textJSONResult(map[string]any{
+			"ok":    true,
+			"id":    id,
+			"label": node.Label,
+			"type":  node.Type,
+			"x":     x,
+			"y":     y,
+		}, false)
+
+	case "phone_scroll_node":
+		id := getInt(args, "id", 0)
+		dir := getString(args, "direction", "down")
+		dur := getInt(args, "duration_ms", 340)
+		dist := 0.65
+		if v, ok := args["distance"].(float64); ok && v > 0 {
+			dist = v
+		}
+		bounds, swipe, err := s.backend.ScrollNode(ctx, id, dir, dist, dur)
+		if err != nil {
+			return textErrorResult(err.Error())
+		}
+		return textJSONResult(map[string]any{
+			"ok":          true,
+			"id":          id,
+			"direction":   dir,
+			"bounds":      bounds,
+			"swipe":       swipe,
+			"duration_ms": dur,
+		}, false)
+
 	case "phone_long_press":
 		x, okX := getIntStrict(args, "x")
 		y, okY := getIntStrict(args, "y")
@@ -1070,6 +1137,42 @@ func toolDefinitions() []map[string]any {
 			"name":        "phone_status",
 			"description": "Get Xiaomi 13 agent status: screen resolution, backend mode, game-guard state, and Chrome CDP socket availability.",
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			"name":        "phone_ui_tree",
+			"description": "Read current screen's in-memory UI hierarchy via UiAutomation (<50ms, no screenshot), purify invisible/redundant nodes, cache ID->bounds mapping, and return a numbered plain-text node list within 300-500 tokens. Falls back cleanly on self-drawn/WebView pages.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"max_depth":  map[string]any{"type": "integer", "description": "Max traversal depth (default 36)"},
+					"max_nodes":  map[string]any{"type": "integer", "description": "Max raw accessibility nodes visited (default 1200)"},
+					"max_tokens": map[string]any{"type": "integer", "description": "Approximate token budget for compressed output (default 450)"},
+				},
+			},
+		},
+		{
+			"name":        "phone_tap_node",
+			"description": "Tap a UI element by its [id] from the latest phone_ui_tree output, computing the center with bounded random offset.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id": map[string]any{"type": "integer", "description": "Node ID from phone_ui_tree"},
+				},
+				"required": []string{"id"},
+			},
+		},
+		{
+			"name":        "phone_scroll_node",
+			"description": "Scroll inside a scrollable UI container [id] (or largest scrollable list if id is omitted/0) cached from phone_ui_tree.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id":          map[string]any{"type": "integer", "description": "Optional scrollable container ID from phone_ui_tree (0 = auto-pick main list)"},
+					"direction":   map[string]any{"type": "string", "enum": []string{"down", "up", "left", "right"}, "description": "Content scroll direction (default down)"},
+					"distance":    map[string]any{"type": "number", "description": "Fraction of container span to drag (default 0.65)"},
+					"duration_ms": map[string]any{"type": "integer", "description": "Swipe duration in ms (default 340)"},
+				},
+			},
 		},
 		{
 			"name":        "phone_screenshot",

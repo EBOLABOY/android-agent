@@ -40,4 +40,9 @@ type DeviceBackend interface {
 	LaunchApp(ctx context.Context, pkg string) error
 	OpenDeepLink(ctx context.Context, uri, pkg string) error
 	PostNotification(ctx context.Context, tag, title, text string) error
+	UITree(ctx context.Context, opts UITreeOptions) (*UITreeResult, error)
+	TapNode(ctx context.Context, id int) (*UINode, int, int, error)
+	ScrollNode(ctx context.Context, id int, direction string, distance float64, durationMs int) ([4]int, [4]int, error)
+	StopMicroKernel(reason string)
+	MicroKernelRunning() bool
 }

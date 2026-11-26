@@ -5,9 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GO_BIN="${GO_BIN:-$(command -v go 2>/dev/null || echo /root/router-dashboard/go/bin/go)}"
 SMALI_JAR="${SMALI_JAR:-/usr/share/java/smali.jar}"
 
-echo "==> [1/4] Assembling cliphelper.jar from AgentClip.smali"
+echo "==> [1/4] Assembling cliphelper.jar (AgentClip + AgentKernel)"
 mkdir -p "$ROOT_DIR/build/clip" "$ROOT_DIR/internal/backend" "$ROOT_DIR/ksu-module/bin"
-java -jar "$SMALI_JAR" assemble -a 34 -o "$ROOT_DIR/build/clip/classes.dex" "$ROOT_DIR/cliphelper/AgentClip.smali"
+java -jar "$SMALI_JAR" assemble -a 34 -o "$ROOT_DIR/build/clip/classes.dex" "$ROOT_DIR/cliphelper"
 (cd "$ROOT_DIR/build/clip" && jar cf "$ROOT_DIR/internal/backend/cliphelper.jar" classes.dex)
 
 echo "==> [2/4] Running Go unit & integration tests on host"

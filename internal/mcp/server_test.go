@@ -25,10 +25,13 @@ import (
 )
 
 type fakeBackend struct {
-	mu       sync.Mutex
-	lastTap  [2]int
-	lastText string
-	clip     string
+	mu               sync.Mutex
+	lastTap          [2]int
+	lastSwipe        [4]int
+	lastText         string
+	clip             string
+	microKernelStops int
+	cachedNodes      map[int]backend.UINode
 }
 
 func (f *fakeBackend) Name() string { return "fake-test-backend" }
@@ -87,8 +90,53 @@ func (f *fakeBackend) ForegroundApp(_ context.Context) (backend.ForegroundInfo, 
 	return backend.ForegroundInfo{Package: "com.miui.home", Activity: ".launcher.Launcher"}, nil
 }
 func (f *fakeBackend) LaunchApp(_ context.Context, _ string) error                   { return nil }
-func (f *fakeBackend) OpenDeepLink(_ context.Context, _, _ string) error             { return nil }
-func (f *fakeBackend) PostNotification(_ context.Context, _, _, _ string) error      { return nil }
+func (f *fakeBackend) OpenDeepLink(_ context.Context, _, _ string) error        { return nil }
+func (f *fakeBackend) PostNotification(_ context.Context, _, _, _ string) error { return nil }
+func (f *fakeBackend) UITree(_ context.Context, opts backend.UITreeOptions) (*backend.UITreeResult, error) {
+	raw := []backend.RawUINode{
+		{Cls: "android.widget.EditText", Text: "搜索商家、商品", Bounds: [4]int{60, 120, 960, 220}, Flags: "ce", Depth: 3},
+		{Cls: "android.widget.Button", Text: "外卖", Bounds: [4]int{80, 300, 260, 420}, Flags: "c", Depth: 3},
+		{Cls: "androidx.recyclerview.widget.RecyclerView", Bounds: [4]int{0, 450, 1080, 2200}, Flags: "s", Depth: 2},
+	}
+	res := backend.PurifyUITree(raw, "com.sankuai.meituan", 1080, 2400, opts)
+	f.mu.Lock()
+	f.cachedNodes = make(map[int]backend.UINode, len(res.Nodes))
+	for _, n := range res.Nodes {
+		f.cachedNodes[n.ID] = n
+	}
+	f.mu.Unlock()
+	return res, nil
+}
+func (f *fakeBackend) TapNode(ctx context.Context, id int) (*backend.UINode, int, int, error) {
+	f.mu.Lock()
+	n, ok := f.cachedNodes[id]
+	f.mu.Unlock()
+	if !ok {
+		return nil, 0, 0, context.DeadlineExceeded
+	}
+	x, y := backend.TapPointForNode(n, 1080, 2400)
+	_ = f.Tap(ctx, x, y)
+	return &n, x, y, nil
+}
+func (f *fakeBackend) ScrollNode(_ context.Context, id int, direction string, distance float64, _ int) ([4]int, [4]int, error) {
+	f.mu.Lock()
+	n := f.cachedNodes[id]
+	f.mu.Unlock()
+	if n.Bounds[2] <= n.Bounds[0] {
+		n.Bounds = [4]int{0, 450, 1080, 2200}
+	}
+	x1, y1, x2, y2, err := backend.ScrollCoordsForBounds(n.Bounds, direction, distance)
+	f.mu.Lock()
+	f.lastSwipe = [4]int{x1, y1, x2, y2}
+	f.mu.Unlock()
+	return n.Bounds, [4]int{x1, y1, x2, y2}, err
+}
+func (f *fakeBackend) StopMicroKernel(_ string) {
+	f.mu.Lock()
+	f.microKernelStops++
+	f.mu.Unlock()
+}
+func (f *fakeBackend) MicroKernelRunning() bool { return false }
 
 type testDetector struct {
 	mu  sync.Mutex
@@ -281,9 +329,45 @@ func TestMCPAuthToolsAndGameGuardListenerShutdown(t *testing.T) {
 		"params":  map[string]any{"name": "agent_resume"},
 	})
 
-	// 9. Game-guard entering com.tencent.tmgp.sgame MUST close the TCP listener completely
+	// 8b. phone_ui_tree + phone_tap_node + phone_scroll_node
+	_, out = postMCP(cfg.BearerToken, sid, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      81,
+		"method":  "tools/call",
+		"params":  map[string]any{"name": "phone_ui_tree"},
+	})
+	uiTxt := out["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(uiTxt, "[1] Input") || !strings.Contains(uiTxt, "搜索商家、商品") {
+		t.Fatalf("unexpected phone_ui_tree output: %s", uiTxt)
+	}
+	_, out = postMCP(cfg.BearerToken, sid, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      82,
+		"method":  "tools/call",
+		"params":  map[string]any{"name": "phone_tap_node", "arguments": map[string]any{"id": 2}},
+	})
+	if out["result"].(map[string]any)["isError"] == true {
+		t.Fatalf("phone_tap_node failed: %v", out)
+	}
+	if fb.lastTap[0] < 80 || fb.lastTap[0] > 260 || fb.lastTap[1] < 300 || fb.lastTap[1] > 420 {
+		t.Fatalf("tap_node outside node bounds: %v", fb.lastTap)
+	}
+	_, out = postMCP(cfg.BearerToken, sid, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      83,
+		"method":  "tools/call",
+		"params":  map[string]any{"name": "phone_scroll_node", "arguments": map[string]any{"id": 3, "direction": "down"}},
+	})
+	if out["result"].(map[string]any)["isError"] == true || fb.lastSwipe[1] <= fb.lastSwipe[3] {
+		t.Fatalf("phone_scroll_node invalid swipe: %v out=%v", fb.lastSwipe, out)
+	}
+
+	// 9. Game-guard entering com.tencent.tmgp.sgame MUST close the TCP listener and stop micro-kernel
 	det.set("com.tencent.tmgp.sgame")
 	g.CheckOnce(context.Background())
+	if fb.microKernelStops == 0 {
+		t.Fatal("expected StopMicroKernel to be called when sgame enters foreground")
+	}
 	if srv.IsListening() {
 		t.Fatal("expected server listener to be closed while sgame is active")
 	}
