@@ -33,7 +33,7 @@ import (
 
 const (
 	ServerName          = "android-agent"
-	ServerVersion       = "0.3.4"
+	ServerVersion       = "0.3.5"
 	DefaultProtoVersion = "2025-03-26"
 	mcpSessionTTL       = 2 * time.Hour
 )
@@ -486,7 +486,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="android-agent"`)
+			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeJSON(w, http.StatusUnauthorized, map[string]any{
 				"error": "missing or malformed Authorization Bearer token",
 			})
@@ -497,7 +497,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		gotDigest := sha256.Sum256([]byte(got))
 		expDigest := sha256.Sum256([]byte(expected))
 		if expected == "" || subtle.ConstantTimeCompare(gotDigest[:], expDigest[:]) != 1 {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="android-agent", error="invalid_token"`)
+			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
 			writeJSON(w, http.StatusUnauthorized, map[string]any{
 				"error": "invalid Authorization Bearer token",
 			})

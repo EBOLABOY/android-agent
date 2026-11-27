@@ -204,3 +204,72 @@ func TestMicroKernelGracefulEOFShutdownBeforeSIGKILL(t *testing.T) {
 		t.Fatalf("expected child process to observe stdin EOF and exit gracefully before SIGKILL: %v", err)
 	}
 }
+
+func TestClipHelperPrivatePermsAndCleanupOnStopAndIdle(t *testing.T) {
+	base := t.TempDir()
+	cacheDir := filepath.Join(base, ".ag_cache")
+	jarPath := filepath.Join(cacheDir, "helper.jar")
+
+	// Default and legacy path migration check
+	if def := NewShellBackend("", time.Second); def.clipHelperPath != defaultClipHelperPath {
+		t.Fatalf("expected default clipHelperPath %q, got %q", defaultClipHelperPath, def.clipHelperPath)
+	}
+	if mig := NewShellBackend(legacyClipHelperPath, time.Second); mig.clipHelperPath != defaultClipHelperPath {
+		t.Fatalf("expected legacy clipHelperPath to migrate to %q, got %q", defaultClipHelperPath, mig.clipHelperPath)
+	}
+
+	be := NewShellBackend(jarPath, time.Second)
+	gotPath, err := be.ensureClipHelper()
+	if err != nil || gotPath != jarPath {
+		t.Fatalf("ensureClipHelper failed: path=%q err=%v", gotPath, err)
+	}
+
+	dirInfo, err := os.Stat(cacheDir)
+	if err != nil {
+		t.Fatalf("stat private cache dir failed: %v", err)
+	}
+	if perm := dirInfo.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("expected .ag_cache dir mode 0700, got %04o", perm)
+	}
+
+	fileInfo, err := os.Stat(jarPath)
+	if err != nil {
+		t.Fatalf("stat helper.jar failed: %v", err)
+	}
+	if perm := fileInfo.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("expected helper.jar mode 0600, got %04o", perm)
+	}
+
+	// StopMicroKernel MUST remove both helper.jar and .ag_cache directory
+	be.StopMicroKernel("guard test")
+	if _, err := os.Stat(jarPath); !os.IsNotExist(err) {
+		t.Fatalf("expected helper.jar removed after StopMicroKernel, stat err=%v", err)
+	}
+	if _, err := os.Stat(cacheDir); !os.IsNotExist(err) {
+		t.Fatalf("expected .ag_cache dir removed after StopMicroKernel, stat err=%v", err)
+	}
+
+	// Idle microkernel exit MUST also remove helper.jar and .ag_cache directory
+	be.kernel = NewMicroKernel(be.ensureClipHelper, 40*time.Millisecond)
+	be.kernel.SetOnStop(be.cleanupClipHelper)
+	be.kernel.cmdFactory = func(_ string, _ bool) *exec.Cmd {
+		return exec.Command("/bin/sh", "-c", `while IFS= read -r line; do printf '{"ok":true,"pong":true}\n'; done`)
+	}
+	if _, err := be.kernel.Call(context.Background(), kernelRequest{Cmd: "ping"}); err != nil {
+		t.Fatalf("idle test ping failed: %v", err)
+	}
+	if _, err := os.Stat(jarPath); err != nil {
+		t.Fatalf("expected helper.jar to exist while microkernel active: %v", err)
+	}
+
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		_, jErr := os.Stat(jarPath)
+		_, dErr := os.Stat(cacheDir)
+		if os.IsNotExist(jErr) && os.IsNotExist(dErr) {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatalf("expected helper.jar and .ag_cache to be removed after microkernel idle exit")
+}

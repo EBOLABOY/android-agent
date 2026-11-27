@@ -124,6 +124,7 @@ func (p *kernelProc) closeStop() {
 // or immediately when Stop is called (e.g. game-guard trigger).
 type MicroKernel struct {
 	ensureJar   func() (string, error)
+	onStop      func()
 	cmdFactory  kernelCommandFactory
 	idleTimeout time.Duration
 
@@ -134,6 +135,14 @@ type MicroKernel struct {
 	gen       uint64
 	stopSeq   uint64
 	idleTimer *time.Timer
+}
+
+// SetOnStop registers a cleanup callback invoked after the microkernel terminates
+// via Stop() or idle timeout (e.g. to remove the private helper JAR cache).
+func (m *MicroKernel) SetOnStop(fn func()) {
+	m.stateMu.Lock()
+	m.onStop = fn
+	m.stateMu.Unlock()
 }
 
 func NewMicroKernel(ensureJar func() (string, error), idleTimeout time.Duration) *MicroKernel {
@@ -186,9 +195,18 @@ func (m *MicroKernel) Stop(_ string) {
 	p := m.proc
 	m.proc = nil
 	m.gen++
+	stopGen := m.gen
 	m.stateMu.Unlock()
 
 	terminateKernelProc(p)
+
+	m.stateMu.Lock()
+	stillStopped := (m.proc == nil && m.gen == stopGen)
+	onStop := m.onStop
+	m.stateMu.Unlock()
+	if stillStopped && onStop != nil {
+		onStop()
+	}
 }
 
 func terminateKernelProc(p *kernelProc) {
@@ -308,8 +326,15 @@ func (m *MicroKernel) startLocked() (*kernelProc, error) {
 
 	m.stateMu.Lock()
 	if m.stopSeq != seqBefore {
+		onStop := m.onStop
 		m.stateMu.Unlock()
 		terminateKernelProc(kp)
+		m.stateMu.Lock()
+		stillStopped := (m.proc == nil)
+		m.stateMu.Unlock()
+		if stillStopped && onStop != nil {
+			onStop()
+		}
 		return nil, errors.New("microkernel stopped during startup")
 	}
 	old := m.proc
@@ -338,9 +363,18 @@ func (m *MicroKernel) resetIdleLocked(gen uint64) {
 		p := m.proc
 		m.proc = nil
 		m.gen++
+		idleGen := m.gen
 		m.idleTimer = nil
 		m.stateMu.Unlock()
 		terminateKernelProc(p)
+
+		m.stateMu.Lock()
+		stillIdle := (m.proc == nil && m.gen == idleGen)
+		onStop := m.onStop
+		m.stateMu.Unlock()
+		if stillIdle && onStop != nil {
+			onStop()
+		}
 	})
 }
 

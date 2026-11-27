@@ -104,11 +104,15 @@ type ShellBackend struct {
 	policyQueryFunc    func(ctx context.Context) (string, error)
 }
 
-const screenInfoCacheTTL = 60 * time.Second
+const (
+	screenInfoCacheTTL    = 60 * time.Second
+	defaultClipHelperPath = "/data/local/tmp/.ag_cache/helper.jar"
+	legacyClipHelperPath  = "/data/local/tmp/android_agent_cliphelper.jar"
+)
 
 func NewShellBackend(clipHelperPath string, shellTimeout time.Duration) *ShellBackend {
-	if clipHelperPath == "" {
-		clipHelperPath = "/data/local/tmp/android_agent_cliphelper.jar"
+	if clipHelperPath == "" || clipHelperPath == legacyClipHelperPath {
+		clipHelperPath = defaultClipHelperPath
 	}
 	if shellTimeout <= 0 {
 		shellTimeout = 10 * time.Second
@@ -120,6 +124,7 @@ func NewShellBackend(clipHelperPath string, shellTimeout time.Duration) *ShellBa
 		lastTouchMeth:  "uninitialized",
 	}
 	b.kernel = NewMicroKernel(b.ensureClipHelper, defaultKernelIdleTimeout)
+	b.kernel.SetOnStop(b.cleanupClipHelper)
 	b.screenGateFunc = b.checkScreenInteractive
 	return b
 }
@@ -696,34 +701,65 @@ func isSafeInputASCII(s string) bool {
 	return true
 }
 
+func isPrivateCacheDir(dir string) bool {
+	clean := filepath.Clean(dir)
+	return clean != "" && clean != "." && clean != "/" && clean != "/tmp" && clean != "/data/local/tmp"
+}
+
 func (b *ShellBackend) ensureClipHelper() (string, error) {
 	b.clipMu.Lock()
 	defer b.clipMu.Unlock()
 
+	dir := filepath.Dir(b.clipHelperPath)
 	if b.clipHelperReady {
 		if fileMatchesBytes(b.clipHelperPath, embeddedClipHelperJar) {
 			return b.clipHelperPath, nil
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(b.clipHelperPath), 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("mkdir cliphelper dir: %w", err)
 	}
+	if isPrivateCacheDir(dir) {
+		_ = os.Chmod(dir, 0o700)
+		_ = os.Chown(dir, 2000, 2000)
+	}
 	if fileMatchesBytes(b.clipHelperPath, embeddedClipHelperJar) {
+		_ = os.Chmod(b.clipHelperPath, 0o600)
+		_ = os.Chown(b.clipHelperPath, 2000, 2000)
 		b.clipHelperReady = true
 		return b.clipHelperPath, nil
 	}
 	tmpPath := b.clipHelperPath + ".tmp"
-	if err := os.WriteFile(tmpPath, embeddedClipHelperJar, 0o644); err != nil {
+	if err := os.WriteFile(tmpPath, embeddedClipHelperJar, 0o600); err != nil {
 		return "", fmt.Errorf("write cliphelper.jar: %w", err)
 	}
-	_ = os.Chmod(tmpPath, 0o644)
+	_ = os.Chmod(tmpPath, 0o600)
 	_ = os.Chown(tmpPath, 2000, 2000)
 	if err := os.Rename(tmpPath, b.clipHelperPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return "", fmt.Errorf("install cliphelper.jar: %w", err)
 	}
+	if b.clipHelperPath != legacyClipHelperPath {
+		_ = os.Remove(legacyClipHelperPath)
+	}
 	b.clipHelperReady = true
 	return b.clipHelperPath, nil
+}
+
+func (b *ShellBackend) cleanupClipHelper() {
+	b.clipMu.Lock()
+	defer b.clipMu.Unlock()
+
+	b.clipHelperReady = false
+	if b.clipHelperPath != "" {
+		_ = os.Remove(b.clipHelperPath)
+		_ = os.Remove(b.clipHelperPath + ".tmp")
+		dir := filepath.Dir(b.clipHelperPath)
+		if isPrivateCacheDir(dir) {
+			_ = os.Remove(dir)
+		}
+	}
+	_ = os.Remove(legacyClipHelperPath)
 }
 
 func (b *ShellBackend) runClipHelper(ctx context.Context, action string, stdin string) (string, error) {
@@ -797,6 +833,7 @@ func (b *ShellBackend) StopMicroKernel(reason string) {
 	if b.kernel != nil {
 		b.kernel.Stop(reason)
 	}
+	b.cleanupClipHelper()
 	b.uiCacheMu.Lock()
 	b.uiCache = make(map[int]UINode)
 	b.uiCachePkg = ""

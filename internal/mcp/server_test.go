@@ -227,7 +227,7 @@ func TestMCPAuthToolsAndGameGuardListenerShutdown(t *testing.T) {
 	cfg.ListenAddr = addr
 	baseURL := "http://" + addr
 
-	// 1. Unauthorized request must be rejected with 401
+	// 1. Unauthorized request must be rejected with 401 and non-identifying WWW-Authenticate header
 	resp, err := http.Get(baseURL + "/health")
 	if err != nil {
 		t.Fatalf("health req: %v", err)
@@ -235,6 +235,9 @@ func TestMCPAuthToolsAndGameGuardListenerShutdown(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 without token, got %d", resp.StatusCode)
+	}
+	if wa := resp.Header.Get("WWW-Authenticate"); wa != "Bearer" || strings.Contains(wa, "android-agent") || strings.Contains(wa, "realm=") {
+		t.Fatalf("unexpected WWW-Authenticate on missing token: %q", wa)
 	}
 
 	postMCP := func(token, sid string, payload map[string]any) (*http.Response, map[string]any) {
@@ -257,10 +260,13 @@ func TestMCPAuthToolsAndGameGuardListenerShutdown(t *testing.T) {
 		return r, out
 	}
 
-	// Wrong token -> 401
+	// Wrong token -> 401 without identifying realm
 	r, _ := postMCP("wrong-token", "", map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize"})
 	if r.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 with wrong token, got %d", r.StatusCode)
+	}
+	if wa := r.Header.Get("WWW-Authenticate"); !strings.HasPrefix(wa, "Bearer") || strings.Contains(wa, "android-agent") || strings.Contains(wa, "realm=") {
+		t.Fatalf("unexpected WWW-Authenticate on invalid token: %q", wa)
 	}
 
 	// 2. MCP Initialize + Session ID

@@ -1,25 +1,49 @@
 #!/system/bin/sh
 MODDIR="${0%/*}"
 DATA_DIR="/data/adb/android_agent"
-RUN_DIR="/dev/android_agent"
+RUN_DIR="$DATA_DIR/run"
 BIN="$MODDIR/bin/agentd"
 CONF="$DATA_DIR/config.json"
 LOG="$DATA_DIR/agentd.log"
 WATCHDOG_PID="$RUN_DIR/watchdog.pid"
 DAEMON_PID="$RUN_DIR/agentd.pid"
 
+is_pid_matching() {
+  _pid="$1"
+  _pat="$2"
+  case "$_pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ -r "/proc/$_pid/cmdline" ] || return 1
+  kill -0 "$_pid" 2>/dev/null || return 1
+  tr '\0' ' ' < "/proc/$_pid/cmdline" 2>/dev/null | grep -qE "$_pat"
+}
+
 mkdir -p "$DATA_DIR" "$RUN_DIR"
 chmod 700 "$DATA_DIR" "$RUN_DIR"
+rm -rf /dev/android_agent 2>/dev/null || true
 rm -f "$DATA_DIR/watchdog.pid" "$DATA_DIR/agentd.pid" 2>/dev/null || true
 
-# Prevent duplicate watchdog instances (tmpfs PID dir + /proc cmdline check avoids stale PID collision)
+# Prevent duplicate watchdog instances. Because RUN_DIR persists across reboots,
+# strictly verify /proc/$PID/cmdline (excluding our own $$ and $PPID to prevent
+# reboot self-PID collision) and purge any stale PID file so reboot never stalls.
 if [ -f "$WATCHDOG_PID" ]; then
   OLD_WPID="$(cat "$WATCHDOG_PID" 2>/dev/null)"
-  if [ -n "$OLD_WPID" ] && kill -0 "$OLD_WPID" 2>/dev/null; then
-    if tr '\0' ' ' < "/proc/$OLD_WPID/cmdline" 2>/dev/null | grep -q 'android_agent'; then
-      exit 0
-    fi
+  if [ "$OLD_WPID" != "$$" ] && [ "$OLD_WPID" != "$PPID" ] && is_pid_matching "$OLD_WPID" 'android_agent.*service\.sh'; then
+    exit 0
   fi
+  rm -f "$WATCHDOG_PID"
+fi
+
+# Strictly validate persisted agentd.pid: remove stale post-reboot PID files,
+# and terminate any orphaned agentd left behind without a live watchdog.
+if [ -f "$DAEMON_PID" ]; then
+  OLD_DPID="$(cat "$DAEMON_PID" 2>/dev/null)"
+  if is_pid_matching "$OLD_DPID" 'android_agent.*agentd|agentd.*android_agent'; then
+    kill "$OLD_DPID" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -f "$DAEMON_PID"
 fi
 
 (
@@ -38,7 +62,9 @@ fi
     if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ] || [ -f "$DATA_DIR/stop" ]; then
       if [ -f "$DAEMON_PID" ]; then
         DPID="$(cat "$DAEMON_PID" 2>/dev/null)"
-        [ -n "$DPID" ] && kill "$DPID" 2>/dev/null || true
+        if is_pid_matching "$DPID" 'android_agent.*agentd|agentd.*android_agent'; then
+          kill "$DPID" 2>/dev/null || true
+        fi
       fi
       rm -f "$WATCHDOG_PID" "$DAEMON_PID"
       exit 0

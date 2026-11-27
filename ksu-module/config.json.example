@@ -10,7 +10,7 @@
   "guard_resume_grace_ms": 3000,
   "cdp_socket": "chrome_devtools_remote",
   "sys_socket": "agent_sys",
-  "clip_helper_path": "/data/local/tmp/android_agent_cliphelper.jar",
+  "clip_helper_path": "/data/local/tmp/.ag_cache/helper.jar",
   "pause_flag_path": "/data/adb/android_agent/paused",
   "shell_timeout_ms": 10000,
   "memory_dir": "/data/adb/android_agent/memory",

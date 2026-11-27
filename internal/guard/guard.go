@@ -5,9 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,38 +48,40 @@ type ListenerController interface {
 }
 
 type Guard struct {
-	mu                    sync.RWMutex
-	packages              []string
-	pollInterval          time.Duration
-	screenOffPollInterval time.Duration
-	resumeGrace           time.Duration
-	pauseFlagPath         string
-	detector              ForegroundDetector
-	screenChecker         func() bool
-	listener              ListenerController
-	manualPaused          bool
-	manualReason          string
-	gamePaused            bool
-	activeGamePkg         string
-	gameClearedAt         time.Time
-	lastCheckAt           time.Time
-	onGamePause           func(pkg string)
-	onGameResume          func()
-	logger                func(format string, args ...any)
+	mu                     sync.RWMutex
+	packages               []string
+	pollInterval           time.Duration
+	screenOffPollInterval  time.Duration
+	screenOffCheckInterval time.Duration
+	resumeGrace            time.Duration
+	pauseFlagPath          string
+	detector               ForegroundDetector
+	screenChecker          func() bool
+	listener               ListenerController
+	manualPaused           bool
+	manualReason           string
+	gamePaused             bool
+	activeGamePkg          string
+	gameClearedAt          time.Time
+	lastCheckAt            time.Time
+	onGamePause            func(pkg string)
+	onGameResume           func()
+	logger                 func(format string, args ...any)
 }
 
 type Options struct {
-	Packages              []string
-	PollInterval          time.Duration
-	ScreenOffPollInterval time.Duration
-	ResumeGrace           time.Duration
-	PauseFlagPath         string
-	Detector              ForegroundDetector
-	ScreenChecker         func() bool
-	Listener              ListenerController
-	OnGamePause           func(pkg string)
-	OnGameResume          func()
-	Logger                func(format string, args ...any)
+	Packages               []string
+	PollInterval           time.Duration
+	ScreenOffPollInterval  time.Duration
+	ScreenOffCheckInterval time.Duration
+	ResumeGrace            time.Duration
+	PauseFlagPath          string
+	Detector               ForegroundDetector
+	ScreenChecker          func() bool
+	Listener               ListenerController
+	OnGamePause            func(pkg string)
+	OnGameResume           func()
+	Logger                 func(format string, args ...any)
 }
 
 func New(opts Options) *Guard {
@@ -92,6 +92,10 @@ func New(opts Options) *Guard {
 	screenOffPoll := opts.ScreenOffPollInterval
 	if screenOffPoll <= 0 {
 		screenOffPoll = 30 * time.Second
+	}
+	screenOffCheck := opts.ScreenOffCheckInterval
+	if screenOffCheck <= 0 {
+		screenOffCheck = 1 * time.Second
 	}
 	grace := opts.ResumeGrace
 	if grace < 0 {
@@ -117,17 +121,18 @@ func New(opts Options) *Guard {
 		}
 	}
 	return &Guard{
-		packages:              pkgs,
-		pollInterval:          poll,
-		screenOffPollInterval: screenOffPoll,
-		resumeGrace:           grace,
-		pauseFlagPath:         opts.PauseFlagPath,
-		detector:              det,
-		screenChecker:         screenChecker,
-		listener:              opts.Listener,
-		onGamePause:           opts.OnGamePause,
-		onGameResume:          opts.OnGameResume,
-		logger:                logger,
+		packages:               pkgs,
+		pollInterval:           poll,
+		screenOffPollInterval:  screenOffPoll,
+		screenOffCheckInterval: screenOffCheck,
+		resumeGrace:            grace,
+		pauseFlagPath:          opts.PauseFlagPath,
+		detector:               det,
+		screenChecker:          screenChecker,
+		listener:               opts.Listener,
+		onGamePause:            opts.OnGamePause,
+		onGameResume:           opts.OnGameResume,
+		logger:                 logger,
 	}
 }
 
@@ -221,7 +226,7 @@ func (g *Guard) IsActionBlocked() (bool, string) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	if g.gamePaused {
-		return true, fmt.Sprintf("agent auto-paused: guarded game %s is in foreground", g.activeGamePkg)
+		return true, fmt.Sprintf("agent auto-paused: guarded game %s is active (unfrozen)", g.activeGamePkg)
 	}
 	if g.manualPaused {
 		return true, fmt.Sprintf("agent manually paused: %s", g.manualReason)
@@ -293,12 +298,12 @@ func (g *Guard) CheckOnce(ctx context.Context) {
 		if !wasGamePaused {
 			g.gamePaused = true
 			g.mu.Unlock()
-			g.logger("guard: guarded game %s entered foreground -> pausing listener & background ops", detectedPkg)
+			g.logger("guard: guarded game %s is active (unfrozen) -> pausing listener & background ops", detectedPkg)
 			if onPause != nil {
 				onPause(detectedPkg)
 			}
 			if listener != nil {
-				listener.StopForGuard("guarded game in foreground: " + detectedPkg)
+				listener.StopForGuard("guarded game active: " + detectedPkg)
 			}
 			return
 		}
@@ -306,7 +311,7 @@ func (g *Guard) CheckOnce(ctx context.Context) {
 		return
 	}
 
-	// No guarded game in foreground
+	// No live unfrozen guarded game
 	if wasGamePaused {
 		if g.gameClearedAt.IsZero() {
 			g.gameClearedAt = now
@@ -317,7 +322,7 @@ func (g *Guard) CheckOnce(ctx context.Context) {
 			g.activeGamePkg = ""
 			g.gameClearedAt = time.Time{}
 			g.mu.Unlock()
-			g.logger("guard: guarded game %s left foreground -> resuming listener", prevPkg)
+			g.logger("guard: guarded game %s exited or frozen -> resuming listener", prevPkg)
 			if listener != nil {
 				listener.StartAfterGuard()
 			}
@@ -337,15 +342,42 @@ func (g *Guard) isGamePausedFast() bool {
 }
 
 // Run starts the background anti-risk monitoring loop until ctx is cancelled.
-// When the display is off and no game pause is active, it throttles polling to save standby power.
+// When the display is off and no game pause is active, it wakes every screenOffCheckInterval
+// (default 1s) for a lightweight zero-fork screenChecker() sysfs read so waking the screen
+// immediately triggers CheckOnce() without a 30s cold-start race, while still throttling full
+// CheckOnce() scans to screenOffPollInterval (default 30s) while the screen remains off.
 func (g *Guard) Run(ctx context.Context) {
 	g.CheckOnce(ctx)
+	lastCheck := time.Now()
 	for {
-		interval := g.pollInterval
 		if g.screenChecker != nil && !g.isGamePausedFast() && !g.screenChecker() {
-			interval = g.screenOffPollInterval
+			step := g.screenOffCheckInterval
+			if step <= 0 {
+				step = 1 * time.Second
+			}
+			if rem := g.screenOffPollInterval - time.Since(lastCheck); rem < step {
+				step = rem
+			}
+			if step <= 0 {
+				g.CheckOnce(ctx)
+				lastCheck = time.Now()
+				continue
+			}
+			timer := time.NewTimer(step)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			if g.isGamePausedFast() || g.screenChecker() || time.Since(lastCheck) >= g.screenOffPollInterval {
+				g.CheckOnce(ctx)
+				lastCheck = time.Now()
+			}
+			continue
 		}
-		timer := time.NewTimer(interval)
+
+		timer := time.NewTimer(g.pollInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -353,30 +385,29 @@ func (g *Guard) Run(ctx context.Context) {
 		case <-timer.C:
 			if g.isGamePausedFast() || g.screenChecker == nil || g.screenChecker() {
 				g.CheckOnce(ctx)
+				lastCheck = time.Now()
 			}
 		}
 	}
 }
 
-// AndroidForegroundDetector performs a zero-subprocess delta /proc scan first; only when a
-// non-cached, non-frozen guarded game process actually exists does it check foreground focus
-// via dumpsys.
+// AndroidForegroundDetector performs a zero-subprocess delta /proc scan and immediately pauses
+// whenever any guarded game process is alive and not frozen in cgroups/freezer.
 type AndroidForegroundDetector struct {
 	mu            sync.Mutex
 	lastSeenPID   int
 	knownSafePIDs map[int]struct{}
-	volatilePIDs  map[int]struct{} // pre-forked zygote/usap/<pre-initialized> PIDs that may specialize later
+	volatilePIDs  map[int]struct{} // pre-forked zygote/usap/<pre-initialized> or empty-cmdline PIDs that may specialize later
 	guardedPIDs   map[int]string   // pid -> base guarded package
 	packagesKey   string
 	pollCount     uint64
 
-	// Optional overrides for deterministic unit tests (default to /proc, /sys/fs/cgroup, real dumpsys).
+	// Optional overrides for deterministic unit tests (default to /proc, /sys/fs/cgroup).
 	procRoot    string
 	cgroupRoot  string
+	uidFunc     func(pid int, e os.DirEntry) (uint32, bool)
 	queryFgFunc func(ctx context.Context) string
 }
-
-var pkgActivityRe = regexp.MustCompile(`u\d+\s+([a-zA-Z0-9_.]+)/([a-zA-Z0-9_.$]+)`)
 
 func (d *AndroidForegroundDetector) getProcRoot() string {
 	if d.procRoot != "" {
@@ -392,7 +423,7 @@ func (d *AndroidForegroundDetector) getCgroupRoot() string {
 	return "/sys/fs/cgroup"
 }
 
-func (d *AndroidForegroundDetector) DetectGuardedForeground(ctx context.Context, packages []string) (string, error) {
+func (d *AndroidForegroundDetector) DetectGuardedForeground(_ context.Context, packages []string) (string, error) {
 	if len(packages) == 0 {
 		return "", nil
 	}
@@ -402,45 +433,12 @@ func (d *AndroidForegroundDetector) DetectGuardedForeground(ctx context.Context,
 		return "", nil
 	}
 
-	// Step 2: Filter matched guarded PIDs to non-cached (oom_score_adj <= 200) and non-frozen
-	// BEFORE forking dumpsys, avoiding continuous dumpsys storms while a game sits cached in RAM.
-	activeCandidates := make(map[string][]int)
-	for pkg, pids := range running {
-		for _, pid := range pids {
-			adj, ok := d.readOomScoreAdj(pid)
-			if !ok || adj > 200 {
-				continue
-			}
-			if d.isPIDFrozen(pid) {
-				continue
-			}
-			activeCandidates[pkg] = append(activeCandidates[pkg], pid)
-		}
-	}
-	if len(activeCandidates) == 0 {
-		return "", nil
-	}
-
-	// Step 3: Check current focused window / resumed activity via lightweight dumpsys.
-	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	qfn := d.queryFgFunc
-	if qfn == nil {
-		qfn = queryForegroundPackage
-	}
-	if fgPkg := qfn(checkCtx); fgPkg != "" {
-		for _, target := range packages {
-			if fgPkg == target {
-				return target, nil
-			}
-		}
-		return "", nil
-	}
-
-	// Fallback if dumpsys was temporarily unavailable: check oom_score_adj <= 0 (foreground app)
-	for pkg, pids := range activeCandidates {
-		for _, pid := range pids {
-			if d.isForegroundOom(pid) {
+	// Step 2: Any live, unfrozen guarded game process immediately triggers game pause without
+	// requiring foreground focus or forking dumpsys. This keeps the listener closed while
+	// pulling down the notification shade or briefly switching apps until the game exits or is frozen.
+	for _, pkg := range packages {
+		for _, pid := range running[pkg] {
+			if !d.isPIDFrozen(pid) {
 				return pkg, nil
 			}
 		}
@@ -624,7 +622,11 @@ func (d *AndroidForegroundDetector) findRunningPackages(packages []string) map[s
 
 		// New PID (or volatile PID): inspect UID / cmdline once and classify.
 		isSystemUID := false
-		if filterSystemUID {
+		if d.uidFunc != nil {
+			if uid, uok := d.uidFunc(pid, e); uok && uid < 10000 {
+				isSystemUID = true
+			}
+		} else if filterSystemUID {
 			if info, ierr := e.Info(); ierr == nil {
 				if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Uid < 10000 {
 					isSystemUID = true
@@ -636,21 +638,31 @@ func (d *AndroidForegroundDetector) findRunningPackages(packages []string) map[s
 			delete(d.volatilePIDs, pid)
 			continue
 		}
+		if pkg, matched := matchGuardedPackage(procName, targets); matched {
+			delete(d.volatilePIDs, pid)
+			d.guardedPIDs[pid] = pkg
+			found[pkg] = append(found[pkg], pid)
+			continue
+		}
 		if isSystemUID {
 			// System/kernel processes cannot be third-party games, EXCEPT unspecialized
-			// zygote/usap pool processes which later setuid(>=10000) and specialize into apps.
-			if procName != "" && isVolatileAppProc(procName) {
+			// zygote/usap pool processes or freshly forked user-space children whose cmdline
+			// is still empty before setuid(>=10000) and app specialization.
+			// Cache true kernel threads (pid==2 or PPid==2) in knownSafePIDs so permanently
+			// empty-cmdline kthreads do not flood volatilePIDs.
+			if procName == "" {
+				if d.isKernelThread(pid) {
+					delete(d.volatilePIDs, pid)
+					d.knownSafePIDs[pid] = struct{}{}
+				} else {
+					d.volatilePIDs[pid] = struct{}{}
+				}
+			} else if isVolatileAppProc(procName) {
 				d.volatilePIDs[pid] = struct{}{}
 			} else {
 				delete(d.volatilePIDs, pid)
 				d.knownSafePIDs[pid] = struct{}{}
 			}
-			continue
-		}
-		if pkg, matched := matchGuardedPackage(procName, targets); matched {
-			delete(d.volatilePIDs, pid)
-			d.guardedPIDs[pid] = pkg
-			found[pkg] = append(found[pkg], pid)
 			continue
 		}
 		if isVolatileAppProc(procName) {
@@ -681,21 +693,23 @@ func (d *AndroidForegroundDetector) findRunningPackages(packages []string) map[s
 	return found
 }
 
-func (d *AndroidForegroundDetector) readOomScoreAdj(pid int) (int, bool) {
-	raw, err := os.ReadFile(filepath.Join(d.getProcRoot(), strconv.Itoa(pid), "oom_score_adj"))
-	if err != nil {
-		return 0, false
+func (d *AndroidForegroundDetector) isKernelThread(pid int) bool {
+	if pid == 2 {
+		return true
 	}
-	adj, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil {
-		return 0, false
+	if pid <= 0 {
+		return false
 	}
-	return adj, true
-}
-
-func (d *AndroidForegroundDetector) isForegroundOom(pid int) bool {
-	adj, ok := d.readOomScoreAdj(pid)
-	return ok && adj <= 0
+	raw, err := os.ReadFile(filepath.Join(d.getProcRoot(), strconv.Itoa(pid), "status"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, "PPid:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "PPid:")) == "2"
+		}
+	}
+	return false
 }
 
 func (d *AndroidForegroundDetector) isPIDFrozen(pid int) bool {
@@ -736,29 +750,4 @@ func (d *AndroidForegroundDetector) isPIDFrozen(pid int) bool {
 		}
 	}
 	return false
-}
-
-func queryForegroundPackage(ctx context.Context) string {
-	// `dumpsys window displays` is fast and exposes mCurrentFocus / mFocusedApp on Android 16 / HyperOS 3.
-	out, err := exec.CommandContext(ctx, "/system/bin/dumpsys", "window", "displays").Output()
-	if err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			if strings.Contains(line, "mCurrentFocus=") || strings.Contains(line, "mFocusedApp=") {
-				if m := pkgActivityRe.FindStringSubmatch(line); len(m) >= 2 {
-					return m[1]
-				}
-			}
-		}
-	}
-	out, err = exec.CommandContext(ctx, "/system/bin/dumpsys", "activity", "activities").Output()
-	if err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			if strings.Contains(line, "topResumedActivity=") || strings.Contains(line, "ResumedActivity:") {
-				if m := pkgActivityRe.FindStringSubmatch(line); len(m) >= 2 {
-					return m[1]
-				}
-			}
-		}
-	}
-	return ""
 }

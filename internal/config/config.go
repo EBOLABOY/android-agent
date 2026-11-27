@@ -64,7 +64,7 @@ func Default() *Config {
 		GuardResumeGraceMs:    3000,
 		CDPSocket:             "chrome_devtools_remote",
 		SysSocket:             "agent_sys",
-		ClipHelperPath:        "/data/local/tmp/android_agent_cliphelper.jar",
+		ClipHelperPath:        "/data/local/tmp/.ag_cache/helper.jar",
 		PauseFlagPath:         "/data/adb/android_agent/paused",
 		ShellTimeoutMs:        10000,
 		MemoryDir:             "/data/adb/android_agent/memory",
@@ -230,7 +230,7 @@ func applyDefaults(cfg *Config) {
 	if cfg.SysSocket == "" {
 		cfg.SysSocket = def.SysSocket
 	}
-	if cfg.ClipHelperPath == "" {
+	if cfg.ClipHelperPath == "" || cfg.ClipHelperPath == "/data/local/tmp/android_agent_cliphelper.jar" {
 		cfg.ClipHelperPath = def.ClipHelperPath
 	}
 	if cfg.ShellTimeoutMs <= 0 {

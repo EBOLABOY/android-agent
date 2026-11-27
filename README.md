@@ -2,7 +2,7 @@
 
 小米 13（`fuxi` / Android 16 / API 36 / HyperOS 3.0 / KernelSU 3.3.1）原生低延迟 AI Agent 底座。
 
-- **当前状态**：**`v0.3.4` 可靠性、低功耗与安全加固版 — 在 `v0.3.3-streaming` 实时流式 SSE / Run Replay / 零 Hook HyperOS 3.0 超级岛基础上，全面修复闲置功耗、CDP 冻结重连、横屏坐标缩放、WebUI 断线防卡死与多项安全隐私漏洞**。
+- **当前状态**：**`v0.3.5` Anti-ACE 隐蔽加固版 — 在 `v0.3.4` 可靠性/低功耗/安全加固基础上，全面收紧游戏防风控（存活且未冻结即熔断 + 消除亮屏 30s 冷启动竞态 + 空 `cmdline` 进程防误缓存）、私有化 `0700/0600` 微内核缓存并随熔断/空闲自动清除、迁移 PID 目录至 `/data/adb/android_agent/run` 消除 `/dev` 痕迹，并去除 `401` 响应头指纹**。
 - **架构亮点**：零外部 Go 依赖静态单文件（内嵌 `_ "time/tzdata"`），内置标准 **MCP Streamable HTTP (`2025-03-26`)** 服务端（`26` 个工具，内置 LLM 大脑自动隐藏 `agent_pause`/`agent_resume` 防自锁）、懒加载 `app_process64` 微内核（3 分钟空闲销毁 + 杂讯隔离 + 王者荣耀秒杀熔断 + 焦点通知通道）、`evdev` 亮屏解锁门禁、2MB 进程内日志轮转、严格 Origin/Host 防护与本机 `127.0.0.1:8765` 默认监听。
 
 ---
@@ -86,8 +86,8 @@
 
 - **KernelSU 模块目录**：`/data/adb/modules/android_agent/`（`module.prop`、`service.sh`、`action.sh`、`uninstall.sh`、`bin/agentd`，统一权限与 `u:object_r:system_file:s0` SELinux 标签）
 - **持久化配置与日志**：`/data/adb/android_agent/`（`config.json` 权限 `0600`、`agentd.log` 自动轮转 2MB）
-- **运行时 PID 目录（tmpfs，重启自动清空）**：`/dev/android_agent/`（`watchdog.pid`、`agentd.pid`，叠加 `/proc/$PID/cmdline` 防重入校验）
-- **临时运行文件**：`/data/local/tmp/android_agent_cliphelper.jar`（首次操作剪贴板时自动释放，供 `uid=2000` `app_process64` 读取）
+- **运行时 PID 目录（`0700`，位于 `/data/adb` 受限区）**：`/data/adb/android_agent/run/`（`watchdog.pid`、`agentd.pid`，开机/启停均严格核验 `/proc/$PID/cmdline` 并自动清理陈旧 PID 文件，消除 `/dev/android_agent` 存在性痕迹）
+- **临时运行文件（私有缓存，熔断/空闲自动清除）**：`/data/local/tmp/.ag_cache/helper.jar`（目录 `0700`、文件 `0600`，属主 `2000:2000` `shell:shell`，仅在微内核活跃时按需释放，游戏熔断或 3 分钟空闲退出后立即删除整个缓存目录）
 
 ---
 
@@ -167,6 +167,25 @@
 
 ---
 
+## 2.8 `v0.3.5` Anti-ACE 隐蔽加固摘要
+
+针对 `com.tencent.tmgp.sgame`（王者荣耀 / ACE）实机全链路可观测性审计，`v0.3.5` 将 `android-agent` 在游戏期间的暴露面压缩至零：
+
+1. **存活且未冻结即熔断 + 零 30s 亮屏竞态（`internal/guard/guard.go`）**
+   - `AndroidForegroundDetector.DetectGuardedForeground` 只要检测到受保护游戏存在任意存活且未被 cgroup/freezer 冻结的进程（`!isPIDFrozen(pid)`），立即返回熔断而无需等待前台焦点或 fork `dumpsys`——下拉通知栏或临时切微信/小窗期间持续关闭 `127.0.0.1:8765` 并阻断 Cron 任务，待游戏退出或被 HyperOS 冻结后再按 `resumeGrace` 恢复。
+   - `Guard.Run()` 在息屏期间改为每 `1s` 执行零 fork 轻量级 `screenChecker()`（sysfs 读取约 `50µs`），息屏状态仍按 `30s` 节流完整扫描，但一旦亮屏（`false -> true`）立即触发 `CheckOnce()` 并切回活跃轮询间隔，彻底消除解锁秒开游戏时的 30s 窗口。
+   - 修复 `findRunningPackages` 中 `UID < 10000` 且 `cmdline` 暂为空的新生进程被永久写入 `knownSafePIDs` 的竞态，改为纳入 `volatilePIDs` 持续复检。
+
+2. **私有化 `0700/0600` 微内核 JAR + 熔断/空闲自动删除 + PID 目录移出 `/dev`**
+   - 将微内核 JAR 迁移至 `/data/local/tmp/.ag_cache/helper.jar`（目录 `0700`、文件 `0600`、`2000:2000` `shell:shell`，兼容自动迁移旧配置并清理遗留 `/data/local/tmp/android_agent_cliphelper.jar`），普通应用（`untrusted_app_30`）执行 `stat`/`read` 均返回 `EACCES`。
+   - `StopMicroKernel`（`StopForGuard` 游戏熔断与 3 分钟空闲退出）自动删除 `helper.jar` 及 `.ag_cache` 目录，游戏与空闲期间 `/data/local/tmp` 零 JAR 残留。
+   - `ksu-module/{service,action,uninstall}.sh` 将 PID 目录从 `/dev/android_agent` 迁移至 `/data/adb/android_agent/run`（`0700`），并自动清理旧 `/dev/android_agent`；针对持久化 PID 目录在启动/查询/卸载全路径强制校验 `watchdog.pid` 与 `agentd.pid` 对应的 `/proc/$PID/cmdline`，确保重启后陈旧 PID 文件绝不会造成假存活或卡死。
+
+3. **去指纹化 `127.0.0.1:8765` 响应头（`internal/mcp/server.go`）**
+   - 移除 `401 Unauthorized` 响应中 `WWW-Authenticate` 头的 `realm="android-agent"` 标识字符串（仅返回标准 `Bearer` / `Bearer error="invalid_token"`）。
+
+---
+
 ## 3. 常用运维命令
 
 ### 读取当前手机端 Bearer Token 并通过 `adb forward` 访问（宿主机执行）
@@ -216,7 +235,7 @@ curl -sS -H "Authorization: Bearer $AGENT_TOKEN" \
 adb -s 192.168.100.100:5555 shell "su -c 'ps -ef | grep agentd | grep -v grep; tail -n 30 /data/adb/android_agent/agentd.log'"
 
 # 停止守护进程（不重启手机）
-adb -s 192.168.100.100:5555 shell "su -c 'touch /data/adb/android_agent/stop; kill \$(cat /dev/android_agent/agentd.pid 2>/dev/null) 2>/dev/null || true'"
+adb -s 192.168.100.100:5555 shell "su -c 'touch /data/adb/android_agent/stop; kill \$(cat /data/adb/android_agent/run/agentd.pid 2>/dev/null) 2>/dev/null || true'"
 
 # 重新拉起守护进程
 adb -s 192.168.100.100:5555 shell "su -c 'rm -f /data/adb/android_agent/stop; nohup sh /data/adb/modules/android_agent/service.sh </dev/null >/dev/null 2>&1 &'"
