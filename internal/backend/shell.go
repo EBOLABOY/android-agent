@@ -76,12 +76,18 @@ type ShellBackend struct {
 	uiCacheW   int
 	uiCacheH   int
 
-	screenMu     sync.RWMutex
-	cachedScreen ScreenInfo
+	screenMu       sync.RWMutex
+	cachedScreen   ScreenInfo
+	cachedScreenAt time.Time
+	screenQueryFn  func(ctx context.Context) (ScreenInfo, error)
 
-	touchOnce  sync.Once
-	evTouch    *EvdevTouch
-	touchProbe TouchDeviceInfo
+	touchMu          sync.Mutex
+	evTouch          *EvdevTouch
+	touchProbe       TouchDeviceInfo
+	touchLastProbeAt time.Time
+	touchProbeFailN  int
+	touchRetryBase   time.Duration
+	touchProbeFunc   func() (TouchDeviceInfo, error)
 
 	touchMethodMu sync.RWMutex
 	lastTouchMeth string
@@ -90,11 +96,15 @@ type ShellBackend struct {
 	lastRot   int
 	lastRotAt time.Time
 
-	screenGateMu   sync.Mutex
-	lastGateAt     time.Time
-	lastGateErr    error
-	screenGateFunc func(ctx context.Context) error
+	screenGateMu       sync.Mutex
+	lastGateAt         time.Time
+	lastGateErr        error
+	screenGateFunc     func(ctx context.Context) error
+	backlightCheckFunc func() bool
+	policyQueryFunc    func(ctx context.Context) (string, error)
 }
+
+const screenInfoCacheTTL = 60 * time.Second
 
 func NewShellBackend(clipHelperPath string, shellTimeout time.Duration) *ShellBackend {
 	if clipHelperPath == "" {
@@ -119,8 +129,11 @@ func (b *ShellBackend) Close() {
 	if b.kernel != nil {
 		b.kernel.Stop("backend close")
 	}
-	if b.evTouch != nil {
-		b.evTouch.Drain()
+	b.touchMu.Lock()
+	ev := b.evTouch
+	b.touchMu.Unlock()
+	if ev != nil {
+		ev.Drain()
 	}
 }
 
@@ -135,12 +148,12 @@ func (b *ShellBackend) withTimeout(ctx context.Context) (context.Context, contex
 	return context.WithTimeout(ctx, b.shellTimeout)
 }
 
-func (b *ShellBackend) ScreenInfo(ctx context.Context) (ScreenInfo, error) {
-	cctx, cancel := b.withTimeout(ctx)
-	defer cancel()
-
+func (b *ShellBackend) queryScreenInfo(ctx context.Context) (ScreenInfo, error) {
+	if b.screenQueryFn != nil {
+		return b.screenQueryFn(ctx)
+	}
 	var info ScreenInfo
-	if out, err := exec.CommandContext(cctx, "/system/bin/cmd", "window", "size").Output(); err == nil {
+	if out, err := exec.CommandContext(ctx, "/system/bin/cmd", "window", "size").Output(); err == nil {
 		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 		// Prefer Override size if present (usually the last line)
 		for i := len(lines) - 1; i >= 0; i-- {
@@ -151,7 +164,7 @@ func (b *ShellBackend) ScreenInfo(ctx context.Context) (ScreenInfo, error) {
 			}
 		}
 	}
-	if out, err := exec.CommandContext(cctx, "/system/bin/cmd", "window", "density").Output(); err == nil {
+	if out, err := exec.CommandContext(ctx, "/system/bin/cmd", "window", "density").Output(); err == nil {
 		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 		for i := len(lines) - 1; i >= 0; i-- {
 			if m := wmDensityRe.FindStringSubmatch(lines[i]); len(m) == 2 {
@@ -161,14 +174,30 @@ func (b *ShellBackend) ScreenInfo(ctx context.Context) (ScreenInfo, error) {
 		}
 	}
 	if info.Width > 0 && info.Height > 0 {
+		return info, nil
+	}
+	return ScreenInfo{}, errors.New("unable to query screen size via wm")
+}
+
+func (b *ShellBackend) ScreenInfo(ctx context.Context) (ScreenInfo, error) {
+	b.screenMu.RLock()
+	cached := b.cachedScreen
+	cachedAt := b.cachedScreenAt
+	b.screenMu.RUnlock()
+	if cached.Width > 0 && cached.Height > 0 && !cachedAt.IsZero() && time.Since(cachedAt) < screenInfoCacheTTL {
+		return cached, nil
+	}
+
+	cctx, cancel := b.withTimeout(ctx)
+	defer cancel()
+
+	if info, err := b.queryScreenInfo(cctx); err == nil && info.Width > 0 && info.Height > 0 {
 		b.screenMu.Lock()
 		b.cachedScreen = info
+		b.cachedScreenAt = time.Now()
 		b.screenMu.Unlock()
 		return info, nil
 	}
-	b.screenMu.RLock()
-	cached := b.cachedScreen
-	b.screenMu.RUnlock()
 	if cached.Width > 0 && cached.Height > 0 {
 		return cached, nil
 	}
@@ -225,18 +254,48 @@ func (b *ShellBackend) Screenshot(ctx context.Context, targetWidth, quality int)
 }
 
 func (b *ShellBackend) ensureTouch() *EvdevTouch {
-	b.touchOnce.Do(func() {
-		info, err := ProbeTouchscreen()
-		if err != nil {
-			info.ProbeError = err.Error()
-			info.Available = false
+	b.touchMu.Lock()
+	defer b.touchMu.Unlock()
+
+	if b.evTouch != nil {
+		return b.evTouch
+	}
+	if !b.touchLastProbeAt.IsZero() && b.touchProbeFailN > 0 {
+		base := b.touchRetryBase
+		if base <= 0 {
+			base = 5 * time.Second
 		}
-		b.touchProbe = info
-		if info.Available {
-			b.evTouch = NewEvdevTouch(info)
+		shift := b.touchProbeFailN - 1
+		if shift > 4 {
+			shift = 4
 		}
-	})
-	return b.evTouch
+		backoff := base << shift
+		if backoff > 60*time.Second {
+			backoff = 60 * time.Second
+		}
+		if time.Since(b.touchLastProbeAt) < backoff {
+			return nil
+		}
+	}
+
+	probeFn := b.touchProbeFunc
+	if probeFn == nil {
+		probeFn = ProbeTouchscreen
+	}
+	info, err := probeFn()
+	b.touchLastProbeAt = time.Now()
+	if err != nil {
+		info.ProbeError = err.Error()
+		info.Available = false
+	}
+	b.touchProbe = info
+	if info.Available {
+		b.evTouch = NewEvdevTouch(info)
+		b.touchProbeFailN = 0
+		return b.evTouch
+	}
+	b.touchProbeFailN++
+	return nil
 }
 
 func (b *ShellBackend) setLastTouchMethod(m string) {
@@ -250,7 +309,9 @@ func (b *ShellBackend) TouchStatus() TouchStatusInfo {
 	b.touchMethodMu.RLock()
 	meth := b.lastTouchMeth
 	b.touchMethodMu.RUnlock()
+	b.touchMu.Lock()
 	dev := b.touchProbe
+	b.touchMu.Unlock()
 	if ev != nil {
 		dev = ev.Device()
 	}
@@ -318,14 +379,33 @@ func (b *ShellBackend) isPortrait(ctx context.Context) bool {
 	return false
 }
 
-// IsBacklightScreenOn performs a zero-fork sysfs check to see if the display panel backlight is on.
+// IsBacklightScreenOn performs a zero-fork sysfs check to see if the display panel is interactively on.
+// Requires DRM dpms=="On" when exposed alongside backlight brightness > 0 so OLED AOD is treated as off.
 // Returns true on unknown/non-Android hosts so unit tests and fallback behavior remain intact.
 func IsBacklightScreenOn() bool {
+	dpmsChecked := false
+	dpmsOn := false
+	dpmsMatches, _ := filepath.Glob("/sys/class/drm/card*-DSI-*/dpms")
+	for _, p := range dpmsMatches {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		dpmsChecked = true
+		if strings.EqualFold(strings.TrimSpace(string(raw)), "On") {
+			dpmsOn = true
+		}
+	}
+	if dpmsChecked && !dpmsOn {
+		return false
+	}
+
 	patterns := []string{
 		"/sys/class/backlight/*/brightness",
 		"/sys/class/leds/*backlight*/brightness",
 	}
-	checked := false
+	blChecked := false
+	blOn := false
 	for _, pat := range patterns {
 		matches, _ := filepath.Glob(pat)
 		for _, p := range matches {
@@ -333,28 +413,17 @@ func IsBacklightScreenOn() bool {
 			if err != nil {
 				continue
 			}
-			checked = true
+			blChecked = true
 			if v, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && v > 0 {
-				return true
+				blOn = true
 			}
 		}
 	}
-	if checked {
-		return false
+	if blChecked {
+		return blOn
 	}
-	dpmsMatches, _ := filepath.Glob("/sys/class/drm/card*-DSI-*/dpms")
-	for _, p := range dpmsMatches {
-		raw, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		checked = true
-		if strings.EqualFold(strings.TrimSpace(string(raw)), "On") {
-			return true
-		}
-	}
-	if checked {
-		return false
+	if dpmsChecked {
+		return dpmsOn
 	}
 	return true
 }
@@ -366,7 +435,8 @@ func parseScreenInteractivePolicy(policyOut string) error {
 		return errors.New("screen is off; refusing touch injection")
 	}
 	if strings.Contains(policyOut, "mDreamingLockscreen=true") ||
-		strings.Contains(policyOut, "isKeyguardShowing=true") {
+		strings.Contains(policyOut, "isKeyguardShowing=true") ||
+		strings.Contains(policyOut, "mShowingLockscreen=true") {
 		return errors.New("device is locked (keyguard showing); refusing touch injection")
 	}
 	inKeyguard := false
@@ -388,8 +458,26 @@ func parseScreenInteractivePolicy(policyOut string) error {
 	return nil
 }
 
+func (b *ShellBackend) queryWindowPolicy(ctx context.Context) (string, error) {
+	if b.policyQueryFunc != nil {
+		return b.policyQueryFunc(ctx)
+	}
+	out, err := exec.CommandContext(ctx, "/system/bin/dumpsys", "window", "policy").Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
 func (b *ShellBackend) checkScreenInteractive(ctx context.Context) error {
-	if !IsBacklightScreenOn() {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	blCheck := b.backlightCheckFunc
+	if blCheck == nil {
+		blCheck = IsBacklightScreenOn
+	}
+	if !blCheck() {
 		return errors.New("screen is off; refusing touch injection")
 	}
 	b.screenGateMu.Lock()
@@ -402,16 +490,25 @@ func (b *ShellBackend) checkScreenInteractive(ctx context.Context) error {
 
 	cctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 	defer cancel()
-	out, err := exec.CommandContext(cctx, "/system/bin/dumpsys", "window", "policy").Output()
-	var gateErr error
-	if err == nil {
-		gateErr = parseScreenInteractivePolicy(string(out))
+	out, err := b.queryWindowPolicy(cctx)
+	if err != nil {
+		// Fail closed: never permit touch/input injection when lockscreen policy cannot be verified.
+		return fmt.Errorf("screen policy check failed (refusing touch injection): %w", err)
 	}
+	gateErr := parseScreenInteractivePolicy(out)
 	b.screenGateMu.Lock()
 	b.lastGateAt = time.Now()
 	b.lastGateErr = gateErr
 	b.screenGateMu.Unlock()
 	return gateErr
+}
+
+// IsScreenUnlocked returns true only when the display is on AND the keyguard is not locked.
+func (b *ShellBackend) IsScreenUnlocked(ctx context.Context) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return b.enforceScreenInteractive(ctx) == nil
 }
 
 func (b *ShellBackend) enforceScreenInteractive(ctx context.Context) error {
@@ -529,6 +626,11 @@ func (b *ShellBackend) KeyEvent(ctx context.Context, keycode string) error {
 func (b *ShellBackend) InputText(ctx context.Context, text string, method string, submit bool) (string, error) {
 	if text == "" {
 		return "", errors.New("text is required")
+	}
+	gateCtx, gateCancel := b.withTimeout(ctx)
+	defer gateCancel()
+	if err := b.enforceScreenInteractive(gateCtx); err != nil {
+		return "", err
 	}
 	method = strings.ToLower(strings.TrimSpace(method))
 	if method == "" {
@@ -933,13 +1035,15 @@ func (b *ShellBackend) UpdateLiveProgress(ctx context.Context, spec LiveProgress
 		Ongoing:   &ongoing,
 	})
 	if err != nil {
-		return b.PostNotification(cctx, spec.Tag, spec.Title, spec.Text)
+		fbCtx, fbCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer fbCancel()
+		return b.PostNotification(fbCtx, spec.Tag, spec.Title, spec.Text)
 	}
 	return nil
 }
 
 func (b *ShellBackend) CancelLiveProgress(ctx context.Context, tag string, id int) error {
-	if b.kernel == nil {
+	if b.kernel == nil || !b.MicroKernelRunning() {
 		return nil
 	}
 	cctx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)

@@ -3,6 +3,7 @@ package brain
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -18,8 +19,10 @@ import (
 
 const (
 	defaultHeartbeatInterval = 30 * time.Second
-	maxDynamicWakeDelay      = 6 * time.Hour
+	maxSleep                 = 60 * time.Second
 	maxScheduleHistory       = 30
+	maxScheduleRetries       = 2
+	scheduleRetryBackoff     = 5 * time.Minute
 )
 
 type ScheduleEntryState struct {
@@ -59,6 +62,7 @@ type entryRuntime struct {
 	lastRunDate   string
 	lastState     string
 	lastMessage   string
+	retryCount    int
 }
 
 // JobRunFunc executes a scheduled job by name inside a JobManager worker.
@@ -66,20 +70,29 @@ type JobRunFunc func(ctx context.Context, jobName string, logFn func(string)) (a
 
 // Scheduler runs lightweight randomized daily cron jobs while respecting game-guard pauses.
 type Scheduler struct {
-	mu          sync.Mutex
-	cfg         config.ScheduleConfig
-	guard       *guard.Guard
-	jobs        *JobManager
-	runJob      JobRunFunc
-	historyPath string
-	logger      func(string, ...any)
+	mu             sync.Mutex
+	cfg            config.ScheduleConfig
+	guard          *guard.Guard
+	jobs           *JobManager
+	runJob         JobRunFunc
+	historyPath    string
+	logger         func(string, ...any)
+	screenUnlocked func(context.Context) bool
 
 	runtimes    map[string]*entryRuntime
 	history     []ScheduleHistoryItem
 	lastCheckAt time.Time
 	tickEvery   time.Duration
 	randIntn    func(int) int
+	nowFn       func() time.Time
 	wakeCh      chan struct{}
+}
+
+func (s *Scheduler) now() time.Time {
+	if s.nowFn != nil {
+		return s.nowFn()
+	}
+	return time.Now()
 }
 
 func NewScheduler(
@@ -103,11 +116,21 @@ func NewScheduler(
 		runtimes:    make(map[string]*entryRuntime),
 		tickEvery:   defaultHeartbeatInterval,
 		randIntn:    rand.Intn,
+		nowFn:       time.Now,
 		wakeCh:      make(chan struct{}, 1),
 	}
+	now := s.now()
+	s.syncRuntimesLocked(now)
 	s.loadHistory()
-	s.syncRuntimesLocked(time.Now())
 	return s
+}
+
+// SetScreenUnlockChecker configures an optional display/lockscreen check invoked before
+// triggering scheduled jobs. When it returns false, the job is deferred instead of burning the day.
+func (s *Scheduler) SetScreenUnlockChecker(fn func(context.Context) bool) {
+	s.mu.Lock()
+	s.screenUnlocked = fn
+	s.mu.Unlock()
 }
 
 func (s *Scheduler) loadHistory() {
@@ -124,6 +147,45 @@ func (s *Scheduler) loadHistory() {
 			hist = hist[len(hist)-maxScheduleHistory:]
 		}
 		s.history = hist
+		s.hydrateRuntimesFromHistoryLocked(s.now())
+	}
+}
+
+func (s *Scheduler) hydrateRuntimesFromHistoryLocked(now time.Time) {
+	if len(s.history) == 0 {
+		return
+	}
+	today := now.Format("2006-01-02")
+	for _, item := range s.history {
+		ts, err := time.Parse(time.RFC3339, item.TriggeredAt)
+		if err != nil {
+			continue
+		}
+		if ts.In(now.Location()).Format("2006-01-02") != today {
+			continue
+		}
+		rt := s.runtimes[item.EntryID]
+		if rt == nil {
+			continue
+		}
+		switch item.State {
+		case "completed", "skipped":
+			rt.lastRunDate = today
+			rt.lastState = item.State
+			rt.lastMessage = item.Message
+		case "failed":
+			// Only mark today consumed if this wasn't an intermediate retry-scheduled failure.
+			if !strings.HasPrefix(item.Message, "retry ") {
+				rt.lastRunDate = today
+			}
+			rt.lastState = item.State
+			rt.lastMessage = item.Message
+		case "deferred":
+			if rt.lastRunDate != today {
+				rt.lastState = "deferred"
+				rt.lastMessage = item.Message
+			}
+		}
 	}
 }
 
@@ -151,6 +213,7 @@ func (s *Scheduler) SetHistoryPath(path string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.historyPath = strings.TrimSpace(path)
+	s.syncRuntimesLocked(s.now())
 	s.loadHistory()
 }
 
@@ -213,6 +276,7 @@ func (s *Scheduler) syncRuntimesLocked(now time.Time) {
 		}
 		if rt.plannedDate != today {
 			rt.plannedDate = today
+			rt.retryCount = 0
 			rt.nextRunAt, rt.windowEndTime = s.pickRandomTrigger(now, e.WindowStart, e.WindowEnd)
 		}
 	}
@@ -325,8 +389,8 @@ func (s *Scheduler) nextWakeDelay(now time.Time) (time.Duration, bool) {
 	if earliest <= 0 {
 		earliest = time.Second
 	}
-	if earliest > maxDynamicWakeDelay {
-		earliest = maxDynamicWakeDelay
+	if earliest > maxSleep {
+		earliest = maxSleep
 	}
 	return earliest, true
 }
@@ -374,6 +438,19 @@ func (s *Scheduler) Tick(ctx context.Context, now time.Time) {
 	}
 }
 
+func isNonRetryableScheduleError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	low := strings.ToLower(err.Error())
+	return strings.Contains(low, "captcha") ||
+		strings.Contains(low, "prize_selection_required") ||
+		strings.Contains(low, "login_required")
+}
+
 func (s *Scheduler) triggerEntry(ctx context.Context, rt *entryRuntime, now time.Time, today string) {
 	if s.guard != nil {
 		if blocked, reason := s.guard.IsActionBlocked(); blocked {
@@ -408,6 +485,44 @@ func (s *Scheduler) triggerEntry(ctx context.Context, rt *entryRuntime, now time
 		}
 	}
 
+	s.mu.Lock()
+	unlockChecker := s.screenUnlocked
+	s.mu.Unlock()
+	if unlockChecker != nil && !unlockChecker(ctx) {
+		s.mu.Lock()
+		if now.Before(rt.windowEndTime) {
+			next := now.Add(15 * time.Minute)
+			if next.After(rt.windowEndTime) {
+				next = rt.windowEndTime
+			}
+			rt.nextRunAt = next
+			rt.lastState = "deferred"
+			rt.lastMessage = "screen locked or off; deferred"
+			s.recordHistoryLocked(ScheduleHistoryItem{
+				EntryID:     rt.entry.ID,
+				Job:         rt.entry.Job,
+				State:       "deferred",
+				Message:     rt.lastMessage,
+				TriggeredAt: now.Format(time.RFC3339),
+			})
+			s.logger("schedule: %s deferred until %s (screen locked)", rt.entry.ID, next.Format("15:04"))
+		} else {
+			rt.lastRunDate = today
+			rt.lastState = "skipped"
+			rt.lastMessage = "screen remained locked past window end"
+			s.recordHistoryLocked(ScheduleHistoryItem{
+				EntryID:     rt.entry.ID,
+				Job:         rt.entry.Job,
+				State:       "skipped",
+				Message:     rt.lastMessage,
+				TriggeredAt: now.Format(time.RFC3339),
+			})
+			s.logger("schedule: %s skipped today (screen remained locked)", rt.entry.ID)
+		}
+		s.mu.Unlock()
+		return
+	}
+
 	if s.jobs == nil || s.runJob == nil {
 		return
 	}
@@ -427,29 +542,53 @@ func (s *Scheduler) triggerEntry(ctx context.Context, rt *entryRuntime, now time
 		elapsed := float64(int(time.Since(started).Seconds()*10)) / 10
 
 		s.mu.Lock()
+		var histState string
 		if runErr != nil {
-			rt.lastState = "failed"
-			rt.lastMessage = runErr.Error()
+			if !isNonRetryableScheduleError(runErr) && rt.retryCount < maxScheduleRetries {
+				rt.retryCount++
+				rt.lastRunDate = ""
+				baseTime := now
+				if realNow := s.now(); realNow.After(baseTime) && realNow.Sub(baseTime) < 2*time.Hour {
+					baseTime = realNow
+				}
+				rt.nextRunAt = baseTime.Add(scheduleRetryBackoff)
+				rt.lastState = "deferred"
+				rt.lastMessage = fmt.Sprintf("retry %d/%d scheduled after error: %v", rt.retryCount, maxScheduleRetries, runErr)
+				histState = "failed"
+			} else {
+				rt.lastState = "failed"
+				rt.lastMessage = runErr.Error()
+				histState = "failed"
+			}
 		} else {
+			rt.retryCount = 0
 			rt.lastState = "completed"
 			rt.lastMessage = fmt.Sprintf("completed in %.1fs", elapsed)
+			histState = "completed"
 		}
 		s.recordHistoryLocked(ScheduleHistoryItem{
 			EntryID:     entryID,
 			Job:         jobName,
-			State:       rt.lastState,
+			State:       histState,
 			Message:     rt.lastMessage,
 			TriggeredAt: started.Format(time.RFC3339),
 			ElapsedSec:  elapsed,
 		})
 		s.mu.Unlock()
+
+		if s.wakeCh != nil {
+			select {
+			case s.wakeCh <- struct{}{}:
+			default:
+			}
+		}
 		return res, runErr
 	})
 	if err != nil {
-		// Busy with manual job: retry in 5 minutes cleanly.
+		// Busy with manual job or chat turn: retry in 5 minutes cleanly.
 		s.mu.Lock()
 		rt.lastRunDate = ""
-		rt.nextRunAt = now.Add(5 * time.Minute)
+		rt.nextRunAt = now.Add(scheduleRetryBackoff)
 		rt.lastState = "deferred"
 		rt.lastMessage = err.Error()
 		s.mu.Unlock()
@@ -461,7 +600,7 @@ func (s *Scheduler) triggerEntry(ctx context.Context, rt *entryRuntime, now time
 func (s *Scheduler) Status() SchedulerStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.syncRuntimesLocked(time.Now())
+	s.syncRuntimesLocked(s.now())
 
 	entries := make([]ScheduleEntryState, 0, len(s.cfg.Entries))
 	for _, e := range s.cfg.Entries {

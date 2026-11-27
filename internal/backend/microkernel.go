@@ -20,7 +20,18 @@ const (
 	defaultKernelIdleTimeout = 3 * time.Minute
 	maxKernelRequestBytes    = 128 * 1024
 	kernelStderrRingBytes    = 4096
+	kernelGracefulExitWait   = 100 * time.Millisecond
 )
+
+// kernelAppError distinguishes an application-level ok=false reply from a healthy JVM
+// from transport/EOF/crash errors that require restarting the microkernel process.
+type kernelAppError struct {
+	msg string
+}
+
+func (e *kernelAppError) Error() string {
+	return e.msg
+}
 
 type kernelCommandFactory func(jarPath string, asShell bool) *exec.Cmd
 
@@ -187,6 +198,15 @@ func terminateKernelProc(p *kernelProc) {
 	p.closeStop()
 	if p.stdin != nil {
 		_ = p.stdin.Close()
+	}
+	// Give AgentKernel up to 100ms to observe stdin EOF and run shutdownUiAutomation()
+	// cleanly before escalating to SIGKILL.
+	if p.done != nil {
+		select {
+		case <-p.done:
+			return
+		case <-time.After(kernelGracefulExitWait):
+		}
 	}
 	if p.cmd != nil && p.cmd.Process != nil {
 		_ = p.cmd.Process.Kill()
@@ -396,6 +416,16 @@ func (m *MicroKernel) Call(ctx context.Context, req kernelRequest) (*kernelRespo
 			m.stateMu.Unlock()
 			return resp, nil
 		}
+		var appErr *kernelAppError
+		if errors.As(err, &appErr) {
+			// Application-level ok=false reply from a healthy JVM: do NOT SIGKILL or respawn.
+			m.stateMu.Lock()
+			if m.proc == kp && m.gen == gen {
+				m.resetIdleLocked(gen)
+			}
+			m.stateMu.Unlock()
+			return nil, err
+		}
 		lastErr = err
 		m.invalidateProc(kp)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -452,7 +482,7 @@ func (m *MicroKernel) roundTrip(ctx context.Context, kp *kernelProc, payload []b
 			if msg == "" {
 				msg = "AgentKernel returned ok=false"
 			}
-			return &resp, errors.New(msg)
+			return &resp, &kernelAppError{msg: msg}
 		}
 		return &resp, nil
 	}

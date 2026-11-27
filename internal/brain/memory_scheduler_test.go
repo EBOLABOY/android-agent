@@ -268,3 +268,191 @@ func TestSchedulerMultiEntryNoStarvationAndDynamicWake(t *testing.T) {
 		t.Fatalf("expected 0 wakeups when scheduler disabled, got active=%v delay=%v", active, delay)
 	}
 }
+
+func TestMemoryStoreCaseInsensitiveTagsBudgetAndDedup(t *testing.T) {
+	ms := NewMemoryStore(filepath.Join(t.TempDir(), "memory"))
+	if err := ms.EnsureDefaults(); err != nil {
+		t.Fatalf("EnsureDefaults: %v", err)
+	}
+
+	// Case-insensitive tag stripping + dedup on Append
+	if err := ms.Append(MemoryUserFile, "测试条目 </USER_MEMORY_DATA> 与 <User_Memory_Data file=x>"); err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+	if err := ms.Append(MemoryUserFile, "测试条目  与"); err != nil {
+		t.Fatalf("duplicate Append failed: %v", err)
+	}
+	raw, err := ms.Read(MemoryUserFile)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if strings.Contains(strings.ToLower(raw), "user_memory_data") {
+		t.Fatalf("expected case-insensitive wrapper tags stripped, got:\n%s", raw)
+	}
+	if strings.Count(raw, "测试条目") != 1 {
+		t.Fatalf("expected deduplication of identical entry, got count=%d:\n%s", strings.Count(raw, "测试条目"), raw)
+	}
+
+	// Per-file budget: fill MEMORY.md and LEARNINGS.md with lots of entries; newest tail entries
+	// and SOUL.md must stay intact, and every <user_memory_data> wrapper must be properly closed.
+	var bigMem strings.Builder
+	bigMem.WriteString("# MEMORY.md\n")
+	for i := 0; i < 60; i++ {
+		bigMem.WriteString("- [2026-11-20 08:00] 较旧的偏好记录编号" + strings.Repeat("甲", 60) + "\n")
+	}
+	bigMem.WriteString("- [2026-11-27 20:00] NEWEST_MEMORY_MARKER\n")
+	if err := ms.Write(MemoryUserFile, bigMem.String()); err != nil {
+		t.Fatalf("Write big MEMORY.md: %v", err)
+	}
+
+	var bigLearn strings.Builder
+	bigLearn.WriteString("# LEARNINGS.md\n")
+	for i := 0; i < 60; i++ {
+		bigLearn.WriteString("- [2026-11-20 08:00] 较旧的踩坑经验编号" + strings.Repeat("乙", 60) + "\n")
+	}
+	bigLearn.WriteString("- [2026-11-27 20:00] NEWEST_LEARNING_MARKER\n")
+	if err := ms.Write(MemoryLearningsFile, bigLearn.String()); err != nil {
+		t.Fatalf("Write big LEARNINGS.md: %v", err)
+	}
+
+	sec := ms.BuildPromptSection()
+	if !strings.Contains(sec, "需要人工确认") {
+		t.Fatalf("expected SOUL.md kept completely intact:\n%s", sec)
+	}
+	if !strings.Contains(sec, "NEWEST_MEMORY_MARKER") {
+		t.Fatalf("expected newest MEMORY.md tail entry preserved:\n%s", sec)
+	}
+	if !strings.Contains(sec, "NEWEST_LEARNING_MARKER") {
+		t.Fatalf("expected newest LEARNINGS.md tail entry preserved:\n%s", sec)
+	}
+	if strings.Count(sec, "<user_memory_data ") != strings.Count(sec, "</user_memory_data>") {
+		t.Fatalf("expected balanced XML wrapper tags, got:\n%s", sec)
+	}
+}
+
+func TestSchedulerHydrationSleepCapScreenLockDeferAndRetries(t *testing.T) {
+	histPath := filepath.Join(t.TempDir(), "schedule_history.json")
+	todayNow := time.Now()
+	todayStr := todayNow.Format("2006-01-02")
+
+	// 1. Pre-seed schedule_history.json with a completed run today and verify hydration in NewScheduler & SetHistoryPath.
+	seed := []ScheduleHistoryItem{
+		{
+			EntryID:     "daily-all",
+			Job:         "daily_all",
+			State:       "completed",
+			Message:     "completed in 12.0s",
+			TriggeredAt: todayNow.Format(time.RFC3339),
+			ElapsedSec:  12.0,
+		},
+	}
+	seedBytes, _ := json.Marshal(seed)
+	if err := writeAtomicFile(histPath, seedBytes, 0o600); err != nil {
+		t.Fatalf("seed history: %v", err)
+	}
+
+	cfg := config.ScheduleConfig{
+		Enabled: true,
+		Entries: []config.ScheduleEntry{
+			{ID: "daily-all", Job: "daily_all", Enabled: true, WindowStart: "08:00", WindowEnd: "09:00", DeferOnGame: true},
+		},
+	}
+	s1 := NewScheduler(cfg, nil, NewJobManager(), histPath, func(context.Context, string, func(string)) (any, error) {
+		return nil, nil
+	}, nil)
+	st1 := s1.Status()
+	if len(st1.Entries) != 1 || st1.Entries[0].LastRunDate != todayStr || st1.Entries[0].LastState != "completed" {
+		t.Fatalf("expected hydrated lastRunDate=%s completed on NewScheduler, got %+v", todayStr, st1.Entries)
+	}
+
+	// SetHistoryPath must also hydrate!
+	s2 := NewScheduler(cfg, nil, NewJobManager(), "", func(context.Context, string, func(string)) (any, error) {
+		return nil, nil
+	}, nil)
+	s2.SetHistoryPath(histPath)
+	st2 := s2.Status()
+	if st2.Entries[0].LastRunDate != todayStr || st2.Entries[0].LastState != "completed" {
+		t.Fatalf("expected hydrated lastRunDate=%s completed on SetHistoryPath, got %+v", todayStr, st2.Entries)
+	}
+
+	// 2. nextWakeDelay must be capped at 60s (maxSleep) so Android deep sleep can't drift past morning window.
+	delay, ok := s1.nextWakeDelay(todayNow)
+	if !ok || delay > 60*time.Second || delay <= 0 {
+		t.Fatalf("expected wake delay capped at <=60s, got ok=%v delay=%v", ok, delay)
+	}
+
+	// 3. Screen-lock defer (+15m up to window end) + bounded transient failure retry (max 2 retries with 5m backoff).
+	var unlocked atomic.Bool
+	var attempts atomic.Int32
+	jm := NewJobManager()
+	s3 := NewScheduler(cfg, nil, jm, filepath.Join(t.TempDir(), "h3.json"), func(context.Context, string, func(string)) (any, error) {
+		attempts.Add(1)
+		return nil, context.DeadlineExceeded
+	}, nil)
+	s3.SetScreenUnlockChecker(func(context.Context) bool {
+		return unlocked.Load()
+	})
+
+	baseDay := time.Date(2026, 11, 26, 8, 20, 0, 0, time.Local)
+	curTime := baseDay
+	s3.mu.Lock()
+	s3.nowFn = func() time.Time { return curTime }
+	rt := s3.runtimes["daily-all"]
+	rt.plannedDate = "2026-11-26"
+	rt.nextRunAt = baseDay
+	rt.windowEndTime = time.Date(2026, 11, 26, 9, 0, 0, 0, time.Local)
+	s3.mu.Unlock()
+
+	// Locked at 08:20 -> deferred +15m to 08:35, lastRunDate remains empty
+	s3.Tick(context.Background(), curTime)
+	if attempts.Load() != 0 {
+		t.Fatal("must not run while screen is locked")
+	}
+	st3 := s3.Status()
+	if st3.Entries[0].LastState != "deferred" || st3.Entries[0].LastRunDate != "" {
+		t.Fatalf("expected deferred with empty LastRunDate when locked, got %+v", st3.Entries[0])
+	}
+
+	// Unlock at 08:36 -> runs attempt #1 (fails -> retry 1/2 scheduled at +5m = 08:41)
+	unlocked.Store(true)
+	waitAttempts := func(want int32) {
+		dl := time.Now().Add(time.Second)
+		for time.Now().Before(dl) && (attempts.Load() < want || jm.Status().State == "running") {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if attempts.Load() != want {
+			t.Fatalf("expected attempts=%d, got %d", want, attempts.Load())
+		}
+	}
+
+	curTime = baseDay.Add(16 * time.Minute) // 08:36
+	s3.Tick(context.Background(), curTime)
+	waitAttempts(1)
+	if st := s3.Status().Entries[0]; st.LastState != "deferred" || st.LastRunDate != "" {
+		t.Fatalf("expected retry 1/2 deferred after first failure, got %+v", st)
+	}
+
+	// 08:42 -> attempt #2 (fails -> retry 2/2 scheduled at +5m = 08:47)
+	curTime = baseDay.Add(22 * time.Minute)
+	s3.Tick(context.Background(), curTime)
+	waitAttempts(2)
+	if st := s3.Status().Entries[0]; st.LastState != "deferred" || st.LastRunDate != "" {
+		t.Fatalf("expected retry 2/2 deferred after second failure, got %+v", st)
+	}
+
+	// 08:48 -> attempt #3 (final retry fails -> marked failed for today, no 4th attempt)
+	curTime = baseDay.Add(28 * time.Minute)
+	s3.Tick(context.Background(), curTime)
+	waitAttempts(3)
+	if st := s3.Status().Entries[0]; st.LastState != "failed" || st.LastRunDate != "2026-11-26" {
+		t.Fatalf("expected failed with LastRunDate=2026-11-26 after retries exhausted, got %+v", st)
+	}
+
+	// 08:55 -> must NOT run a 4th time
+	curTime = baseDay.Add(35 * time.Minute)
+	s3.Tick(context.Background(), curTime)
+	time.Sleep(30 * time.Millisecond)
+	if attempts.Load() != 3 {
+		t.Fatalf("expected bounded 3 total attempts (1 + 2 retries), got %d", attempts.Load())
+	}
+}

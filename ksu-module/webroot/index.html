@@ -484,8 +484,46 @@ svg.ic {
   font-size: 12.5px;
   line-height: 1.45;
   display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.confirm-banner-head {
+  display: flex;
   align-items: flex-start;
   gap: 8px;
+}
+
+.confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  padding-left: 25px;
+}
+
+.confirm-btn {
+  padding: 6px 11px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  color: #fef3c7;
+  transition: transform 0.12s, background 0.15s;
+}
+
+.confirm-btn:active { transform: scale(0.96); }
+
+.confirm-btn.primary {
+  background: rgba(16, 185, 129, 0.18);
+  border-color: rgba(16, 185, 129, 0.45);
+  color: #a7f3d0;
+}
+
+.confirm-btn.danger {
+  background: rgba(244, 63, 94, 0.16);
+  border-color: rgba(244, 63, 94, 0.42);
+  color: #fecdd3;
 }
 
 .tool-box {
@@ -964,6 +1002,26 @@ pre#sheetLogs { margin: 0; max-height: 180px; overflow: auto; white-space: pre-w
 .field input, .field select { width: 100%; background: #09090c; color: var(--text); border: 1px solid var(--border-strong); border-radius: 11px; padding: 10px 11px; font-size: 13px; outline: none; }
 .field input:focus, .field select:focus { border-color: var(--cyan); }
 
+.sheet-notice {
+  display: none;
+  padding: 9px 11px;
+  border-radius: 11px;
+  font-size: 12px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+.sheet-notice.open { display: block; }
+.sheet-notice.err {
+  background: rgba(244, 63, 94, 0.14);
+  border: 1px solid rgba(244, 63, 94, 0.38);
+  color: #fecdd3;
+}
+.sheet-notice.ok {
+  background: rgba(16, 185, 129, 0.14);
+  border: 1px solid rgba(16, 185, 129, 0.36);
+  color: #a7f3d0;
+}
+
 .sheet-actions { display: flex; gap: 8px; margin-top: 2px; }
 .btn-secondary { flex: 1; padding: 11px; border-radius: 13px; font-size: 14px; font-weight: 600; background: rgba(255, 255, 255, 0.06); border: 1px solid var(--border); text-align: center; }
 .btn-primary { flex: 1.4; padding: 11px; border-radius: 13px; font-size: 14px; font-weight: 600; background: linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%); color: #fff; text-align: center; }
@@ -1091,6 +1149,7 @@ pre#sheetLogs { margin: 0; max-height: 180px; overflow: auto; white-space: pre-w
       <h2>端侧 Markdown 记忆系统</h2>
       <span id="memPermBadge" class="t-pill cyan">加载中</span>
     </div>
+    <div id="memorySheetNotice" class="sheet-notice" role="alert"></div>
     <div class="seg-tabs">
       <button id="tabSOUL" class="seg-btn active" onclick="selectMemoryTab('SOUL.md')">SOUL.md</button>
       <button id="tabMEM" class="seg-btn" onclick="selectMemoryTab('MEMORY.md')">MEMORY.md</button>
@@ -1116,6 +1175,7 @@ pre#sheetLogs { margin: 0; max-height: 180px; overflow: auto; white-space: pre-w
       <h2>0-Token 引擎与心跳调度</h2>
       <button id="sheetStopBtn" class="btn-danger hidden" onclick="cancelJob()">停止任务</button>
     </div>
+    <div id="autoSheetNotice" class="sheet-notice" role="alert"></div>
 
     <div class="task-list">
       <button class="task-row" onclick="runJob('daily_all', false)">
@@ -1199,6 +1259,7 @@ pre#sheetLogs { margin: 0; max-height: 180px; overflow: auto; white-space: pre-w
       <h2>云端大模型与鉴权</h2>
       <span id="authModeTag" class="agent-meta"></span>
     </div>
+    <div id="settingsSheetNotice" class="sheet-notice" role="alert"></div>
 
     <div id="tokenField" class="field">
       Bearer Token（浏览器访问需要，KernelSU 内免填）
@@ -1252,17 +1313,26 @@ const CAT_LABELS = {
 
 let seq = 0;
 let polling = false;
+let pollTimer = null;
+let uiBootstrapped = false;
 let sending = false;
 let currentModelName = '';
 let memFilesCache = [];
 let activeMemFile = 'SOUL.md';
+let scheduleCache = null;
+let settingsLoadedFromServer = false;
 let activeRunId = '';
 let lastEventSeq = 0;
 let activeTurn = null;
 let replayTimer = null;
 let replayInFlight = false;
+let replayConsecutiveErrors = 0;
+const renderedRunIds = new Set();
 const RUN_STORAGE_KEY = 'agent_active_run_id';
 const SEQ_STORAGE_KEY = 'agent_last_event_seq';
+const RUN_TS_STORAGE_KEY = 'agent_active_run_ts';
+const LAST_DONE_RUN_KEY = 'agent_last_done_run_id';
+const RUN_TTL_MS = 2 * 60 * 60 * 1000;
 
 if (!KSU_SUPPORTED && location.hash.startsWith('#token=')) {
   localStorage.setItem(TOKEN_KEY, decodeURIComponent(location.hash.slice(7)));
@@ -1340,11 +1410,29 @@ async function api(path, method = 'GET', body = null, timeoutMs = 15000) {
       throw new Error('Bearer Token 未设置或无效');
     }
     const data = await r.json();
-    if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+    if (!r.ok) {
+      const err = new Error((data && data.error) || ('HTTP ' + r.status));
+      err.status = r.status;
+      throw err;
+    }
     return data;
   } finally {
     clearTimeout(timer);
   }
+}
+
+function showSheetNotice(sheetId, msg, isErr = true) {
+  const el = document.getElementById(sheetId + 'Notice');
+  if (!el) return;
+  el.textContent = msg || '';
+  el.className = 'sheet-notice open ' + (isErr ? 'err' : 'ok');
+}
+
+function clearSheetNotice(sheetId) {
+  const el = document.getElementById(sheetId + 'Notice');
+  if (!el) return;
+  el.textContent = '';
+  el.className = 'sheet-notice';
 }
 
 /* ---------- Lightweight Safe Markdown ---------- */
@@ -1450,9 +1538,68 @@ function buildToolTraceBox(tools, trace) {
   return box;
 }
 
-function appendAgentBubble(text, tools = [], elapsedSec = null, isError = false, trace = [], needsConfirm = false) {
+function createConfirmBanner(summaryText) {
+  const banner = document.createElement('div');
+  banner.className = 'confirm-banner';
+
+  const head = document.createElement('div');
+  head.className = 'confirm-banner-head';
+  const detail = summaryText ? `（${escapeHTML(summaryText)}）` : '';
+  head.innerHTML = `<svg class="ic" style="flex-shrink:0;margin-top:2px" viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg><span><strong>需要人工确认</strong>${detail}：Agent 已遵守 SOUL.md 安全红线停在此步，请在手机屏幕上核对金额/验证码后再选择下一步操作。</span>`;
+
+  const actions = document.createElement('div');
+  actions.className = 'confirm-actions';
+
+  const btnDefs = [
+    {
+      label: '我已处理，继续',
+      cls: 'confirm-btn primary',
+      onClick: () => quickPrompt('我已在手机上完成人工核对与处理，请先检查当前界面状态并继续执行后续步骤。'),
+    },
+    {
+      label: '截屏核对',
+      cls: 'confirm-btn',
+      onClick: () => quickPrompt('请调用 phone_screenshot 截屏核对当前手机页面状态，先不要执行最终提交或支付操作。'),
+    },
+    {
+      label: '放弃任务',
+      cls: 'confirm-btn danger',
+      onClick: () => {
+        if (sending) {
+          cancelActiveChat();
+        } else {
+          quickPrompt('放弃当前任务，不要继续操作，保持手机现状即可。');
+        }
+      },
+    },
+  ];
+
+  const buttons = [];
+  for (const def of btnDefs) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = def.cls;
+    b.textContent = def.label;
+    b.addEventListener('click', () => {
+      for (const other of buttons) other.disabled = true;
+      def.onClick();
+    });
+    buttons.push(b);
+    actions.appendChild(b);
+  }
+
+  banner.appendChild(head);
+  banner.appendChild(actions);
+  return banner;
+}
+
+function appendAgentBubble(text, tools = [], elapsedSec = null, isError = false, trace = [], needsConfirm = false, runId = '') {
   const wrap = document.createElement('div');
   wrap.className = 'turn-agent';
+  if (runId) {
+    wrap.dataset.runId = runId;
+    renderedRunIds.add(runId);
+  }
 
   const hdr = document.createElement('div');
   hdr.className = 'agent-hdr';
@@ -1474,10 +1621,7 @@ function appendAgentBubble(text, tools = [], elapsedSec = null, isError = false,
   if (traceBox) wrap.appendChild(traceBox);
 
   if (needsConfirm) {
-    const banner = document.createElement('div');
-    banner.className = 'confirm-banner';
-    banner.innerHTML = `<svg class="ic" style="flex-shrink:0;margin-top:2px" viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg><span><strong>需要人工确认</strong>：Agent 已遵守 SOUL.md 安全红线停在此步，请在手机屏幕上核对金额/验证码后再手动操作。</span>`;
-    wrap.appendChild(banner);
+    wrap.appendChild(createConfirmBanner(''));
   }
 
   const body = document.createElement('div');
@@ -1603,13 +1747,36 @@ function addCollapsedToolRow(turn, ev) {
   scrollToBottom();
 }
 
-function showConfirmBannerInTurn(turn) {
+function showConfirmBannerInTurn(turn, summaryText = '') {
   if (!turn || turn.confirmShown) return;
   turn.confirmShown = true;
-  const banner = document.createElement('div');
-  banner.className = 'confirm-banner';
-  banner.innerHTML = `<svg class="ic" style="flex-shrink:0;margin-top:2px" viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg><span><strong>需要人工确认</strong>：Agent 已遵守 SOUL.md 安全红线停在此步，请在手机屏幕上核对金额/验证码后再手动操作。</span>`;
-  turn.confirmSlot.appendChild(banner);
+  turn.confirmSlot.appendChild(createConfirmBanner(summaryText));
+}
+
+function hydrateAccumulatedText(turn, snap) {
+  if (!turn || !snap || typeof snap.accumulated_text !== 'string' || !snap.accumulated_text) return;
+  if (snap.accumulated_text.length > (turn.streamText || '').length) {
+    turn.streamText = snap.accumulated_text;
+    if (turn.liveStepEl) turn.liveStepEl.classList.add('hidden');
+    turn.bodyEl.className = 'agent-body';
+    turn.bodyEl.innerHTML = renderMarkdown(turn.streamText) + (snap.finished ? '' : '<span class="stream-cursor"></span>');
+    scrollToBottom();
+  }
+}
+
+function loadPersistedRunTracking() {
+  try {
+    const ts = Number(localStorage.getItem(RUN_TS_STORAGE_KEY) || '0') || 0;
+    const runId = localStorage.getItem(RUN_STORAGE_KEY) || sessionStorage.getItem(RUN_STORAGE_KEY) || '';
+    const seqNum = Number(localStorage.getItem(SEQ_STORAGE_KEY) || sessionStorage.getItem(SEQ_STORAGE_KEY) || '0') || 0;
+    if (!runId || (ts > 0 && Date.now() - ts > RUN_TTL_MS)) {
+      persistRunTracking('', 0);
+      return {runId: '', seq: 0};
+    }
+    return {runId, seq: seqNum};
+  } catch (_) {
+    return {runId: '', seq: 0};
+  }
 }
 
 function persistRunTracking(runId, seqNum) {
@@ -1617,9 +1784,15 @@ function persistRunTracking(runId, seqNum) {
   lastEventSeq = seqNum || 0;
   try {
     if (activeRunId) {
+      localStorage.setItem(RUN_STORAGE_KEY, activeRunId);
+      localStorage.setItem(SEQ_STORAGE_KEY, String(lastEventSeq));
+      localStorage.setItem(RUN_TS_STORAGE_KEY, String(Date.now()));
       sessionStorage.setItem(RUN_STORAGE_KEY, activeRunId);
       sessionStorage.setItem(SEQ_STORAGE_KEY, String(lastEventSeq));
     } else {
+      localStorage.removeItem(RUN_STORAGE_KEY);
+      localStorage.removeItem(SEQ_STORAGE_KEY);
+      localStorage.removeItem(RUN_TS_STORAGE_KEY);
       sessionStorage.removeItem(RUN_STORAGE_KEY);
       sessionStorage.removeItem(SEQ_STORAGE_KEY);
     }
@@ -1634,13 +1807,20 @@ function stopReplayLoop() {
 }
 
 function finalizeTurnUI(turn, isErr) {
+  const finishedRunId = activeRunId;
+  if (finishedRunId) {
+    renderedRunIds.add(finishedRunId);
+    try { localStorage.setItem(LAST_DONE_RUN_KEY, finishedRunId); } catch (_) {}
+  }
   if (turn) {
+    if (finishedRunId) turn.wrap.dataset.runId = finishedRunId;
     clearInterval(turn.clockTimer);
     if (turn.liveStepEl) turn.liveStepEl.classList.add('hidden');
     turn.orb.classList.remove('busy');
     if (isErr) turn.orb.classList.add('warn');
   }
   sending = false;
+  replayConsecutiveErrors = 0;
   document.getElementById('topOrb').classList.remove('busy');
   stopReplayLoop();
   persistRunTracking('', 0);
@@ -1663,6 +1843,10 @@ function applyRunEvent(ev) {
   if (!activeTurn) {
     activeTurn = createLiveAgentTurn();
   }
+  if (activeRunId && !activeTurn.wrap.dataset.runId) {
+    activeTurn.wrap.dataset.runId = activeRunId;
+    renderedRunIds.add(activeRunId);
+  }
 
   switch (ev.type) {
     case 'run_start':
@@ -1674,6 +1858,9 @@ function applyRunEvent(ev) {
       break;
 
     case 'tool_start':
+      activeTurn.streamText = '';
+      activeTurn.bodyEl.innerHTML = '';
+      activeTurn.bodyEl.classList.add('hidden');
       setLiveStepText(activeTurn, ev.summary || `正在调用 ${ev.tool}...`, ev.max_steps ? `${ev.step}/${ev.max_steps}` : '');
       break;
 
@@ -1693,13 +1880,13 @@ function applyRunEvent(ev) {
       break;
 
     case 'needs_confirmation':
-      showConfirmBannerInTurn(activeTurn);
+      showConfirmBannerInTurn(activeTurn, ev.summary || '');
       scrollToBottom();
       break;
 
     case 'done': {
       const finalText = ev.reply || activeTurn.streamText || '(无回复)';
-      if (ev.needs_confirmation) showConfirmBannerInTurn(activeTurn);
+      if (ev.needs_confirmation) showConfirmBannerInTurn(activeTurn, ev.summary || '');
       if (ev.elapsed_sec !== undefined && ev.elapsed_sec !== null) {
         activeTurn.clockEl.textContent = `· ${ev.elapsed_sec}s`;
       }
@@ -1862,6 +2049,7 @@ async function refreshSchedule() {
   if (!KSU_SUPPORTED && !getToken()) return;
   try {
     const sched = await api('/api/v1/schedule');
+    scheduleCache = sched;
     updateCronPill(sched);
     document.getElementById('cronEnabled').checked = !!sched.enabled;
     const e = (sched.entries && sched.entries[0]) || null;
@@ -1872,47 +2060,90 @@ async function refreshSchedule() {
       document.getElementById('cronDefer').checked = e.defer_on_game !== false;
       const t = e.next_run_at ? new Date(e.next_run_at) : null;
       const hhmm = (t && !isNaN(t)) ? `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}` : '—';
-      document.getElementById('cronNextTip').textContent = `今日随机触发：${hhmm}` + (e.last_state ? ` · 上次:${e.last_state}` : '');
+      const extraCount = (sched.entries && sched.entries.length > 1) ? ` · 共 ${sched.entries.length} 条规则` : '';
+      document.getElementById('cronNextTip').textContent = `今日随机触发：${hhmm}` + (e.last_state ? ` · 上次:${e.last_state}` : '') + extraCount;
     }
     const histBox = document.getElementById('cronHistory');
     const items = (sched.history || []).slice(-5).reverse();
     histBox.innerHTML = items.length ? items.map(h => {
-      const ts = (h.triggered_at || '').slice(11, 16);
+      const rawTs = h.triggered_at || '';
+      const ts = rawTs.length >= 16 ? rawTs.slice(5, 16).replace('T', ' ') : rawTs.slice(11, 16);
       return `<div class="hist-item"><span>${escapeHTML(ts + ' ' + h.job)}</span><span>${escapeHTML(h.state + (h.message ? ' · ' + h.message : ''))}</span></div>`;
     }).join('') : '';
   } catch (_) {}
 }
 
+function isValidHHMM(v) {
+  if (!/^\d{2}:\d{2}$/.test(v)) return false;
+  const [hh, mm] = v.split(':').map(Number);
+  return hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59;
+}
+
 async function saveSchedule() {
+  clearSheetNotice('autoSheet');
+  const startVal = (document.getElementById('cronStart').value || '08:15').trim();
+  const endVal = (document.getElementById('cronEnd').value || '09:30').trim();
+  if (!isValidHHMM(startVal) || !isValidHHMM(endVal)) {
+    showSheetNotice('autoSheet', '时间格式无效，请使用 HH:MM（00:00..23:59）');
+    return;
+  }
+  if (endVal <= startVal) {
+    showSheetNotice('autoSheet', '最晚时间必须晚于最早时间');
+    return;
+  }
+  const preserved = Array.isArray(scheduleCache?.entries)
+    ? scheduleCache.entries.map(e => ({
+        id: e.id || '',
+        job: e.job || 'daily_all',
+        enabled: e.enabled !== false,
+        window_start: e.window_start || '08:15',
+        window_end: e.window_end || '09:30',
+        defer_on_game: e.defer_on_game !== false,
+      }))
+    : [];
+  const primary = {
+    id: (preserved[0] && preserved[0].id) ? preserved[0].id : 'daily-all',
+    job: document.getElementById('cronJob').value,
+    enabled: true,
+    window_start: startVal,
+    window_end: endVal,
+    defer_on_game: document.getElementById('cronDefer').checked,
+  };
+  if (preserved.length > 0) {
+    preserved[0] = primary;
+  } else {
+    preserved.push(primary);
+  }
   const payload = {
     enabled: document.getElementById('cronEnabled').checked,
-    entries: [{
-      id: 'daily-all',
-      job: document.getElementById('cronJob').value,
-      enabled: true,
-      window_start: document.getElementById('cronStart').value || '08:15',
-      window_end: document.getElementById('cronEnd').value || '09:30',
-      defer_on_game: document.getElementById('cronDefer').checked,
-    }],
+    entries: preserved,
   };
   try {
     const res = await api('/api/v1/schedule', 'POST', payload);
+    scheduleCache = res;
     updateCronPill(res);
     await refreshSchedule();
-    document.getElementById('cronNextTip').textContent += '（已保存）';
+    showSheetNotice('autoSheet', '定时计划已保存 ✓', false);
   } catch (e) {
-    appendAgentBubble('保存定时计划失败：' + e.message, [], null, true);
+    showSheetNotice('autoSheet', '保存定时计划失败：' + e.message, true);
   }
 }
 
 async function pollTick() {
-  if (polling) return;
+  if (polling || document.hidden) return;
   polling = true;
   try {
     await Promise.all([refreshStatus(), refreshJob()]);
   } finally {
     polling = false;
   }
+}
+
+function startPollLoop() {
+  if (pollTimer) return;
+  pollTimer = setInterval(() => {
+    if (!document.hidden) pollTick();
+  }, 3500);
 }
 
 /* ---------- Memory Manager ---------- */
@@ -1923,7 +2154,8 @@ async function openMemory() {
     memFilesCache = res.files || [];
     renderMemoryTab();
   } catch (e) {
-    document.getElementById('memEditor').value = '读取记忆失败：' + e.message;
+    showSheetNotice('memorySheet', '读取记忆失败：' + e.message, true);
+    document.getElementById('memEditor').value = '';
   }
 }
 
@@ -1932,6 +2164,7 @@ function selectMemoryTab(name) {
   document.getElementById('tabSOUL').classList.toggle('active', name === 'SOUL.md');
   document.getElementById('tabMEM').classList.toggle('active', name === 'MEMORY.md');
   document.getElementById('tabLEARN').classList.toggle('active', name === 'LEARNINGS.md');
+  clearSheetNotice('memorySheet');
   renderMemoryTab();
 }
 
@@ -1949,6 +2182,7 @@ function renderMemoryTab() {
 async function saveMemory() {
   const btn = document.getElementById('memSaveBtn');
   const content = document.getElementById('memEditor').value;
+  clearSheetNotice('memorySheet');
   btn.disabled = true;
   btn.textContent = '保存中...';
   try {
@@ -1956,10 +2190,11 @@ async function saveMemory() {
     memFilesCache = res.files || memFilesCache;
     renderMemoryTab();
     btn.textContent = '已保存 ✓';
+    showSheetNotice('memorySheet', `${activeMemFile} 已保存 ✓`, false);
     setTimeout(() => { btn.textContent = '保存此记忆'; }, 1200);
   } catch (e) {
     btn.textContent = '保存失败';
-    appendAgentBubble('保存记忆失败：' + e.message, [], null, true);
+    showSheetNotice('memorySheet', '保存记忆失败：' + e.message, true);
   } finally {
     btn.disabled = false;
   }
@@ -1973,21 +2208,31 @@ function openAutomation() {
 }
 
 async function runJob(name, openLogSheet) {
+  clearSheetNotice('autoSheet');
   try {
     await api('/api/v1/jobs/run', 'POST', {job: name});
     if (openLogSheet) openAutomation();
     await refreshJob();
   } catch (e) {
-    appendAgentBubble('任务启动失败：' + e.message, [], null, true);
+    if (document.getElementById('autoSheet').classList.contains('open')) {
+      showSheetNotice('autoSheet', '任务启动失败：' + e.message, true);
+    } else {
+      appendAgentBubble('任务启动失败：' + e.message, [], null, true);
+    }
   }
 }
 
 async function cancelJob() {
+  clearSheetNotice('autoSheet');
   try {
     await api('/api/v1/jobs/cancel', 'POST', {});
     await refreshJob();
   } catch (e) {
-    appendAgentBubble('停止任务失败：' + e.message, [], null, true);
+    if (document.getElementById('autoSheet').classList.contains('open')) {
+      showSheetNotice('autoSheet', '停止任务失败：' + e.message, true);
+    } else {
+      appendAgentBubble('停止任务失败：' + e.message, [], null, true);
+    }
   }
 }
 
@@ -2021,18 +2266,53 @@ async function replayOnce() {
   try {
     const q = `/api/v1/chat/events?run_id=${encodeURIComponent(activeRunId)}&after_seq=${lastEventSeq}`;
     const snap = await api(q, 'GET', null, 8000);
-    if (snap && Array.isArray(snap.events)) {
+    replayConsecutiveErrors = 0;
+
+    if (!snap || snap.not_found || (!snap.active && !snap.finished)) {
+      if (activeTurn) {
+        if (!activeTurn.streamText) {
+          activeTurn.bodyEl.className = 'agent-error';
+          activeTurn.bodyEl.textContent = '服务已重启或该任务记录已失效，界面已自动恢复。';
+        }
+        finalizeTurnUI(activeTurn, true);
+      } else {
+        finalizeTurnUI(null, true);
+      }
+      return;
+    }
+
+    if (Array.isArray(snap.events)) {
       for (const ev of snap.events) {
         applyRunEvent(ev);
       }
     }
-    if (sending && snap && snap.finished && activeTurn) {
+    if (sending && activeTurn) {
+      hydrateAccumulatedText(activeTurn, snap);
+    }
+    if (sending && snap.finished && activeTurn) {
+      const finalText = activeTurn.streamText || snap.accumulated_text || '(已完成)';
+      activeTurn.bodyEl.className = 'agent-body';
+      activeTurn.bodyEl.innerHTML = renderMarkdown(finalText);
       finalizeTurnUI(activeTurn, false);
-    } else if (sending && snap && snap.active && !replayTimer) {
+    } else if (sending && snap.active && !replayTimer && !document.hidden) {
       scheduleReplayLoop(450);
     }
-  } catch (_) {
-    if (sending) scheduleReplayLoop(900);
+  } catch (e) {
+    replayConsecutiveErrors++;
+    const isNotFound = e && (e.status === 404 || /404|not[\s_]?found/i.test(String(e.message || '')));
+    if (isNotFound || replayConsecutiveErrors >= 12) {
+      if (activeTurn) {
+        activeTurn.bodyEl.className = 'agent-error';
+        activeTurn.bodyEl.textContent = isNotFound
+          ? '服务已重启或该任务记录不存在，界面已自动恢复。'
+          : ('与守护进程失联，已停止重试：' + (e?.message || '网络异常'));
+        finalizeTurnUI(activeTurn, true);
+      } else {
+        finalizeTurnUI(null, true);
+      }
+      return;
+    }
+    if (sending && !document.hidden) scheduleReplayLoop(900);
   } finally {
     replayInFlight = false;
   }
@@ -2040,12 +2320,12 @@ async function replayOnce() {
 
 function scheduleReplayLoop(delayMs = 450) {
   stopReplayLoop();
-  if (!sending || !activeRunId) return;
+  if (!sending || !activeRunId || document.hidden) return;
   replayTimer = setTimeout(async () => {
     replayTimer = null;
-    if (!sending || !activeRunId) return;
+    if (!sending || !activeRunId || document.hidden) return;
     await replayOnce();
-    if (sending && activeRunId && !replayTimer) {
+    if (sending && activeRunId && !replayTimer && !document.hidden) {
       scheduleReplayLoop(450);
     }
   }, delayMs);
@@ -2163,12 +2443,22 @@ async function sendChat() {
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && activeRunId && sending) {
+  if (document.hidden) {
+    stopReplayLoop();
+    return;
+  }
+  if (KSU_SUPPORTED || getToken()) {
+    pollTick();
+  }
+  if (activeRunId && sending) {
     replayOnce();
   }
 });
 
 window.addEventListener('online', () => {
+  if (!document.hidden && (KSU_SUPPORTED || getToken())) {
+    pollTick();
+  }
   if (activeRunId && sending) {
     replayOnce();
   }
@@ -2177,10 +2467,13 @@ window.addEventListener('online', () => {
 async function clearChat() {
   try { await api('/api/v1/chat/clear', 'POST', {}); } catch (_) {}
   document.getElementById('feed').innerHTML = '';
+  renderedRunIds.clear();
+  try { localStorage.removeItem(LAST_DONE_RUN_KEY); } catch (_) {}
   syncHeroVisibility();
 }
 
 function openSheet(id) {
+  clearSheetNotice(id);
   document.getElementById(id).classList.add('open');
 }
 
@@ -2198,39 +2491,61 @@ async function openSettings() {
   document.getElementById('tokenField').classList.toggle('hidden', KSU_SUPPORTED);
   document.getElementById('authModeTag').textContent = KSU_SUPPORTED ? 'KernelSU Root 免密' : 'Browser Bearer Auth';
   if (!KSU_SUPPORTED) document.getElementById('cfgToken').value = getToken();
+  settingsLoadedFromServer = false;
   openSheet('settingsSheet');
   if (KSU_SUPPORTED || getToken()) {
     try {
       const cfg = await api('/api/v1/llm/config');
+      settingsLoadedFromServer = true;
       document.getElementById('cfgProvider').value = cfg.provider || 'openai';
       document.getElementById('cfgBaseURL').value = cfg.base_url || '';
       document.getElementById('cfgModel').value = cfg.model || '';
       document.getElementById('cfgAPIKey').value = '';
       document.getElementById('cfgAPIKey').placeholder = cfg.api_key_masked ? ('当前已配置: ' + cfg.api_key_masked) : 'nvapi-... / sk-... / AIza...';
-    } catch (_) {}
+    } catch (e) {
+      showSheetNotice('settingsSheet', '读取配置失败：' + e.message, true);
+    }
   }
 }
 
 async function saveSettings() {
+  clearSheetNotice('settingsSheet');
   if (!KSU_SUPPORTED) {
     const tok = document.getElementById('cfgToken').value.trim();
-    if (tok) localStorage.setItem(TOKEN_KEY, tok);
+    if (!tok) {
+      showSheetNotice('settingsSheet', '请先输入 Bearer Token', true);
+      return;
+    }
+    localStorage.setItem(TOKEN_KEY, tok);
   }
-  const body = {
-    provider: document.getElementById('cfgProvider').value,
-    base_url: document.getElementById('cfgBaseURL').value.trim(),
-    model: document.getElementById('cfgModel').value.trim(),
-  };
-  const key = document.getElementById('cfgAPIKey').value.trim();
-  if (key) body.api_key = key;
+  const providerVal = document.getElementById('cfgProvider').value;
+  const baseUrlVal = document.getElementById('cfgBaseURL').value.trim();
+  const modelVal = document.getElementById('cfgModel').value.trim();
+  const keyVal = document.getElementById('cfgAPIKey').value.trim();
 
   try {
-    const saved = await api('/api/v1/llm/config', 'POST', body);
-    currentModelName = saved.model || body.model || currentModelName;
+    // First-run token-only save: verify token & keep existing server LLM config intact
+    if (!settingsLoadedFromServer && !baseUrlVal && !modelVal && !keyVal) {
+      const cfg = await api('/api/v1/llm/config');
+      if (cfg && cfg.model) currentModelName = cfg.model;
+    } else {
+      const body = {};
+      if (settingsLoadedFromServer || providerVal) body.provider = providerVal;
+      if (settingsLoadedFromServer || baseUrlVal) body.base_url = baseUrlVal;
+      if (settingsLoadedFromServer || modelVal) body.model = modelVal;
+      if (keyVal) body.api_key = keyVal;
+      const saved = await api('/api/v1/llm/config', 'POST', body);
+      currentModelName = saved.model || modelVal || currentModelName;
+    }
     closeSheet('settingsSheet');
-    await refreshStatus();
+    if (!uiBootstrapped) {
+      await bootstrapAuthedUI();
+    } else {
+      await refreshStatus();
+      startPollLoop();
+    }
   } catch (e) {
-    appendAgentBubble('保存设置失败：' + e.message, [], null, true);
+    showSheetNotice('settingsSheet', '保存设置失败：' + e.message, true);
   }
 }
 
@@ -2260,11 +2575,97 @@ function autoResizeInput() {
 const promptEl = document.getElementById('prompt');
 promptEl.addEventListener('input', autoResizeInput);
 promptEl.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
     sendChat();
   }
 });
+
+async function bootstrapAuthedUI() {
+  try {
+    const [cfg, hist, sched] = await Promise.all([
+      api('/api/v1/llm/config').catch(() => null),
+      api('/api/v1/chat/history').catch(() => null),
+      api('/api/v1/schedule').catch(() => null),
+    ]);
+    if (cfg && cfg.model) currentModelName = cfg.model;
+    if (sched) {
+      scheduleCache = sched;
+      updateCronPill(sched);
+    }
+    const msgs = hist?.messages || hist?.history || [];
+    let lastRenderedAssistantText = '';
+    if (!uiBootstrapped || document.getElementById('feed').children.length === 0) {
+      for (const m of msgs) {
+        if ((m.role === 'user' || m.role === 'assistant') && m.text) {
+          if (m.role === 'user') {
+            appendUserBubble(m.text);
+          } else {
+            if (m.run_id && renderedRunIds.has(m.run_id)) continue;
+            const tools = Array.isArray(m.tool_calls) ? m.tool_calls.map(tc => tc.name).filter(Boolean) : [];
+            appendAgentBubble(m.text, tools, null, false, [], !!m.needs_confirmation, m.run_id || '');
+            lastRenderedAssistantText = String(m.text).trim();
+          }
+        }
+      }
+    }
+
+    // Check if there is an active or recently suspended run to attach & replay immediately
+    const {runId: storedRunId, seq: storedSeq} = loadPersistedRunTracking();
+    const lastDoneRunId = (() => { try { return localStorage.getItem(LAST_DONE_RUN_KEY) || ''; } catch (_) { return ''; } })();
+    const snap = await api(
+      storedRunId ? `/api/v1/chat/events?run_id=${encodeURIComponent(storedRunId)}&after_seq=0` : '/api/v1/chat/events',
+      'GET',
+      null,
+      6000
+    ).catch(() => null);
+
+    if (snap && snap.not_found) {
+      persistRunTracking('', 0);
+    } else if (snap && snap.run_id && !renderedRunIds.has(snap.run_id)) {
+      const doneEv = Array.isArray(snap.events) ? snap.events.find(ev => ev.type === 'done') : null;
+      const snapReply = String((doneEv && doneEv.reply) || snap.accumulated_text || '').trim();
+      const alreadyInHistory = !!(snap.finished && (
+        snap.run_id === lastDoneRunId ||
+        (snapReply && lastRenderedAssistantText && snapReply === lastRenderedAssistantText)
+      ));
+      if (alreadyInHistory) {
+        renderedRunIds.add(snap.run_id);
+        persistRunTracking('', 0);
+      } else if (snap.active || (storedRunId && snap.run_id === storedRunId && storedSeq < (snap.last_seq || 0))) {
+        if (snap.user_message && (!msgs.length || msgs[msgs.length - 1].text !== snap.user_message)) {
+          appendUserBubble(snap.user_message);
+        }
+        sending = true;
+        document.getElementById('topOrb').classList.add('busy');
+        persistRunTracking(snap.run_id, 0);
+        activeTurn = createLiveAgentTurn();
+        activeTurn.wrap.dataset.runId = snap.run_id;
+        renderedRunIds.add(snap.run_id);
+        syncSendState();
+        for (const ev of (snap.events || [])) {
+          applyRunEvent(ev);
+        }
+        if (sending && activeTurn) {
+          hydrateAccumulatedText(activeTurn, snap);
+          if (snap.finished) {
+            const finalText = activeTurn.streamText || snap.accumulated_text || '(已完成)';
+            activeTurn.bodyEl.className = 'agent-body';
+            activeTurn.bodyEl.innerHTML = renderMarkdown(finalText);
+            finalizeTurnUI(activeTurn, false);
+          } else {
+            scheduleReplayLoop(450);
+          }
+        }
+      } else if (storedRunId && !snap.active && !snap.finished) {
+        persistRunTracking('', 0);
+      }
+    }
+  } catch (_) {}
+  uiBootstrapped = true;
+  await pollTick();
+  startPollLoop();
+}
 
 async function init() {
   document.getElementById('sheetAuthBadge').textContent = KSU_SUPPORTED ? 'KSU Root' : 'HTTP Bearer';
@@ -2273,46 +2674,7 @@ async function init() {
     openSettings();
     return;
   }
-  try {
-    const [cfg, hist, sched] = await Promise.all([
-      api('/api/v1/llm/config').catch(() => null),
-      api('/api/v1/chat/history').catch(() => null),
-      api('/api/v1/schedule').catch(() => null),
-    ]);
-    if (cfg && cfg.model) currentModelName = cfg.model;
-    if (sched) updateCronPill(sched);
-    const msgs = hist?.messages || hist?.history || [];
-    for (const m of msgs) {
-      if ((m.role === 'user' || m.role === 'assistant') && m.text) {
-        if (m.role === 'user') {
-          appendUserBubble(m.text);
-        } else {
-          const tools = Array.isArray(m.tool_calls) ? m.tool_calls.map(tc => tc.name).filter(Boolean) : [];
-          appendAgentBubble(m.text, tools);
-        }
-      }
-    }
-    // Check if there is an active or recently suspended run to attach & replay immediately
-    const storedRunId = (() => { try { return sessionStorage.getItem(RUN_STORAGE_KEY) || ''; } catch (_) { return ''; } })();
-    const storedSeq = (() => { try { return Number(sessionStorage.getItem(SEQ_STORAGE_KEY) || '0') || 0; } catch (_) { return 0; } })();
-    const snap = await api(storedRunId ? `/api/v1/chat/events?run_id=${encodeURIComponent(storedRunId)}&after_seq=0` : '/api/v1/chat/events', 'GET', null, 6000).catch(() => null);
-    if (snap && snap.run_id && (snap.active || (storedRunId && snap.run_id === storedRunId && !snap.finished) || (storedRunId && storedSeq < snap.last_seq && snap.finished))) {
-      if (snap.user_message && (!msgs.length || msgs[msgs.length - 1].text !== snap.user_message)) {
-        appendUserBubble(snap.user_message);
-      }
-      sending = true;
-      document.getElementById('topOrb').classList.add('busy');
-      persistRunTracking(snap.run_id, 0);
-      activeTurn = createLiveAgentTurn();
-      syncSendState();
-      for (const ev of (snap.events || [])) {
-        applyRunEvent(ev);
-      }
-      if (sending) scheduleReplayLoop(450);
-    }
-  } catch (_) {}
-  await pollTick();
-  setInterval(pollTick, 3500);
+  await bootstrapAuthedUI();
 }
 
 init();

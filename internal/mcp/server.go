@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,8 +33,9 @@ import (
 
 const (
 	ServerName          = "android-agent"
-	ServerVersion       = "0.3.3-streaming"
+	ServerVersion       = "0.3.4"
 	DefaultProtoVersion = "2025-03-26"
+	mcpSessionTTL       = 2 * time.Hour
 )
 
 type backendIslandAdapter struct {
@@ -85,6 +88,9 @@ type Server struct {
 	sessMu   sync.RWMutex
 	sessions map[string]time.Time
 
+	shotMu   sync.RWMutex
+	lastShot screenshotMeta
+
 	srvMu      sync.Mutex
 	listener   net.Listener
 	httpServer *http.Server
@@ -95,6 +101,14 @@ type Server struct {
 	sseMu      sync.Mutex
 	sseCancels map[int]context.CancelFunc
 	nextSSEID  int
+}
+
+type screenshotMeta struct {
+	origWidth  int
+	origHeight int
+	width      int
+	height     int
+	capturedAt time.Time
 }
 
 func NewServer(cfg *config.Config, be backend.DeviceBackend, g *guard.Guard, cdpClient *cdp.Client, logger func(string, ...any)) *Server {
@@ -119,9 +133,15 @@ func NewServer(cfg *config.Config, be backend.DeviceBackend, g *guard.Guard, cdp
 	_ = s.memory.EnsureDefaults()
 	s.agent = brain.NewAgent(cfg.LLM, s, g)
 	s.agent.SetMemoryStore(s.memory)
+	lease := brain.NewDeviceLease()
+	s.agent.SetDeviceLease(lease)
+	s.jobs.SetDeviceLease(lease)
 	s.island = brain.NewIslandController(&backendIslandAdapter{be: be})
 	s.agent.SetEventObserver(s.island.HandleEvent)
 	s.scheduler = brain.NewScheduler(cfg.Schedule, g, s.jobs, "", s.runWorkflowJob, logger)
+	if u, ok := be.(interface{ IsScreenUnlocked(context.Context) bool }); ok {
+		s.scheduler.SetScreenUnlockChecker(u.IsScreenUnlocked)
+	}
 
 	apiMux := http.NewServeMux()
 	apiMux.HandleFunc("/mcp", s.handleMCP)
@@ -321,9 +341,65 @@ func isLoopbackHost(h string) bool {
 	return h == "localhost" || h == "127.0.0.1" || h == "::1"
 }
 
-func isAllowedHostHeader(hostHeader string) bool {
+func normalizeAuthority(scheme, hostport string) (string, bool) {
+	hostport = strings.TrimSpace(hostport)
+	if hostport == "" {
+		return "", false
+	}
+	var host, port string
+	if h, p, err := net.SplitHostPort(hostport); err == nil {
+		host = strings.ToLower(strings.Trim(h, "[]"))
+		port = strings.TrimSpace(p)
+	} else {
+		// Reject malformed host:port (e.g. unbracketed IPv6 or stray colon)
+		if strings.HasPrefix(hostport, "[") {
+			if !strings.HasSuffix(hostport, "]") {
+				return "", false
+			}
+			host = strings.ToLower(strings.Trim(hostport, "[]"))
+		} else if strings.Contains(hostport, ":") {
+			return "", false
+		} else {
+			host = strings.ToLower(hostport)
+		}
+	}
+	if host == "" {
+		return "", false
+	}
+	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		return net.JoinHostPort(host, port), true
+	}
+	if strings.Contains(host, ":") {
+		return "[" + host + "]", true
+	}
+	return host, true
+}
+
+func (s *Server) boundHost() string {
+	s.srvMu.Lock()
+	actual := s.actualAddr
+	s.srvMu.Unlock()
+	if h := stripHostPort(actual); h != "" && h != "0.0.0.0" && h != "::" {
+		return h
+	}
+	s.cfgMu.RLock()
+	listenAddr := ""
+	if s.cfg != nil {
+		listenAddr = s.cfg.ListenAddr
+	}
+	s.cfgMu.RUnlock()
+	if h := stripHostPort(listenAddr); h != "" && h != "0.0.0.0" && h != "::" {
+		return h
+	}
+	return ""
+}
+
+func isAllowedHostHeader(hostHeader, boundHost string) bool {
 	if strings.TrimSpace(hostHeader) == "" {
-		return true
+		return false
 	}
 	h := stripHostPort(hostHeader)
 	if h == "" {
@@ -332,27 +408,38 @@ func isAllowedHostHeader(hostHeader string) bool {
 	if isLoopbackHost(h) {
 		return true
 	}
-	return net.ParseIP(h) != nil
+	if boundHost != "" && strings.EqualFold(h, boundHost) {
+		return true
+	}
+	return false
 }
 
-func isAllowedOriginHeader(originHeader, reqHostHeader string) bool {
+func isAllowedOriginHeader(originHeader, reqHostHeader string, isTLS bool) bool {
 	originHeader = strings.TrimSpace(originHeader)
 	if originHeader == "" {
 		return true
 	}
+	reqHostHeader = strings.TrimSpace(reqHostHeader)
+	if reqHostHeader == "" {
+		return false
+	}
 	u, err := url.Parse(originHeader)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+	if err != nil || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
 		return false
 	}
-	ohost := stripHostPort(u.Host)
-	if ohost == "" {
+	expectedScheme := "http"
+	if isTLS {
+		expectedScheme = "https"
+	}
+	if !strings.EqualFold(u.Scheme, expectedScheme) {
 		return false
 	}
-	if isLoopbackHost(ohost) {
-		return true
+	originAuth, ok1 := normalizeAuthority(expectedScheme, u.Host)
+	reqAuth, ok2 := normalizeAuthority(expectedScheme, reqHostHeader)
+	if !ok1 || !ok2 {
+		return false
 	}
-	reqHost := stripHostPort(reqHostHeader)
-	return reqHost != "" && strings.EqualFold(ohost, reqHost)
+	return strings.EqualFold(originAuth, reqAuth)
 }
 
 func isLoopbackRemoteAddr(remoteAddr string) bool {
@@ -370,13 +457,13 @@ func isLoopbackRemoteAddr(remoteAddr string) bool {
 // originHostMiddleware mitigates DNS Rebinding and cross-origin browser requests.
 func (s *Server) originHostMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !isAllowedHostHeader(r.Host) {
+		if !isAllowedHostHeader(r.Host, s.boundHost()) {
 			writeJSON(w, http.StatusForbidden, map[string]any{
 				"error": "forbidden Host header (DNS rebinding protection)",
 			})
 			return
 		}
-		if origin := r.Header.Get("Origin"); origin != "" && !isAllowedOriginHeader(origin, r.Host) {
+		if origin := r.Header.Get("Origin"); origin != "" && !isAllowedOriginHeader(origin, r.Host, r.TLS != nil) {
 			writeJSON(w, http.StatusForbidden, map[string]any{
 				"error": "forbidden Origin header",
 			})
@@ -386,8 +473,16 @@ func (s *Server) originHostMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func (s *Server) getBearerToken() string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	if s.cfg == nil {
+		return ""
+	}
+	return s.cfg.BearerToken
+}
+
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
-	expected := []byte(s.cfg.BearerToken)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
@@ -397,8 +492,11 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			})
 			return
 		}
-		got := []byte(strings.TrimSpace(strings.TrimPrefix(auth, "Bearer ")))
-		if len(got) != len(expected) || subtle.ConstantTimeCompare(got, expected) != 1 {
+		got := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+		expected := s.getBearerToken()
+		gotDigest := sha256.Sum256([]byte(got))
+		expDigest := sha256.Sum256([]byte(expected))
+		if expected == "" || subtle.ConstantTimeCompare(gotDigest[:], expDigest[:]) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="android-agent", error="invalid_token"`)
 			writeJSON(w, http.StatusUnauthorized, map[string]any{
 				"error": "invalid Authorization Bearer token",
@@ -609,6 +707,10 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
+	if _, werr := io.WriteString(w, ": connected\n\n"); werr != nil {
+		return
+	}
+	flusher.Flush()
 
 	writeSSE := func(ev brain.RunEvent) bool {
 		b, merr := json.Marshal(ev)
@@ -696,7 +798,7 @@ func (s *Server) handleChatHistory(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"messages": s.agent.History()})
+	writeJSON(w, http.StatusOK, map[string]any{"messages": sanitizeChatHistory(s.agent.History())})
 }
 
 func (s *Server) handleChatClear(w http.ResponseWriter, r *http.Request) {
@@ -818,6 +920,24 @@ func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func parseStrictHHMM(raw string) (int, bool) {
+	s := strings.TrimSpace(raw)
+	if len(s) != 5 || s[2] != ':' {
+		return 0, false
+	}
+	for _, idx := range []int{0, 1, 3, 4} {
+		if s[idx] < '0' || s[idx] > '9' {
+			return 0, false
+		}
+	}
+	hh := int(s[0]-'0')*10 + int(s[1]-'0')
+	mm := int(s[3]-'0')*10 + int(s[4]-'0')
+	if hh < 0 || hh > 23 || mm < 0 || mm > 59 {
+		return 0, false
+	}
+	return hh*60 + mm, true
+}
+
 func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -829,14 +949,36 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for i, e := range body.Entries {
-			switch strings.TrimSpace(e.Job) {
+			job := strings.TrimSpace(e.Job)
+			switch job {
 			case "daily_all", "ms_rewards", "jd_daily":
 			default:
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid job %q", e.Job)})
 				return
 			}
+			body.Entries[i].Job = job
+			startStr := strings.TrimSpace(e.WindowStart)
+			endStr := strings.TrimSpace(e.WindowEnd)
+			startMin, okStart := parseStrictHHMM(startStr)
+			if !okStart {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid window_start %q (expected HH:MM 00:00..23:59)", e.WindowStart)})
+				return
+			}
+			endMin, okEnd := parseStrictHHMM(endStr)
+			if !okEnd {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid window_end %q (expected HH:MM 00:00..23:59)", e.WindowEnd)})
+				return
+			}
+			if endMin <= startMin {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("window_end %q must be after window_start %q", endStr, startStr)})
+				return
+			}
+			body.Entries[i].WindowStart = startStr
+			body.Entries[i].WindowEnd = endStr
 			if strings.TrimSpace(e.ID) == "" {
-				body.Entries[i].ID = fmt.Sprintf("job-%d-%s", i+1, e.Job)
+				body.Entries[i].ID = fmt.Sprintf("job-%d-%s", i+1, job)
+			} else {
+				body.Entries[i].ID = strings.TrimSpace(e.ID)
 			}
 		}
 		s.cfgMu.Lock()
@@ -899,9 +1041,39 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) evictExpiredSessionsLocked(now time.Time) {
+	cutoff := now.Add(-mcpSessionTTL)
+	for sid, lastSeen := range s.sessions {
+		if lastSeen.Before(cutoff) {
+			delete(s.sessions, sid)
+		}
+	}
+}
+
+func (s *Server) validateSession(sid string) bool {
+	now := time.Now()
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	s.evictExpiredSessionsLocked(now)
+	lastSeen, exists := s.sessions[sid]
+	if !exists || now.Sub(lastSeen) > mcpSessionTTL {
+		delete(s.sessions, sid)
+		return false
+	}
+	s.sessions[sid] = now
+	return true
+}
+
 func (s *Server) handleMCPGetSSE(w http.ResponseWriter, r *http.Request) {
 	if !strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if reqSessionID := strings.TrimSpace(r.Header.Get("Mcp-Session-Id")); reqSessionID != "" && !s.validateSession(reqSessionID) {
+		writeJSON(w, http.StatusNotFound, rpcResponse{
+			JSONRPC: "2.0",
+			Error:   &rpcError{Code: -32001, Message: "unknown or expired Mcp-Session-Id"},
+		})
 		return
 	}
 	flusher, ok := w.(http.Flusher)
@@ -975,6 +1147,29 @@ func (s *Server) handleMCPPost(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		if len(batch) == 0 {
+			writeJSON(w, http.StatusBadRequest, rpcResponse{
+				JSONRPC: "2.0",
+				Error:   &rpcError{Code: -32600, Message: "empty JSON-RPC batch"},
+			})
+			return
+		}
+		if reqSessionID != "" {
+			needsSession := false
+			for _, req := range batch {
+				if req.Method != "initialize" {
+					needsSession = true
+					break
+				}
+			}
+			if needsSession && !s.validateSession(reqSessionID) {
+				writeJSON(w, http.StatusNotFound, rpcResponse{
+					JSONRPC: "2.0",
+					Error:   &rpcError{Code: -32001, Message: "unknown or expired Mcp-Session-Id"},
+				})
+				return
+			}
+		}
 		var responses []rpcResponse
 		var newSessionID string
 		for _, req := range batch {
@@ -993,6 +1188,7 @@ func (s *Server) handleMCPPost(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
+		w.Header().Set("MCP-Protocol-Version", DefaultProtoVersion)
 		writeJSON(w, http.StatusOK, responses)
 		return
 	}
@@ -1007,10 +1203,7 @@ func (s *Server) handleMCPPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Method != "initialize" && reqSessionID != "" {
-		s.sessMu.RLock()
-		_, exists := s.sessions[reqSessionID]
-		s.sessMu.RUnlock()
-		if !exists {
+		if !s.validateSession(reqSessionID) {
 			writeJSON(w, http.StatusNotFound, rpcResponse{
 				JSONRPC: "2.0",
 				ID:      req.ID,
@@ -1046,8 +1239,10 @@ func (s *Server) dispatchRPC(ctx context.Context, req rpcRequest) (*rpcResponse,
 			protoVer = params.ProtocolVersion
 		}
 		sid := newSessionID()
+		now := time.Now()
 		s.sessMu.Lock()
-		s.sessions[sid] = time.Now()
+		s.evictExpiredSessionsLocked(now)
+		s.sessions[sid] = now
 		s.sessMu.Unlock()
 		return &rpcResponse{
 			JSONRPC: "2.0",
@@ -1147,6 +1342,24 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		if err != nil {
 			return textErrorResult(err.Error())
 		}
+		if res.OrigWidth > 0 && res.OrigHeight > 0 && res.Width > 0 && res.Height > 0 {
+			s.shotMu.Lock()
+			s.lastShot = screenshotMeta{
+				origWidth:  res.OrigWidth,
+				origHeight: res.OrigHeight,
+				width:      res.Width,
+				height:     res.Height,
+				capturedAt: time.Now(),
+			}
+			s.shotMu.Unlock()
+		}
+		scaleX, scaleY := 1.0, 1.0
+		if res.Width > 0 && res.OrigWidth > 0 {
+			scaleX = float64(res.OrigWidth) / float64(res.Width)
+		}
+		if res.Height > 0 && res.OrigHeight > 0 {
+			scaleY = float64(res.OrigHeight) / float64(res.Height)
+		}
 		meta, _ := json.Marshal(map[string]any{
 			"screen_width":   res.OrigWidth,
 			"screen_height":  res.OrigHeight,
@@ -1156,8 +1369,8 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 			"quality":        quality,
 			"capture_method": res.CaptureMethod,
 			"elapsed_ms":     res.ElapsedMs,
-			"scale_x":        float64(res.OrigWidth) / float64(res.Width),
-			"scale_y":        float64(res.OrigHeight) / float64(res.Height),
+			"scale_x":        scaleX,
+			"scale_y":        scaleY,
 		})
 		return map[string]any{
 			"content": []map[string]any{
@@ -1180,7 +1393,7 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		if !okX || !okY {
 			return textErrorResult("x and y integer coordinates are required")
 		}
-		px, py, err := s.resolveCoords(ctx, x, y, getString(args, "coord_space", "physical"), getInt(args, "image_width", s.cfg.ScreenshotWidth))
+		px, py, err := s.resolveCoords(ctx, x, y, getString(args, "coord_space", "physical"), getInt(args, "image_width", 0))
 		if err != nil {
 			return textErrorResult(err.Error())
 		}
@@ -1256,7 +1469,7 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 			return textErrorResult("x and y integer coordinates are required")
 		}
 		dur := getInt(args, "duration_ms", 800)
-		px, py, err := s.resolveCoords(ctx, x, y, getString(args, "coord_space", "physical"), getInt(args, "image_width", s.cfg.ScreenshotWidth))
+		px, py, err := s.resolveCoords(ctx, x, y, getString(args, "coord_space", "physical"), getInt(args, "image_width", 0))
 		if err != nil {
 			return textErrorResult(err.Error())
 		}
@@ -1275,7 +1488,7 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		}
 		dur := getInt(args, "duration_ms", 300)
 		space := getString(args, "coord_space", "physical")
-		imgW := getInt(args, "image_width", s.cfg.ScreenshotWidth)
+		imgW := getInt(args, "image_width", 0)
 		px1, py1, err := s.resolveCoords(ctx, x1, y1, space, imgW)
 		if err != nil {
 			return textErrorResult(err.Error())
@@ -1412,21 +1625,21 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		}, false)
 
 	case "run_daily_all":
-		rep, err := s.runner.RunDailyAll(ctx)
+		rep, err := s.runWorkflowViaJobs(ctx, "daily_all")
 		if err != nil {
 			return textJSONResult(map[string]any{"error": err.Error(), "report": rep}, true)
 		}
 		return textJSONResult(rep, false)
 
 	case "run_ms_rewards":
-		rep, err := s.runner.RunMSRewards(ctx, workflows.MSRewardsOptions{SearchIntervalSec: 6.0, ReadCount: 10})
+		rep, err := s.runWorkflowViaJobs(ctx, "ms_rewards")
 		if err != nil {
 			return textJSONResult(map[string]any{"error": err.Error(), "report": rep}, true)
 		}
 		return textJSONResult(rep, false)
 
 	case "run_jd_daily":
-		rep, err := s.runner.RunJDDaily(ctx, workflows.JDDailyOptions{BrowseSec: 8.5, MaxBrowse: 24, WaterMode: "tasks"})
+		rep, err := s.runWorkflowViaJobs(ctx, "jd_daily")
 		if err != nil {
 			return textJSONResult(map[string]any{"error": err.Error(), "report": rep}, true)
 		}
@@ -1465,12 +1678,101 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 	}
 }
 
+func (s *Server) runWorkflowViaJobs(ctx context.Context, jobName string) (any, error) {
+	type jobOutcome struct {
+		res any
+		err error
+	}
+	done := make(chan jobOutcome, 1)
+	_, err := s.jobs.Start(jobName, func(jobCtx context.Context, logFn func(string)) (any, error) {
+		runCtx, cancel := context.WithCancel(jobCtx)
+		defer cancel()
+		stopWatch := make(chan struct{})
+		defer close(stopWatch)
+		go func() {
+			select {
+			case <-ctx.Done():
+				cancel()
+			case <-stopWatch:
+			}
+		}()
+		res, rerr := s.runWorkflowJob(runCtx, jobName, func(line string) {
+			logFn(line)
+			s.logger("workflow[%s]: %s", jobName, line)
+		})
+		done <- jobOutcome{res: res, err: rerr}
+		return res, rerr
+	})
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case out := <-done:
+		return out.res, out.err
+	case <-ctx.Done():
+		s.jobs.Cancel("mcp caller cancelled")
+		return nil, ctx.Err()
+	}
+}
+
+var (
+	secretTokenPattern = regexp.MustCompile(`(?i)\b(bearer\s+[a-z0-9._\-]{8,}|(?:sk|nvapi|ghp|gho|pat|xoxb|xoxp|aiza)[a-z0-9_\-]{8,})\b`)
+	secretKVPattern    = regexp.MustCompile(`(?i)((?:password|passwd|pwd|secret|token|api[_\-]?key|otp|密码|口令|密钥|验证码)\s*[:=：是为]?\s*)([^\s,;，；"'` + "`" + `]{4,64})`)
+)
+
+func redactSensitiveText(s string) string {
+	if s == "" {
+		return s
+	}
+	s = secretTokenPattern.ReplaceAllString(s, "[REDACTED]")
+	s = secretKVPattern.ReplaceAllString(s, "${1}[REDACTED]")
+	return s
+}
+
+func sanitizeChatHistory(msgs []brain.ChatMessage) []brain.ChatMessage {
+	if len(msgs) == 0 {
+		return msgs
+	}
+	out := make([]brain.ChatMessage, len(msgs))
+	for i, m := range msgs {
+		cp := m
+		if len(m.ToolCalls) > 0 {
+			cp.ToolCalls = make([]brain.ToolCall, len(m.ToolCalls))
+			for j, tc := range m.ToolCalls {
+				tcc := tc
+				if tc.Args != nil {
+					argsCopy := make(map[string]any, len(tc.Args))
+					for k, v := range tc.Args {
+						if (tc.Name == "phone_input_text" || tc.Name == "phone_clipboard_set") && k == "text" {
+							argsCopy[k] = "[REDACTED]"
+						} else {
+							argsCopy[k] = v
+						}
+					}
+					tcc.Args = argsCopy
+				}
+				cp.ToolCalls[j] = tcc
+			}
+		}
+		if m.Role == "tool" && m.ToolName == "phone_clipboard_get" {
+			cp.Text = `{"ok":true,"redacted":true}`
+		}
+		out[i] = cp
+	}
+	return out
+}
+
 // ToolSpecs implements brain.ToolExecutor for in-process zero-HTTP LLM tool calls.
+// agent_pause and agent_resume are intentionally hidden from the in-process LLM brain
+// (while remaining available to external MCP clients and HTTP /api/v1/{pause,resume}).
 func (s *Server) ToolSpecs() []brain.ToolSpec {
 	defs := toolDefinitions()
 	specs := make([]brain.ToolSpec, 0, len(defs))
 	for _, d := range defs {
 		name, _ := d["name"].(string)
+		if name == "agent_pause" || name == "agent_resume" {
+			continue
+		}
 		desc, _ := d["description"].(string)
 		schema, _ := d["inputSchema"].(map[string]any)
 		specs = append(specs, brain.ToolSpec{
@@ -1484,6 +1786,12 @@ func (s *Server) ToolSpecs() []brain.ToolSpec {
 
 // ExecuteTool implements brain.ToolExecutor for direct in-process tool dispatch.
 func (s *Server) ExecuteTool(ctx context.Context, name string, args map[string]any) brain.ToolOutput {
+	if name == "agent_pause" || name == "agent_resume" {
+		return brain.ToolOutput{
+			Text:    fmt.Sprintf("tool %s is restricted from in-process LLM brain; use /api/v1/pause or /api/v1/resume", name),
+			IsError: true,
+		}
+	}
 	res := s.callTool(ctx, name, args)
 	isErr, _ := res["isError"].(bool)
 	var texts []string
@@ -1502,8 +1810,32 @@ func (s *Server) ExecuteTool(ctx context.Context, name string, args map[string]a
 			}
 		}
 	}
+	outText := strings.Join(texts, "\n")
+	switch name {
+	case "phone_clipboard_get":
+		if !isErr {
+			var parsed struct {
+				OK   bool   `json:"ok"`
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal([]byte(outText), &parsed); err == nil {
+				redacted := redactSensitiveText(parsed.Text)
+				payload, _ := json.Marshal(map[string]any{"ok": parsed.OK, "text": redacted})
+				// Keep first line non-sensitive so RunEvent.Summary never leaks clipboard plaintext.
+				outText = fmt.Sprintf("clipboard read ok (len=%d, redacted in summary)\n%s", len([]rune(parsed.Text)), string(payload))
+				s.logger("brain tool %s: ok (len=%d, redacted)", name, len([]rune(parsed.Text)))
+			}
+		}
+	case "phone_input_text", "phone_clipboard_set":
+		rawInput := getString(args, "text", "")
+		if rawInput != "" && strings.Contains(outText, rawInput) {
+			outText = strings.ReplaceAll(outText, rawInput, "[REDACTED]")
+		}
+		outText = redactSensitiveText(outText)
+		s.logger("brain tool %s: is_err=%v (input len=%d, redacted)", name, isErr, len([]rune(rawInput)))
+	}
 	return brain.ToolOutput{
-		Text:      strings.Join(texts, "\n"),
+		Text:      outText,
 		ImageJPEG: imgBytes,
 		IsError:   isErr,
 	}
@@ -1513,6 +1845,23 @@ func (s *Server) resolveCoords(ctx context.Context, x, y int, space string, imag
 	if strings.ToLower(strings.TrimSpace(space)) != "image" {
 		return x, y, nil
 	}
+	s.shotMu.RLock()
+	shot := s.lastShot
+	s.shotMu.RUnlock()
+
+	if shot.origWidth > 0 && shot.origHeight > 0 && shot.width > 0 && shot.height > 0 {
+		if imageWidth <= 0 || imageWidth == shot.width {
+			scaleX := float64(shot.origWidth) / float64(shot.width)
+			scaleY := float64(shot.origHeight) / float64(shot.height)
+			return int(math.Round(float64(x) * scaleX)), int(math.Round(float64(y) * scaleY)), nil
+		}
+		if shot.origWidth <= imageWidth {
+			return x, y, nil
+		}
+		scale := float64(shot.origWidth) / float64(imageWidth)
+		return int(math.Round(float64(x) * scale)), int(math.Round(float64(y) * scale)), nil
+	}
+
 	if imageWidth <= 0 {
 		imageWidth = s.cfg.ScreenshotWidth
 	}

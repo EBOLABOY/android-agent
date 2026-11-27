@@ -131,6 +131,7 @@ type topicRule struct {
 }
 
 var exploreTopicRules = []topicRule{
+	{regexp.MustCompile(`(?i)video\s*games?|videogames?|gaming|电子游戏|主机游戏|电竞|游戏`), "Minecraft"},
 	{regexp.MustCompile(`(?i)邮轮|启航|cruise`), "best caribbean cruise deals and destinations"},
 	{regexp.MustCompile(`(?i)航班|机票|短途旅行|假期|flight|travel|trip|vacation`), "flights from Los Angeles to Tokyo"},
 	{regexp.MustCompile(`(?i)保险|insurance`), "best auto and home insurance plans"},
@@ -144,6 +145,11 @@ var exploreTopicRules = []topicRule{
 	{regexp.MustCompile(`(?i)酒店|住宿|hotel`), "best boutique hotels in kyoto"},
 	{regexp.MustCompile(`(?i)汽车|新车|二手车|car|vehicle|suv`), "best hybrid suv fuel economy comparison"},
 	{regexp.MustCompile(`(?i)电影|影院|movie|cinema|showtime`), "top rated movies playing in theaters"},
+	{regexp.MustCompile(`(?i)体育|运动|足球|篮球|比赛|sports?|football|basketball|soccer|nba|nfl`), "NBA standings and schedule today"},
+	{regexp.MustCompile(`(?i)书籍|阅读|小说|图书|books?|reading|novel|author`), "best selling fiction books this year"},
+	{regexp.MustCompile(`(?i)宠物|猫|狗|pets?|dog|cat|puppy`), "best healthy dog food brands"},
+	{regexp.MustCompile(`(?i)电脑|数码|电子产品|laptop|tablet|headphone|camera|electronics|tech`), "best noise cancelling headphones review"},
+	{regexp.MustCompile(`(?i)家居|家具|园艺|装修|home|garden|furniture|kitchen`), "minimalist living room furniture ideas"},
 	{regexp.MustCompile(`(?i)工作|求职|简历|job|career|resume`), "remote software engineer jobs"},
 	{regexp.MustCompile(`(?i)健身|锻炼|workout|fitness|exercise`), "home strength training workout routine"},
 	{regexp.MustCompile(`(?i)歌词|歌曲|音乐|lyrics|song|music`), "Shape of You Ed Sheeran lyrics"},
@@ -154,14 +160,21 @@ var exploreTopicRules = []topicRule{
 	{regexp.MustCompile(`(?i)购物|清单|优惠|shopping|deals|discount`), "best shopping deals on wireless headphones"},
 }
 
+var (
+	exploreBoilerplateRe = regexp.MustCompile(`(?i)在必应上?搜索|在必应上浏览|已激活|\+\d+|以找到|最适合您需求的|explore\s+on\s+bing|search\s+on\s+bing|find\s+out\s+about|learn\s+about|\bexplore\b|\bdiscover\b`)
+	readToEarnFullRe     = regexp.MustCompile(`^30(?:/30)?$`)
+)
+
 type LogFunc func(line string)
 
 type Runner struct {
-	backend    backend.DeviceBackend
-	cdp        *cdp.Client
-	guard      *guard.Guard
-	imageWidth int
-	log        LogFunc
+	backend       backend.DeviceBackend
+	cdp           *cdp.Client
+	guard         *guard.Guard
+	imageWidth    int
+	log           LogFunc
+	unfreezeDelay time.Duration
+	cdpSendFn     func(ctx context.Context, socketSel, targetID, method string, params map[string]any) (json.RawMessage, error)
 }
 
 func NewRunner(be backend.DeviceBackend, cdpClient *cdp.Client, g *guard.Guard, imageWidth int, logFn LogFunc) *Runner {
@@ -172,11 +185,12 @@ func NewRunner(be backend.DeviceBackend, cdpClient *cdp.Client, g *guard.Guard, 
 		logFn = func(string) {}
 	}
 	return &Runner{
-		backend:    be,
-		cdp:        cdpClient,
-		guard:      g,
-		imageWidth: imageWidth,
-		log:        logFn,
+		backend:       be,
+		cdp:           cdpClient,
+		guard:         g,
+		imageWidth:    imageWidth,
+		log:           logFn,
+		unfreezeDelay: 1500 * time.Millisecond,
 	}
 }
 
@@ -234,13 +248,60 @@ func CleanHeadlineToQuery(text string) string {
 	return s
 }
 
+func IsReadToEarnFull(val string) bool {
+	return readToEarnFullRe.MatchString(strings.TrimSpace(val))
+}
+
 func MapExploreQuery(cardText string) string {
 	for _, rule := range exploreTopicRules {
 		if rule.re.MatchString(cardText) {
 			return rule.query
 		}
 	}
+	cleaned := exploreBoilerplateRe.ReplaceAllString(cardText, " ")
+	cleaned = headlineNoiseRe.ReplaceAllString(cleaned, " ")
+	cleaned = multiSpaceRe.ReplaceAllString(cleaned, " ")
+	cleaned = strings.TrimSpace(cleaned)
+	runes := []rune(cleaned)
+	if len(runes) > 48 {
+		cleaned = strings.TrimSpace(string(runes[:48]))
+	}
+	if len([]rune(cleaned)) >= 3 {
+		return cleaned
+	}
 	return "popular travel destinations"
+}
+
+func altExploreQuery(cardText string) string {
+	if regexp.MustCompile(`(?i)歌词|lyrics|song`).MatchString(cardText) {
+		return "周杰伦 稻香 歌词"
+	}
+	if regexp.MustCompile(`(?i)video\s*games?|videogames?|gaming|电子游戏|主机游戏|电竞|游戏`).MatchString(cardText) {
+		return "Elden Ring gameplay and reviews"
+	}
+	cleaned := exploreBoilerplateRe.ReplaceAllString(cardText, " ")
+	cleaned = headlineNoiseRe.ReplaceAllString(cleaned, " ")
+	cleaned = multiSpaceRe.ReplaceAllString(cleaned, " ")
+	cleaned = strings.TrimSpace(cleaned)
+	if len([]rune(cleaned)) >= 3 {
+		r := []rune(cleaned)
+		if len(r) > 36 {
+			cleaned = strings.TrimSpace(string(r[:36]))
+		}
+		return cleaned + " guide"
+	}
+	return MapExploreQuery(cardText)
+}
+
+func resolveExploreURL(href string) string {
+	h := strings.TrimSpace(href)
+	if strings.HasPrefix(h, "http://") || strings.HasPrefix(h, "https://") {
+		return h
+	}
+	if strings.HasPrefix(h, "/") {
+		return "https://rewards.bing.com" + h
+	}
+	return "https://www.bing.com/?form=ML2PCR&OCID=ML2PCR&PUBL=RewardsDO&CREA=ML2PCR&PC=ML2PCR"
 }
 
 func (r *Runner) sleepCtx(ctx context.Context, d time.Duration) error {
@@ -307,17 +368,97 @@ func (r *Runner) jitterSwipe(ctx context.Context, x1, y1, x2, y2, durMs, minX, m
 }
 
 func (r *Runner) cdpClientFor(socketSel string) (*cdp.Client, error) {
+	if r.cdp == nil {
+		return nil, errors.New("cdp client is not configured")
+	}
 	return r.cdp.ForSocket(socketSel)
 }
 
-func (r *Runner) evalJS(ctx context.Context, socketSel, targetID, expr string, awaitPromise bool, out any) error {
-	if err := r.checkGuard(ctx); err != nil {
-		return err
+func isFrozenCDPError(err error) bool {
+	if err == nil {
+		return false
+	}
+	type frozenErr interface {
+		IsTargetFrozen() bool
+	}
+	var fe frozenErr
+	if errors.As(err, &fe) && fe.IsTargetFrozen() {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "frozen")
+}
+
+func packageForSocket(socketSel string) string {
+	switch strings.TrimSpace(socketSel) {
+	case "", EdgePkg, "edge", "chrome":
+		return EdgePkg
+	case BingPkg, "bing":
+		return BingPkg
+	case JDPkg, "jd", "jingdong":
+		return JDPkg
+	default:
+		return socketSel
+	}
+}
+
+func (r *Runner) rawCDPSend(ctx context.Context, socketSel, targetID, method string, params map[string]any) (json.RawMessage, error) {
+	if r.cdpSendFn != nil {
+		return r.cdpSendFn(ctx, socketSel, targetID, method, params)
 	}
 	client, err := r.cdpClientFor(socketSel)
 	if err != nil {
+		return nil, err
+	}
+	return client.SendCommand(ctx, targetID, method, params)
+}
+
+func (r *Runner) unfreezeTarget(ctx context.Context, socketSel, targetID string) error {
+	pkg := packageForSocket(socketSel)
+	r.logf("[CDP] Frozen target detected on %q; foregrounding %s and retrying once...", socketSel, pkg)
+	if r.backend != nil && pkg != "" {
+		if err := r.backend.LaunchApp(ctx, pkg); err != nil {
+			return err
+		}
+	}
+	delay := r.unfreezeDelay
+	if delay <= 0 {
+		delay = 1500 * time.Millisecond
+	}
+	if err := r.sleepCtx(ctx, delay); err != nil {
 		return err
 	}
+	if targetID != "" {
+		bctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_, _ = r.rawCDPSend(bctx, socketSel, targetID, "Page.bringToFront", map[string]any{})
+		cancel()
+	}
+	return nil
+}
+
+func (r *Runner) sendCDPCommand(ctx context.Context, socketSel, targetID, method string, params map[string]any, timeout time.Duration) (json.RawMessage, error) {
+	if err := r.checkGuard(ctx); err != nil {
+		return nil, err
+	}
+	runOnce := func() (json.RawMessage, error) {
+		cctx := ctx
+		var cancel context.CancelFunc
+		if timeout > 0 {
+			cctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		return r.rawCDPSend(cctx, socketSel, targetID, method, params)
+	}
+	raw, err := runOnce()
+	if err != nil && isFrozenCDPError(err) && ctx.Err() == nil {
+		if uerr := r.unfreezeTarget(ctx, socketSel, targetID); uerr != nil {
+			return nil, uerr
+		}
+		return runOnce()
+	}
+	return raw, err
+}
+
+func (r *Runner) evalJS(ctx context.Context, socketSel, targetID, expr string, awaitPromise bool, out any) error {
 	params := map[string]any{
 		"expression":    expr,
 		"returnByValue": true,
@@ -325,9 +466,7 @@ func (r *Runner) evalJS(ctx context.Context, socketSel, targetID, expr string, a
 	if awaitPromise {
 		params["awaitPromise"] = true
 	}
-	cctx, cancel := context.WithTimeout(ctx, 18*time.Second)
-	defer cancel()
-	raw, err := client.SendCommand(cctx, targetID, "Runtime.evaluate", params)
+	raw, err := r.sendCDPCommand(ctx, socketSel, targetID, "Runtime.evaluate", params, 18*time.Second)
 	if err != nil {
 		return err
 	}
@@ -354,27 +493,11 @@ func (r *Runner) evalJS(ctx context.Context, socketSel, targetID, expr string, a
 }
 
 func (r *Runner) cdpNavigate(ctx context.Context, socketSel, targetID, targetURL string) error {
-	if err := r.checkGuard(ctx); err != nil {
-		return err
-	}
-	client, err := r.cdpClientFor(socketSel)
-	if err != nil {
-		return err
-	}
-	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	_, err = client.SendCommand(cctx, targetID, "Page.navigate", map[string]any{"url": targetURL})
+	_, err := r.sendCDPCommand(ctx, socketSel, targetID, "Page.navigate", map[string]any{"url": targetURL}, 15*time.Second)
 	return err
 }
 
 func (r *Runner) cdpClickRect(ctx context.Context, socketSel, targetID string, x, y, w, h float64) error {
-	if err := r.checkGuard(ctx); err != nil {
-		return err
-	}
-	client, err := r.cdpClientFor(socketSel)
-	if err != nil {
-		return err
-	}
 	cx := x + w/2.0
 	cy := y + h/2.0
 	for _, tp := range []string{"mouseMoved", "mousePressed", "mouseReleased"} {
@@ -383,11 +506,76 @@ func (r *Runner) cdpClickRect(ctx context.Context, socketSel, targetID string, x
 			params["button"] = "left"
 			params["clickCount"] = 1
 		}
-		if _, err := client.SendCommand(ctx, targetID, "Input.dispatchMouseEvent", params); err != nil {
+		if _, err := r.sendCDPCommand(ctx, socketSel, targetID, "Input.dispatchMouseEvent", params, 10*time.Second); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (r *Runner) tapNodeByLabels(ctx context.Context, labels ...string) (bool, error) {
+	if err := r.checkGuard(ctx); err != nil {
+		return false, err
+	}
+	if r.backend == nil {
+		return false, nil
+	}
+	tree, err := r.backend.UITree(ctx, backend.UITreeOptions{})
+	if err != nil || tree == nil || len(tree.Nodes) == 0 {
+		if err != nil && (ctx.Err() != nil || isGuardError(err)) {
+			return false, err
+		}
+		return false, nil
+	}
+	// Exact case-insensitive match first, then substring match.
+	pickID := -1
+	for _, want := range labels {
+		want = strings.TrimSpace(want)
+		if want == "" {
+			continue
+		}
+		for _, n := range tree.Nodes {
+			if strings.EqualFold(strings.TrimSpace(n.Label), want) {
+				pickID = n.ID
+				break
+			}
+		}
+		if pickID >= 0 {
+			break
+		}
+	}
+	if pickID < 0 {
+		for _, want := range labels {
+			wantLow := strings.ToLower(strings.TrimSpace(want))
+			if wantLow == "" {
+				continue
+			}
+			for _, n := range tree.Nodes {
+				if strings.Contains(strings.ToLower(n.Label), wantLow) {
+					pickID = n.ID
+					break
+				}
+			}
+			if pickID >= 0 {
+				break
+			}
+		}
+	}
+	if pickID < 0 {
+		return false, nil
+	}
+	if _, _, _, err := r.backend.TapNode(ctx, pickID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func isGuardError(err error) bool {
+	if err == nil {
+		return false
+	}
+	low := strings.ToLower(err.Error())
+	return strings.Contains(low, "guard") || strings.Contains(low, "locked") || strings.Contains(low, "screen")
 }
 
 // ---------- Microsoft Rewards (Edge CDP + Bing WebView CDP, 0 screenshots) ----------
@@ -453,6 +641,12 @@ func (r *Runner) ensureEdgeTarget(ctx context.Context) (string, error) {
 			continue
 		}
 		list, err := client.ListTargets(ctx)
+		if err != nil && isFrozenCDPError(err) {
+			if uerr := r.unfreezeTarget(ctx, "", ""); uerr != nil {
+				return "", uerr
+			}
+			continue
+		}
 		if err == nil && len(list) > 0 {
 			targets = list
 			break
@@ -482,9 +676,8 @@ func (r *Runner) ensureEdgeTarget(ctx context.Context) (string, error) {
 			}
 		}
 	}
-	client, err := r.cdpClientFor("")
-	if err == nil {
-		_, _ = client.SendCommand(ctx, pages[0].ID, "Page.bringToFront", map[string]any{})
+	if _, err := r.sendCDPCommand(ctx, "", pages[0].ID, "Page.bringToFront", map[string]any{}, 10*time.Second); err != nil {
+		return "", err
 	}
 	return pages[0].ID, nil
 }
@@ -582,17 +775,21 @@ func (r *Runner) doBingSearch(ctx context.Context, tid, query string, baseWaitSe
 		return err
 	}
 	var snippet string
-	_ = r.evalJS(ctx, "", tid, `(document.body ? document.body.innerText : "").slice(0, 800)`, false, &snippet)
+	if err := r.evalJS(ctx, "", tid, `(document.body ? document.body.innerText : "").slice(0, 800)`, false, &snippet); err != nil {
+		return err
+	}
 	return CheckCaptcha(snippet)
 }
 
-func (r *Runner) buildFreshSearchQueries(ctx context.Context, tid string, count int) []string {
+func (r *Runner) buildFreshSearchQueries(ctx context.Context, tid string, count int) ([]string, error) {
 	var live []string
 	seen := make(map[string]bool)
 	if err := r.cdpNavigate(ctx, "", tid, "https://www.bing.com/news"); err == nil {
-		_ = r.jitterSleep(ctx, 2.2, 3.0)
+		if err := r.jitterSleep(ctx, 2.2, 3.0); err != nil {
+			return nil, err
+		}
 		var raw []string
-		_ = r.evalJS(ctx, "", tid, `(() => {
+		if err := r.evalJS(ctx, "", tid, `(() => {
 		  const out = [];
 		  for (const a of Array.from(document.querySelectorAll("a.title, .news-card a, [class*=trending] a, h2 a, h3 a"))) {
 		    const t = (a.innerText || "").replace(/\s+/g, " ").trim();
@@ -600,7 +797,9 @@ func (r *Runner) buildFreshSearchQueries(ctx context.Context, tid string, count 
 		    if (out.length >= 40) break;
 		  }
 		  return out;
-		})()`, false, &raw)
+		})()`, false, &raw); err != nil && (ctx.Err() != nil || isGuardError(err)) {
+			return nil, err
+		}
 		for _, h := range raw {
 			q := CleanHeadlineToQuery(h)
 			if q != "" && !seen[strings.ToLower(q)] {
@@ -608,6 +807,8 @@ func (r *Runner) buildFreshSearchQueries(ctx context.Context, tid string, count 
 				live = append(live, q)
 			}
 		}
+	} else if ctx.Err() != nil || isGuardError(err) {
+		return nil, err
 	}
 	rand.Shuffle(len(live), func(i, j int) { live[i], live[j] = live[j], live[i] })
 	var rest []string
@@ -621,7 +822,7 @@ func (r *Runner) buildFreshSearchQueries(ctx context.Context, tid string, count 
 	if len(combined) > count {
 		combined = combined[:count]
 	}
-	return combined
+	return combined, nil
 }
 
 func (r *Runner) completeDashboardDailySet(ctx context.Context, tid string) ([]string, error) {
@@ -632,7 +833,7 @@ func (r *Runner) completeDashboardDailySet(ctx context.Context, tid string) ([]s
 		return nil, err
 	}
 	var cards []earnCard
-	_ = r.evalJS(ctx, "", tid, `(() => {
+	if err := r.evalJS(ctx, "", tid, `(() => {
 	  const res = [];
 	  for (const a of Array.from(document.querySelectorAll("a"))) {
 	    const href = a.getAttribute("href") || "";
@@ -643,7 +844,9 @@ func (r *Runner) completeDashboardDailySet(ctx context.Context, tid string) ([]s
 	    }
 	  }
 	  return res;
-	})()`, false, &cards)
+	})()`, false, &cards); err != nil {
+		return nil, err
+	}
 
 	var manual []string
 	thisOrThatRe := regexp.MustCompile(`(?i)this\s*or\s*that|二选一|\+50`)
@@ -652,20 +855,28 @@ func (r *Runner) completeDashboardDailySet(ctx context.Context, tid string) ([]s
 			manual = append(manual, card.Text)
 			continue
 		}
-		_ = r.cdpNavigate(ctx, "", tid, "https://rewards.bing.com/dashboard")
-		_ = r.sleepCtx(ctx, 2*time.Second)
+		if err := r.cdpNavigate(ctx, "", tid, "https://rewards.bing.com/dashboard"); err != nil {
+			return manual, err
+		}
+		if err := r.sleepCtx(ctx, 2*time.Second); err != nil {
+			return manual, err
+		}
 		hint := strings.Split(card.Text, " ")[0]
 		if len([]rune(hint)) > 12 {
 			hint = string([]rune(hint)[:12])
 		}
 		hJSON, _ := json.Marshal(hint)
 		var okClick bool
-		_ = r.evalJS(ctx, "", tid, fmt.Sprintf(`(() => {
+		if err := r.evalJS(ctx, "", tid, fmt.Sprintf(`(() => {
 		  const el = Array.from(document.querySelectorAll("a")).find(a => a.innerText && a.innerText.includes(%s));
 		  if (el) { el.scrollIntoView({block: "center"}); el.click(); return true; }
 		  return false;
-		})()`, string(hJSON)), false, &okClick)
-		_ = r.sleepCtx(ctx, 3200*time.Millisecond)
+		})()`, string(hJSON)), false, &okClick); err != nil {
+			return manual, err
+		}
+		if err := r.sleepCtx(ctx, 3200*time.Millisecond); err != nil {
+			return manual, err
+		}
 
 		isPoll := strings.Contains(card.Href, "Poll") || strings.Contains(card.Text, "投票") || strings.Contains(strings.ToLower(card.Text), "poll")
 		isQuiz := strings.Contains(strings.ToUpper(card.Href), "QUIZ") || strings.Contains(card.Text, "问答") || strings.Contains(card.Text, "测验")
@@ -677,16 +888,22 @@ func (r *Runner) completeDashboardDailySet(ctx context.Context, tid string) ([]s
 				W float64 `json:"w"`
 				H float64 `json:"h"`
 			}
-			_ = r.evalJS(ctx, "", tid, `(() => {
+			if err := r.evalJS(ctx, "", tid, `(() => {
 			  const el = document.querySelector("acf-button-standard.btom_opt, .btom_opts > *, #btoption0");
 			  if (!el) return null;
 			  el.scrollIntoView({block: "center"});
 			  const r = el.getBoundingClientRect();
 			  return {x: r.left, y: r.top, w: r.width, h: r.height};
-			})()`, false, &rect)
+			})()`, false, &rect); err != nil {
+				return manual, err
+			}
 			if rect.W > 0 {
-				_ = r.cdpClickRect(ctx, "", tid, rect.X, rect.Y, rect.W, rect.H)
-				_ = r.sleepCtx(ctx, 1800*time.Millisecond)
+				if err := r.cdpClickRect(ctx, "", tid, rect.X, rect.Y, rect.W, rect.H); err != nil {
+					return manual, err
+				}
+				if err := r.sleepCtx(ctx, 1800*time.Millisecond); err != nil {
+					return manual, err
+				}
 			}
 		} else if isQuiz {
 			tried := make(map[string]map[string]bool)
@@ -710,7 +927,7 @@ func (r *Runner) completeDashboardDailySet(ctx context.Context, tid string) ([]s
 						H       float64 `json:"h"`
 					} `json:"items"`
 				}
-				_ = r.evalJS(ctx, "", tid, `(() => {
+				if err := r.evalJS(ctx, "", tid, `(() => {
 				  const box = document.querySelector(".btom_opts")?.closest("li, div.b_ans") || document.body;
 				  const t = (box.innerText || "").slice(0, 600);
 				  if (/30\/30|干得好|Great job|You've earned|你已获得|获得 30/i.test(t)) return {done: true};
@@ -733,13 +950,19 @@ func (r *Runner) completeDashboardDailySet(ctx context.Context, tid string) ([]s
 				      return {text: (e.innerText || "").trim(), correctAttr: e.getAttribute("iscorrectoption") || "", x: r.left, y: r.top, w: r.width, h: r.height};
 				    })
 				  };
-				})()`, false, &info)
+				})()`, false, &info); err != nil {
+					return manual, err
+				}
 				if info.Done || info.Empty {
 					break
 				}
 				if info.NextBtn != nil && info.NextBtn.W > 0 {
-					_ = r.cdpClickRect(ctx, "", tid, info.NextBtn.X, info.NextBtn.Y, info.NextBtn.W, info.NextBtn.H)
-					_ = r.sleepCtx(ctx, 1200*time.Millisecond)
+					if err := r.cdpClickRect(ctx, "", tid, info.NextBtn.X, info.NextBtn.Y, info.NextBtn.W, info.NextBtn.H); err != nil {
+						return manual, err
+					}
+					if err := r.sleepCtx(ctx, 1200*time.Millisecond); err != nil {
+						return manual, err
+					}
 					continue
 				}
 				if tried[info.QKey] == nil {
@@ -768,8 +991,12 @@ func (r *Runner) completeDashboardDailySet(ctx context.Context, tid string) ([]s
 				}
 				chosen := info.Items[pickIdx]
 				tried[info.QKey][chosen.Text] = true
-				_ = r.cdpClickRect(ctx, "", tid, chosen.X, chosen.Y, chosen.W, chosen.H)
-				_ = r.sleepCtx(ctx, 1400*time.Millisecond)
+				if err := r.cdpClickRect(ctx, "", tid, chosen.X, chosen.Y, chosen.W, chosen.H); err != nil {
+					return manual, err
+				}
+				if err := r.sleepCtx(ctx, 1400*time.Millisecond); err != nil {
+					return manual, err
+				}
 			}
 		}
 	}
@@ -798,26 +1025,58 @@ func (r *Runner) findBingTargets(ctx context.Context) (feedTID, rewardsTID strin
 	return feedTID, rewardsTID
 }
 
-func (r *Runner) ensureBingRewardsWebView(ctx context.Context) string {
-	_ = r.backend.LaunchApp(ctx, BingPkg)
-	_ = r.sleepCtx(ctx, 1800*time.Millisecond)
+func (r *Runner) ensureBingRewardsWebView(ctx context.Context) (string, error) {
+	if err := r.checkGuard(ctx); err != nil {
+		return "", err
+	}
+	if err := r.backend.LaunchApp(ctx, BingPkg); err != nil {
+		return "", err
+	}
+	if err := r.sleepCtx(ctx, 1800*time.Millisecond); err != nil {
+		return "", err
+	}
 	_, rTID := r.findBingTargets(ctx)
 	if rTID != "" {
-		return rTID
+		return rTID, nil
 	}
-	_ = r.tapImage(ctx, 86, 1515)
-	_ = r.sleepCtx(ctx, 600*time.Millisecond)
-	_ = r.tapImage(ctx, 86, 1515)
-	_ = r.sleepCtx(ctx, 800*time.Millisecond)
-	_ = r.tapImage(ctx, 150, 1270)
-	for i := 0; i < 8; i++ {
-		_ = r.sleepCtx(ctx, 600*time.Millisecond)
-		_, rTID = r.findBingTargets(ctx)
-		if rTID != "" {
-			return rTID
+	// Prefer UI tree node matching on Bing Home before falling back to hardcoded coords.
+	if tapped, err := r.tapNodeByLabels(ctx, "Rewards", "Microsoft Rewards", "积分"); err != nil {
+		return "", err
+	} else if !tapped {
+		if homeTapped, err := r.tapNodeByLabels(ctx, "首页", "Home"); err != nil {
+			return "", err
+		} else if !homeTapped {
+			if err := r.tapImage(ctx, 86, 1515); err != nil {
+				return "", err
+			}
+			if err := r.sleepCtx(ctx, 600*time.Millisecond); err != nil {
+				return "", err
+			}
+			if err := r.tapImage(ctx, 86, 1515); err != nil {
+				return "", err
+			}
+		}
+		if err := r.sleepCtx(ctx, 800*time.Millisecond); err != nil {
+			return "", err
+		}
+		if tapped2, err := r.tapNodeByLabels(ctx, "Rewards", "Microsoft Rewards", "积分"); err != nil {
+			return "", err
+		} else if !tapped2 {
+			if err := r.tapImage(ctx, 150, 1270); err != nil {
+				return "", err
+			}
 		}
 	}
-	return ""
+	for i := 0; i < 8; i++ {
+		if err := r.sleepCtx(ctx, 600*time.Millisecond); err != nil {
+			return "", err
+		}
+		_, rTID = r.findBingTargets(ctx)
+		if rTID != "" {
+			return rTID, nil
+		}
+	}
+	return "", nil
 }
 
 type bingRewardsDOM struct {
@@ -829,7 +1088,9 @@ type bingRewardsDOM struct {
 
 func (r *Runner) readBingRewardsDOM(ctx context.Context, rTID string, refresh bool) (*bingRewardsDOM, error) {
 	if refresh {
-		_ = r.jitterSwipe(ctx, 260, 460, 260, 1150, 220, 140, 440)
+		if err := r.jitterSwipe(ctx, 260, 460, 260, 1150, 220, 140, 440); err != nil {
+			return nil, err
+		}
 		if err := r.sleepCtx(ctx, 2200*time.Millisecond); err != nil {
 			return nil, err
 		}
@@ -852,7 +1113,10 @@ func (r *Runner) readBingRewardsDOM(ctx context.Context, rTID string, refresh bo
 }
 
 func (r *Runner) runBingCheckinAndRead(ctx context.Context, count int, report *MSRewardsReport) error {
-	rTID := r.ensureBingRewardsWebView(ctx)
+	rTID, err := r.ensureBingRewardsWebView(ctx)
+	if err != nil {
+		return err
+	}
 	if rTID == "" {
 		return errors.New("Bing WebView CDP unavailable; ensure Agent WebView Debug is enabled for com.microsoft.bing")
 	}
@@ -860,7 +1124,7 @@ func (r *Runner) runBingCheckinAndRead(ctx context.Context, count int, report *M
 		return err
 	}
 	var clicked string
-	_ = r.evalJS(ctx, BingPkg, rTID, `(() => {
+	if err := r.evalJS(ctx, BingPkg, rTID, `(() => {
 	  const title = Array.from(document.querySelectorAll(".title, div, span")).find(e => (e.innerText || "").trim() === "签入");
 	  let cards = Array.from(document.querySelectorAll(".check-in-card")).filter(c => c.getBoundingClientRect().width > 0);
 	  if (!cards.length && title) { title.scrollIntoView({block: "center"}); title.click(); }
@@ -871,25 +1135,44 @@ func (r *Runner) runBingCheckinAndRead(ctx context.Context, count int, report *M
 	  target.scrollIntoView({block: "center"});
 	  target.click();
 	  return (target.innerText || "").replace(/\s+/g, " ").trim();
-	})()`, false, &clicked)
+	})()`, false, &clicked); err != nil {
+		return err
+	}
 	report.BingCheckin = clicked
-	_ = r.sleepCtx(ctx, 1800*time.Millisecond)
+	if err := r.sleepCtx(ctx, 1800*time.Millisecond); err != nil {
+		return err
+	}
 
-	domMid, _ := r.readBingRewardsDOM(ctx, rTID, false)
-	if domMid != nil && domMid.ReadToEarn == "30" {
-		report.BingReadAfter = "30"
+	domMid, err := r.readBingRewardsDOM(ctx, rTID, false)
+	if err != nil {
+		return err
+	}
+	if domMid != nil && IsReadToEarnFull(domMid.ReadToEarn) {
+		report.BingReadAfter = domMid.ReadToEarn
 		report.AfterPoints = domMid.Points
-		r.logf("[Bing] Read-to-Earn already 30/30, skipping read loop")
+		r.logf("[Bing] Read-to-Earn already %s, skipping read loop", domMid.ReadToEarn)
 		return nil
 	}
 
 	// Switch back to Bing Home news feed and read pure-text MSN /ar- articles via Shadow DOM
-	_ = r.tapImage(ctx, 86, 1515)
-	_ = r.sleepCtx(ctx, 700*time.Millisecond)
-	_ = r.tapImage(ctx, 86, 1515)
-	_ = r.sleepCtx(ctx, 900*time.Millisecond)
-	_ = r.jitterSwipe(ctx, 260, 1350, 260, 320, 220, 140, 440)
-	_ = r.sleepCtx(ctx, 800*time.Millisecond)
+	if err := r.tapImage(ctx, 86, 1515); err != nil {
+		return err
+	}
+	if err := r.sleepCtx(ctx, 700*time.Millisecond); err != nil {
+		return err
+	}
+	if err := r.tapImage(ctx, 86, 1515); err != nil {
+		return err
+	}
+	if err := r.sleepCtx(ctx, 900*time.Millisecond); err != nil {
+		return err
+	}
+	if err := r.jitterSwipe(ctx, 260, 1350, 260, 320, 220, 140, 440); err != nil {
+		return err
+	}
+	if err := r.sleepCtx(ctx, 800*time.Millisecond); err != nil {
+		return err
+	}
 
 	fTID, _ := r.findBingTargets(ctx)
 	if fTID == "" {
@@ -909,7 +1192,7 @@ func (r *Runner) runBingCheckinAndRead(ctx context.Context, count int, report *M
 			Key   string `json:"key"`
 			Title string `json:"title"`
 		}
-		_ = r.evalJS(ctx, BingPkg, fTID, `(() => {
+		if err := r.evalJS(ctx, BingPkg, fTID, `(() => {
 		  const out = [];
 		  function walk(root, depth) {
 		    if (!root || depth > 8) return;
@@ -928,7 +1211,9 @@ func (r *Runner) runBingCheckinAndRead(ctx context.Context, count int, report *M
 		  }
 		  walk(document, 0);
 		  return out;
-		})()`, false, &items)
+		})()`, false, &items); err != nil {
+			return err
+		}
 
 		clickedAny := false
 		for _, it := range items {
@@ -941,7 +1226,7 @@ func (r *Runner) runBingCheckinAndRead(ctx context.Context, count int, report *M
 			seen[it.Key] = true
 			kJSON, _ := json.Marshal(it.Key)
 			var ok bool
-			_ = r.evalJS(ctx, BingPkg, fTID, fmt.Sprintf(`(() => {
+			if err := r.evalJS(ctx, BingPkg, fTID, fmt.Sprintf(`(() => {
 			  const want = %s;
 			  let found = null;
 			  function walk(root, depth) {
@@ -956,7 +1241,9 @@ func (r *Runner) runBingCheckinAndRead(ctx context.Context, count int, report *M
 			  found.scrollIntoView({block: "center"});
 			  found.click();
 			  return true;
-			})()`, string(kJSON)), false, &ok)
+			})()`, string(kJSON)), false, &ok); err != nil {
+				return err
+			}
 			if !ok {
 				continue
 			}
@@ -965,9 +1252,15 @@ func (r *Runner) runBingCheckinAndRead(ctx context.Context, count int, report *M
 				return err
 			}
 			if fg, err := r.backend.ForegroundApp(ctx); err == nil && fg.Package != "" && fg.Package != BingPkg && fg.Package != "com.server.auditor.ssh.client" {
-				_ = r.backend.KeyEvent(ctx, "BACK")
-				_ = r.sleepCtx(ctx, 600*time.Millisecond)
-				_ = r.backend.LaunchApp(ctx, BingPkg)
+				if err := r.backend.KeyEvent(ctx, "BACK"); err != nil {
+					return err
+				}
+				if err := r.sleepCtx(ctx, 600*time.Millisecond); err != nil {
+					return err
+				}
+				if err := r.backend.LaunchApp(ctx, BingPkg); err != nil {
+					return err
+				}
 				continue
 			}
 			for fl := 0; fl < 3; fl++ {
@@ -983,18 +1276,26 @@ func (r *Runner) runBingCheckinAndRead(ctx context.Context, count int, report *M
 			}
 			report.BingReadOK++
 			r.logf("[Bing] Read article #%d: %s", report.BingReadOK, it.Title)
-			_ = r.backend.KeyEvent(ctx, "BACK")
+			if err := r.backend.KeyEvent(ctx, "BACK"); err != nil {
+				return err
+			}
 			if err := r.jitterSleep(ctx, 0.6, 1.1); err != nil {
 				return err
 			}
 		}
 		if !clickedAny && report.BingReadOK < count {
-			_ = r.jitterSwipe(ctx, 260, 1350, 260, 260, 220, 140, 440)
-			_ = r.jitterSleep(ctx, 0.75, 1.15)
+			if err := r.jitterSwipe(ctx, 260, 1350, 260, 260, 220, 140, 440); err != nil {
+				return err
+			}
+			if err := r.jitterSleep(ctx, 0.75, 1.15); err != nil {
+				return err
+			}
 		}
 	}
 
-	if rTID2 := r.ensureBingRewardsWebView(ctx); rTID2 != "" {
+	if rTID2, err := r.ensureBingRewardsWebView(ctx); err != nil {
+		return err
+	} else if rTID2 != "" {
 		if domEnd, err := r.readBingRewardsDOM(ctx, rTID2, true); err == nil {
 			report.BingReadAfter = domEnd.ReadToEarn
 			if domEnd.Points != "" {
@@ -1044,43 +1345,58 @@ func (r *Runner) RunMSRewards(ctx context.Context, opts MSRewardsOptions) (*MSRe
 				rep.InteractiveTasks = append(rep.InteractiveTasks, card.Text)
 				continue
 			}
-			_ = r.cdpNavigate(ctx, "", tid, "https://rewards.bing.com/earn")
-			_ = r.sleepCtx(ctx, 2800*time.Millisecond)
+			if err := r.cdpNavigate(ctx, "", tid, "https://rewards.bing.com/earn"); err != nil {
+				return rep, err
+			}
+			if err := r.sleepCtx(ctx, 2800*time.Millisecond); err != nil {
+				return rep, err
+			}
 			hint := strings.Split(card.Text, " ")[0]
 			if len([]rune(hint)) > 16 {
 				hint = string([]rune(hint)[:16])
 			}
 			hJSON, _ := json.Marshal(hint)
 			var ok bool
-			_ = r.evalJS(ctx, "", tid, fmt.Sprintf(`(() => {
+			if err := r.evalJS(ctx, "", tid, fmt.Sprintf(`(() => {
 			  const el = Array.from(document.querySelectorAll("a")).find(a => a.innerText && a.innerText.includes(%s));
 			  if (!el) return false;
 			  el.scrollIntoView({block: "center"}); el.click(); return true;
-			})()`, string(hJSON)), false, &ok)
+			})()`, string(hJSON)), false, &ok); err != nil {
+				return rep, err
+			}
 			if ok {
-				_ = r.sleepCtx(ctx, 5*time.Second)
+				if err := r.sleepCtx(ctx, 5*time.Second); err != nil {
+					return rep, err
+				}
 			}
 		}
 
 		if len(before.ExploreCards) > 0 {
-			_ = r.cdpNavigate(ctx, "", tid, "https://www.bing.com/?form=ML2PCR&OCID=ML2PCR&PUBL=RewardsDO&CREA=ML2PCR&PC=ML2PCR")
-			_ = r.sleepCtx(ctx, 2800*time.Millisecond)
 			for _, card := range before.ExploreCards {
+				if err := r.cdpNavigate(ctx, "", tid, resolveExploreURL(card.Href)); err != nil {
+					return rep, err
+				}
+				if err := r.sleepCtx(ctx, 2500*time.Millisecond); err != nil {
+					return rep, err
+				}
 				if err := r.doBingSearch(ctx, tid, MapExploreQuery(card.Text), opts.SearchIntervalSec); err != nil {
 					return rep, err
 				}
 			}
 			if retrySnap, err := r.parseEarnSnapshot(ctx, tid, false); err == nil {
-				lyricsRe := regexp.MustCompile(`(?i)歌词|lyrics|song`)
 				for _, card := range retrySnap.ExploreCards {
-					altQ := strings.Split(card.Text, " ")[0] + " official"
-					if lyricsRe.MatchString(card.Text) {
-						altQ = "周杰伦 稻香 歌词"
+					if err := r.cdpNavigate(ctx, "", tid, resolveExploreURL(card.Href)); err != nil {
+						return rep, err
 					}
-					if err := r.doBingSearch(ctx, tid, altQ, opts.SearchIntervalSec); err != nil {
+					if err := r.sleepCtx(ctx, 2500*time.Millisecond); err != nil {
+						return rep, err
+					}
+					if err := r.doBingSearch(ctx, tid, altExploreQuery(card.Text), opts.SearchIntervalSec); err != nil {
 						return rep, err
 					}
 				}
+			} else if ctx.Err() != nil || isGuardError(err) {
+				return rep, err
 			}
 		}
 
@@ -1097,7 +1413,10 @@ func (r *Runner) RunMSRewards(ctx context.Context, opts MSRewardsOptions) (*MSRe
 			if cur >= capV {
 				rep.SearchStatus = "already_completed"
 			} else {
-				pool := r.buildFreshSearchQueries(ctx, tid, 28)
+				pool, err := r.buildFreshSearchQueries(ctx, tid, 28)
+				if err != nil {
+					return rep, err
+				}
 				idx := 0
 				rep.SearchStatus = "in_progress"
 				for cur < capV && idx < len(pool) {
@@ -1110,8 +1429,12 @@ func (r *Runner) RunMSRewards(ctx context.Context, opts MSRewardsOptions) (*MSRe
 					if need > len(pool)-idx {
 						need = len(pool) - idx
 					}
-					_ = r.cdpNavigate(ctx, "", tid, "https://www.bing.com/")
-					_ = r.sleepCtx(ctx, 2200*time.Millisecond)
+					if err := r.cdpNavigate(ctx, "", tid, "https://www.bing.com/"); err != nil {
+						return rep, err
+					}
+					if err := r.sleepCtx(ctx, 2200*time.Millisecond); err != nil {
+						return rep, err
+					}
 					for k := 0; k < need; k++ {
 						q := pool[idx]
 						idx++
@@ -1121,7 +1444,14 @@ func (r *Runner) RunMSRewards(ctx context.Context, opts MSRewardsOptions) (*MSRe
 						rep.SearchesCount++
 					}
 					chk, err := r.parseEarnSnapshot(ctx, tid, true)
-					if err != nil || chk.BingSearchCurrent == nil {
+					if err != nil {
+						if ctx.Err() != nil || isGuardError(err) {
+							return rep, err
+						}
+						rep.SearchStatus = "unknown_counter"
+						break
+					}
+					if chk.BingSearchCurrent == nil {
 						rep.SearchStatus = "unknown_counter"
 						break
 					}
@@ -1208,8 +1538,15 @@ func (r *Runner) findJDTarget(ctx context.Context, urlSubstr, titleSubstr string
 }
 
 func (r *Runner) ensureJDFarmOpen(ctx context.Context) (string, error) {
-	_ = r.backend.LaunchApp(ctx, JDPkg)
-	_ = r.sleepCtx(ctx, 1800*time.Millisecond)
+	if err := r.checkGuard(ctx); err != nil {
+		return "", err
+	}
+	if err := r.backend.LaunchApp(ctx, JDPkg); err != nil {
+		return "", err
+	}
+	if err := r.sleepCtx(ctx, 1800*time.Millisecond); err != nil {
+		return "", err
+	}
 	if tid := r.findJDTarget(ctx, "42HV4J3Q87B2xFQMJk81PCc1mEs3", "东东农场"); tid != "" {
 		return tid, nil
 	}
@@ -1227,19 +1564,37 @@ func (r *Runner) ensureJDFarmOpen(ctx context.Context) (string, error) {
 		if fg, err := r.backend.ForegroundApp(ctx); err == nil && fg.Package == JDPkg && strings.Contains(fg.Activity, "MainFrameActivity") {
 			break
 		}
-		_ = r.backend.KeyEvent(ctx, "BACK")
-		_ = r.sleepCtx(ctx, 1100*time.Millisecond)
+		if err := r.backend.KeyEvent(ctx, "BACK"); err != nil {
+			return "", err
+		}
+		if err := r.sleepCtx(ctx, 1100*time.Millisecond); err != nil {
+			return "", err
+		}
 		if tid := r.findJDTarget(ctx, "42HV4J3Q87B2xFQMJk81PCc1mEs3", "东东农场"); tid != "" {
 			return tid, nil
 		}
 	}
-	_ = r.tapImage(ctx, 155, 1515)
-	_ = r.sleepCtx(ctx, 800*time.Millisecond)
-	_ = r.tapImage(ctx, 155, 1515)
-	_ = r.sleepCtx(ctx, 900*time.Millisecond)
-	_ = r.tapImage(ctx, 300, 200)
-	_ = r.sleepCtx(ctx, 1100*time.Millisecond)
-	_, _ = r.backend.InputText(ctx, "东东农场", "clipboard", true)
+	if err := r.tapImage(ctx, 155, 1515); err != nil {
+		return "", err
+	}
+	if err := r.sleepCtx(ctx, 800*time.Millisecond); err != nil {
+		return "", err
+	}
+	if err := r.tapImage(ctx, 155, 1515); err != nil {
+		return "", err
+	}
+	if err := r.sleepCtx(ctx, 900*time.Millisecond); err != nil {
+		return "", err
+	}
+	if err := r.tapImage(ctx, 300, 200); err != nil {
+		return "", err
+	}
+	if err := r.sleepCtx(ctx, 1100*time.Millisecond); err != nil {
+		return "", err
+	}
+	if _, err := r.backend.InputText(ctx, "东东农场", "clipboard", true); err != nil {
+		return "", err
+	}
 	for i := 0; i < 12; i++ {
 		if err := r.sleepCtx(ctx, 1*time.Second); err != nil {
 			return "", err
@@ -1284,7 +1639,7 @@ func (r *Runner) readFarmSummary(ctx context.Context, tid string) (*farmSummary,
 	return &out, err
 }
 
-func (r *Runner) waitFarmReady(ctx context.Context, tid string) *farmSummary {
+func (r *Runner) waitFarmReady(ctx context.Context, tid string) (*farmSummary, error) {
 	deadline := time.Now().Add(14 * time.Second)
 	var last *farmSummary
 	for time.Now().Before(deadline) {
@@ -1292,14 +1647,16 @@ func (r *Runner) waitFarmReady(ctx context.Context, tid string) *farmSummary {
 		if err == nil {
 			last = s
 			if s.WaterNum != nil || s.NeedPrize || s.Matured || strings.Contains(s.Snippet, "再浇") || strings.Contains(s.Snippet, "浇5次") {
-				return s
+				return s, nil
 			}
+		} else if ctx.Err() != nil || isGuardError(err) {
+			return last, err
 		}
-		if r.sleepCtx(ctx, 1*time.Second) != nil {
-			break
+		if err := r.sleepCtx(ctx, 1*time.Second); err != nil {
+			return last, err
 		}
 	}
-	return last
+	return last, nil
 }
 
 func (r *Runner) dismissFarmPopups(ctx context.Context, tid string) (string, error) {
@@ -1307,7 +1664,7 @@ func (r *Runner) dismissFarmPopups(ctx context.Context, tid string) (string, err
 		RedPacket string `json:"redPacket"`
 		Snippet   string `json:"snippet"`
 	}
-	_ = r.evalJS(ctx, JDPkg, tid, `(() => {
+	if err := r.evalJS(ctx, JDPkg, tid, `(() => {
 	  const txt = (document.body?.innerText || "");
 	  const redMatch = txt.match(/¥\s*\d+(?:\.\d+)?/);
 	  for (const el of Array.from(document.querySelectorAll("div, span, button"))) {
@@ -1324,41 +1681,49 @@ func (r *Runner) dismissFarmPopups(ctx context.Context, tid string) (string, err
 	    if (closes.length > 0) closes[closes.length - 1].click();
 	  }
 	  return {redPacket: redMatch ? redMatch[0] : "", snippet: txt.slice(0, 300)};
-	})()`, false, &res)
+	})()`, false, &res); err != nil {
+		return "", err
+	}
 	if err := CheckCaptcha(res.Snippet); err != nil {
 		return "", err
 	}
 	return strings.ReplaceAll(res.RedPacket, "\n", ""), nil
 }
 
-func (r *Runner) openTaskDrawer(ctx context.Context, tid string) bool {
+func (r *Runner) openTaskDrawer(ctx context.Context, tid string) (bool, error) {
 	var status string
-	_ = r.evalJS(ctx, JDPkg, tid, `(() => {
+	if err := r.evalJS(ctx, JDPkg, tid, `(() => {
 	  if ((document.body?.innerText || "").includes("做任务 领水滴")) return "already_open";
 	  const wrap = document.querySelector(".bottombar_wrap");
 	  if (wrap && wrap.children.length >= 3) { wrap.children[2].click(); return "clicked"; }
 	  return "";
-	})()`, false, &status)
-	if status != "" {
-		_ = r.sleepCtx(ctx, 700*time.Millisecond)
-		return true
+	})()`, false, &status); err != nil {
+		return false, err
 	}
-	return false
+	if status != "" {
+		if err := r.sleepCtx(ctx, 700*time.Millisecond); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
-func (r *Runner) closeTaskDrawer(ctx context.Context, tid string) {
-	_ = r.evalJS(ctx, JDPkg, tid, `(() => {
+func (r *Runner) closeTaskDrawer(ctx context.Context, tid string) error {
+	if err := r.evalJS(ctx, JDPkg, tid, `(() => {
 	  if (!(document.body?.innerText || "").includes("做任务 领水滴")) return;
 	  const closes = Array.from(document.querySelectorAll("[class*=close], [class*=Close], img[src*=close]"))
 	    .filter(e => { const r = e.getBoundingClientRect(); return r.width > 12 && r.width < 80 && r.top > 60 && r.top < 360; });
 	  if (closes.length > 0) closes[closes.length - 1].click();
-	})()`, false, nil)
-	_ = r.sleepCtx(ctx, 500*time.Millisecond)
+	})()`, false, nil); err != nil {
+		return err
+	}
+	return r.sleepCtx(ctx, 500*time.Millisecond)
 }
 
-func (r *Runner) claimDrawerRewards(ctx context.Context, tid string) int {
+func (r *Runner) claimDrawerRewards(ctx context.Context, tid string) (int, error) {
 	var n int
-	_ = r.evalJS(ctx, JDPkg, tid, `(() => {
+	if err := r.evalJS(ctx, JDPkg, tid, `(() => {
 	  let n = 0;
 	  const seen = new Set();
 	  for (const el of Array.from(document.querySelectorAll("div, span, button"))) {
@@ -1373,15 +1738,22 @@ func (r *Runner) claimDrawerRewards(ctx context.Context, tid string) int {
 	    }
 	  }
 	  return n;
-	})()`, false, &n)
-	if n > 0 {
-		_ = r.sleepCtx(ctx, 700*time.Millisecond)
+	})()`, false, &n); err != nil {
+		return 0, err
 	}
-	return n
+	if n > 0 {
+		if err := r.sleepCtx(ctx, 700*time.Millisecond); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 func (r *Runner) returnToFarmActivity(ctx context.Context) (string, error) {
 	for attempt := 0; attempt < 6; attempt++ {
+		if err := r.checkGuard(ctx); err != nil {
+			return "", err
+		}
 		if fg, err := r.backend.ForegroundApp(ctx); err == nil {
 			if fg.Package == JDPkg && strings.Contains(fg.Activity, "BabelActivity") {
 				if tid := r.findJDTarget(ctx, "42HV4J3Q87B2xFQMJk81PCc1mEs3", "东东农场"); tid != "" {
@@ -1389,20 +1761,36 @@ func (r *Runner) returnToFarmActivity(ctx context.Context) (string, error) {
 				}
 			}
 			if fg.Package != "" && fg.Package != JDPkg && fg.Package != "com.server.auditor.ssh.client" {
-				_ = r.backend.LaunchApp(ctx, JDPkg)
-				_ = r.sleepCtx(ctx, 1300*time.Millisecond)
+				if err := r.backend.LaunchApp(ctx, JDPkg); err != nil {
+					return "", err
+				}
+				if err := r.sleepCtx(ctx, 1300*time.Millisecond); err != nil {
+					return "", err
+				}
 				continue
 			}
 		}
 		if attempt == 1 || attempt == 3 {
-			_ = r.tapImage(ctx, 360, 1142)
-			_ = r.sleepCtx(ctx, 700*time.Millisecond)
+			if err := r.tapImage(ctx, 360, 1142); err != nil {
+				return "", err
+			}
+			if err := r.sleepCtx(ctx, 700*time.Millisecond); err != nil {
+				return "", err
+			}
 		}
-		_ = r.backend.KeyEvent(ctx, "BACK")
-		_ = r.sleepCtx(ctx, 1*time.Second)
+		if err := r.backend.KeyEvent(ctx, "BACK"); err != nil {
+			return "", err
+		}
+		if err := r.sleepCtx(ctx, 1*time.Second); err != nil {
+			return "", err
+		}
 		if attempt == 2 || attempt == 4 {
-			_ = r.tapImage(ctx, 45, 124)
-			_ = r.sleepCtx(ctx, 1*time.Second)
+			if err := r.tapImage(ctx, 45, 124); err != nil {
+				return "", err
+			}
+			if err := r.sleepCtx(ctx, 1*time.Second); err != nil {
+				return "", err
+			}
 		}
 	}
 	return r.ensureJDFarmOpen(ctx)
@@ -1432,7 +1820,10 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 	if err != nil {
 		return rep, err
 	}
-	before := r.waitFarmReady(ctx, tid)
+	before, err := r.waitFarmReady(ctx, tid)
+	if err != nil {
+		return rep, err
+	}
 	if before != nil {
 		rep.WaterBefore = before.Water
 		if before.NeedPrize {
@@ -1445,63 +1836,102 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 	}
 
 	// Collect floating 10g water bubble & left 10g entry
-	_ = r.evalJS(ctx, JDPkg, tid, `(() => {
+	if err := r.evalJS(ctx, JDPkg, tid, `(() => {
 	  const b = document.querySelector(".FixedTaskIcon_fixed_task_img__388lV");
 	  if (b) b.click();
 	  const left10 = Array.from(document.querySelectorAll(".LeftTaskEntry_task_item__o3Mg-")).find(e => (e.innerText||"").includes("10水滴"));
 	  if (left10) left10.click();
-	})()`, false, nil)
-	_ = r.sleepCtx(ctx, 900*time.Millisecond)
+	})()`, false, nil); err != nil {
+		return rep, err
+	}
+	if err := r.sleepCtx(ctx, 900*time.Millisecond); err != nil {
+		return rep, err
+	}
 	if _, err := r.dismissFarmPopups(ctx, tid); err != nil {
 		return rep, err
 	}
 
-	// Daily sign-in
+	// Daily sign-in (with 已签到 / 明天再来 detection)
 	var signOpened bool
-	_ = r.evalJS(ctx, JDPkg, tid, `(() => {
+	if err := r.evalJS(ctx, JDPkg, tid, `(() => {
 	  const w = document.querySelector(".bottombar_wrap");
 	  if (w && w.children.length >= 1) { w.children[0].click(); return true; }
 	  return false;
-	})()`, false, &signOpened)
+	})()`, false, &signOpened); err != nil {
+		return rep, err
+	}
 	if signOpened {
-		_ = r.sleepCtx(ctx, 2200*time.Millisecond)
+		if err := r.sleepCtx(ctx, 2200*time.Millisecond); err != nil {
+			return rep, err
+		}
 		if client, err := r.cdpClientFor(JDPkg); err == nil {
 			targets, _ := client.ListTargets(ctx)
 			for _, t := range targets {
 				if t.Type == "page" && t.ID != tid {
-					_ = r.evalJS(ctx, JDPkg, t.ID, `(() => {
+					var signRes string
+					if err := r.evalJS(ctx, JDPkg, t.ID, `(() => {
+					  const txt = document.body?.innerText || "";
+					  if (/已签到|明天再来/.test(txt)) return "already_signed";
 					  const btn = Array.from(document.querySelectorAll("div, span, button")).find(e => /^(点击签到领水滴|立即签到|点击签到|签到领水滴)$/.test((e.innerText||"").trim()) && e.getBoundingClientRect().width > 40);
-					  if (btn) btn.click();
-					})()`, false, nil)
+					  if (btn) { btn.click(); return "clicked:" + btn.innerText.trim(); }
+					  return "";
+					})()`, false, &signRes); err != nil {
+						return rep, err
+					}
+					if signRes != "" {
+						r.logf("[JD SignIn] %s", signRes)
+					}
 					break
 				}
 			}
 		}
-		_ = r.sleepCtx(ctx, 1600*time.Millisecond)
-		_ = r.backend.KeyEvent(ctx, "BACK")
-		_ = r.sleepCtx(ctx, 1200*time.Millisecond)
+		if err := r.sleepCtx(ctx, 1600*time.Millisecond); err != nil {
+			return rep, err
+		}
+		if err := r.backend.KeyEvent(ctx, "BACK"); err != nil {
+			return rep, err
+		}
+		if err := r.sleepCtx(ctx, 1200*time.Millisecond); err != nil {
+			return rep, err
+		}
 		tid, err = r.ensureJDFarmOpen(ctx)
 		if err != nil {
 			return rep, err
 		}
-		_ = r.waitFarmReady(ctx, tid)
-		_, _ = r.dismissFarmPopups(ctx, tid)
+		if _, err := r.waitFarmReady(ctx, tid); err != nil {
+			return rep, err
+		}
+		if _, err := r.dismissFarmPopups(ctx, tid); err != nil {
+			return rep, err
+		}
 	}
 
 	// Safe 6s browse tasks
-	if r.openTaskDrawer(ctx, tid) {
-		rep.DrawerClaims += r.claimDrawerRewards(ctx, tid)
+	drawerOpen, err := r.openTaskDrawer(ctx, tid)
+	if err != nil {
+		return rep, err
+	}
+	if drawerOpen {
+		c0, err := r.claimDrawerRewards(ctx, tid)
+		if err != nil {
+			return rep, err
+		}
+		rep.DrawerClaims += c0
 		tried := make(map[string]int)
 		stalled := make(map[string][2]int)
 		for run := 0; run < opts.MaxBrowse; run++ {
 			if err := r.checkGuard(ctx); err != nil {
 				return rep, err
 			}
-			rep.DrawerClaims += r.claimDrawerRewards(ctx, tid)
+			cn, err := r.claimDrawerRewards(ctx, tid)
+			if err != nil {
+				return rep, err
+			}
+			rep.DrawerClaims += cn
 			var cand []struct {
 				RowText string `json:"rowText"`
 			}
-			_ = r.evalJS(ctx, JDPkg, tid, `(() => {
+			if err := r.evalJS(ctx, JDPkg, tid, `(() => {
 			  const seen = new Set(); const rows = [];
 			  for (const btn of Array.from(document.querySelectorAll("div, span, button"))) {
 			    const bt = (btn.innerText || "").trim();
@@ -1518,7 +1948,9 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 			    rows.push({rowText: rtxt.slice(0, 100)});
 			  }
 			  return rows;
-			})()`, false, &cand)
+			})()`, false, &cand); err != nil {
+				return rep, err
+			}
 
 			chosenText := ""
 			chosenKey := ""
@@ -1566,7 +1998,7 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 			}
 			wJSON, _ := json.Marshal(wantPrefix)
 			var clicked bool
-			_ = r.evalJS(ctx, JDPkg, tid, fmt.Sprintf(`(() => {
+			if err := r.evalJS(ctx, JDPkg, tid, fmt.Sprintf(`(() => {
 			  const want = %s;
 			  for (const btn of Array.from(document.querySelectorAll("div, span, button"))) {
 			    const bt = (btn.innerText || "").trim();
@@ -1582,7 +2014,9 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 			    }
 			  }
 			  return false;
-			})()`, string(wJSON)), false, &clicked)
+			})()`, string(wJSON)), false, &clicked); err != nil {
+				return rep, err
+			}
 			if !clicked {
 				break
 			}
@@ -1600,90 +2034,185 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 			if err := r.sleepCtx(ctx, time.Duration(t1*float64(time.Second))); err != nil {
 				return rep, err
 			}
-			_ = r.jitterSwipe(ctx, 360, 1100, 360, 680, 220, 160, 520)
+			if err := r.jitterSwipe(ctx, 360, 1100, 360, 680, 220, 160, 520); err != nil {
+				return rep, err
+			}
 			if err := r.sleepCtx(ctx, time.Duration(t2*float64(time.Second))); err != nil {
 				return rep, err
 			}
-			_ = r.jitterSwipe(ctx, 360, 1000, 360, 720, 200, 160, 520)
+			if err := r.jitterSwipe(ctx, 360, 1000, 360, 720, 200, 160, 520); err != nil {
+				return rep, err
+			}
 			if err := r.sleepCtx(ctx, time.Duration(rem*float64(time.Second))); err != nil {
 				return rep, err
 			}
 
-			_ = r.backend.KeyEvent(ctx, "BACK")
-			_ = r.jitterSleep(ctx, 0.85, 1.35)
+			if err := r.backend.KeyEvent(ctx, "BACK"); err != nil {
+				return rep, err
+			}
+			if err := r.jitterSleep(ctx, 0.85, 1.35); err != nil {
+				return rep, err
+			}
 			tid, err = r.returnToFarmActivity(ctx)
 			if err != nil {
 				return rep, err
 			}
-			r.openTaskDrawer(ctx, tid)
-			rep.DrawerClaims += r.claimDrawerRewards(ctx, tid)
+			if _, err := r.openTaskDrawer(ctx, tid); err != nil {
+				return rep, err
+			}
+			cn2, err := r.claimDrawerRewards(ctx, tid)
+			if err != nil {
+				return rep, err
+			}
+			rep.DrawerClaims += cn2
 			rep.BrowseRuns++
 			r.logf("[JD Browse #%d] %s", rep.BrowseRuns, wantPrefix)
 		}
-		r.closeTaskDrawer(ctx, tid)
+		if err := r.closeTaskDrawer(ctx, tid); err != nil {
+			return rep, err
+		}
 	}
 
-	// Milestone watering tasks only (mode="tasks")
-	for cycle := 0; cycle < 6 && opts.WaterMode == "tasks"; cycle++ {
-		if !r.openTaskDrawer(ctx, tid) {
-			rep.WaterStop = "drawer_unavailable"
-			break
+	singleWaterClick := func() (string, error) {
+		var btnText string
+		if err := r.evalJS(ctx, JDPkg, tid, `(() => {
+		  const btn = Array.from(document.querySelectorAll("div, span, button")).find(e => /^(浇5次|浇水|浇1次)$/.test((e.innerText||"").trim()) && e.getBoundingClientRect().width > 20 && e.getBoundingClientRect().top > 200);
+		  if (!btn) return "";
+		  btn.click();
+		  return btn.innerText.trim();
+		})()`, false, &btnText); err != nil {
+			return "", err
 		}
-		rep.DrawerClaims += r.claimDrawerRewards(ctx, tid)
-		var wt struct {
-			Found  bool `json:"found"`
-			Cur    int  `json:"cur"`
-			Target int  `json:"target"`
+		return btnText, nil
+	}
+
+	// Watering: supports "tasks" (milestone only), "all" (pour until <10g or harvest), and "fixed" (up to MaxWaterRound clicks).
+	switch opts.WaterMode {
+	case "tasks":
+		for cycle := 0; cycle < 6; cycle++ {
+			opened, err := r.openTaskDrawer(ctx, tid)
+			if err != nil {
+				return rep, err
+			}
+			if !opened {
+				rep.WaterStop = "drawer_unavailable"
+				break
+			}
+			cn, err := r.claimDrawerRewards(ctx, tid)
+			if err != nil {
+				return rep, err
+			}
+			rep.DrawerClaims += cn
+			var wt struct {
+				Found  bool `json:"found"`
+				Cur    int  `json:"cur"`
+				Target int  `json:"target"`
+			}
+			if err := r.evalJS(ctx, JDPkg, tid, `(() => {
+			  const m = (document.body?.innerText || "").match(/每日累计浇水(\d+)次\s*[（(](\d+)\/(\d+)[）)]/);
+			  if (!m) return {found: false};
+			  return {found: true, cur: parseInt(m[2], 10), target: parseInt(m[3], 10)};
+			})()`, false, &wt); err != nil {
+				return rep, err
+			}
+			if err := r.closeTaskDrawer(ctx, tid); err != nil {
+				return rep, err
+			}
+			if !wt.Found || wt.Target-wt.Cur <= 0 {
+				rep.WaterStop = "all_watering_tasks_done"
+				break
+			}
+			needClicks := (wt.Target - wt.Cur + 4) / 5
+			if needClicks > opts.MaxWaterRound-rep.WaterRounds {
+				needClicks = opts.MaxWaterRound - rep.WaterRounds
+			}
+			stoppedEarly := false
+			for c := 0; c < needClicks; c++ {
+				if rp, err := r.dismissFarmPopups(ctx, tid); err != nil {
+					return rep, err
+				} else if rp != "" {
+					rep.RedPackets = append(rep.RedPackets, rp)
+				}
+				sum, err := r.readFarmSummary(ctx, tid)
+				if err != nil {
+					return rep, err
+				}
+				if sum != nil {
+					if sum.Matured {
+						rep.WaterStop = "tree_matured_ready_to_redeem"
+						stoppedEarly = true
+						break
+					}
+					if !opts.AllowMature && sum.NearHarvest {
+						rep.WaterStop = "paused_near_harvest_for_user"
+						stoppedEarly = true
+						break
+					}
+					if sum.WaterNum != nil && *sum.WaterNum < 10 {
+						rep.WaterStop = "water_insufficient"
+						stoppedEarly = true
+						break
+					}
+				}
+				btnText, err := singleWaterClick()
+				if err != nil {
+					return rep, err
+				}
+				if btnText == "" {
+					rep.WaterStop = "water_button_not_found"
+					stoppedEarly = true
+					break
+				}
+				rep.WaterRounds++
+				if err := r.jitterSleep(ctx, 1.5, 2.3); err != nil {
+					return rep, err
+				}
+				if rp, err := r.dismissFarmPopups(ctx, tid); err != nil {
+					return rep, err
+				} else if rp != "" {
+					rep.RedPackets = append(rep.RedPackets, rp)
+				}
+			}
+			if stoppedEarly || rep.WaterRounds >= opts.MaxWaterRound {
+				break
+			}
 		}
-		_ = r.evalJS(ctx, JDPkg, tid, `(() => {
-		  const m = (document.body?.innerText || "").match(/每日累计浇水(\d+)次\s*[（(](\d+)\/(\d+)[）)]/);
-		  if (!m) return {found: false};
-		  return {found: true, cur: parseInt(m[2], 10), target: parseInt(m[3], 10)};
-		})()`, false, &wt)
-		r.closeTaskDrawer(ctx, tid)
-		if !wt.Found || wt.Target-wt.Cur <= 0 {
-			rep.WaterStop = "all_watering_tasks_done"
-			break
-		}
-		needClicks := (wt.Target - wt.Cur + 4) / 5
-		if needClicks > opts.MaxWaterRound-rep.WaterRounds {
-			needClicks = opts.MaxWaterRound - rep.WaterRounds
-		}
-		stoppedEarly := false
-		for c := 0; c < needClicks; c++ {
+
+	case "all", "fixed":
+		stalled := 0
+		rep.WaterStop = "completed"
+		for idx := 1; idx <= opts.MaxWaterRound; idx++ {
 			if rp, err := r.dismissFarmPopups(ctx, tid); err != nil {
 				return rep, err
 			} else if rp != "" {
 				rep.RedPackets = append(rep.RedPackets, rp)
 			}
-			sum, _ := r.readFarmSummary(ctx, tid)
+			sum, err := r.readFarmSummary(ctx, tid)
+			if err != nil {
+				return rep, err
+			}
+			var beforeWater *int
 			if sum != nil {
+				beforeWater = sum.WaterNum
 				if sum.Matured {
 					rep.WaterStop = "tree_matured_ready_to_redeem"
-					stoppedEarly = true
 					break
 				}
 				if !opts.AllowMature && sum.NearHarvest {
 					rep.WaterStop = "paused_near_harvest_for_user"
-					stoppedEarly = true
 					break
 				}
-				if sum.WaterNum != nil && *sum.WaterNum < 10 {
+				if opts.WaterMode == "all" && sum.WaterNum != nil && *sum.WaterNum < 10 {
 					rep.WaterStop = "water_insufficient"
-					stoppedEarly = true
 					break
 				}
 			}
-			var btnText string
-			_ = r.evalJS(ctx, JDPkg, tid, `(() => {
-			  const btn = Array.from(document.querySelectorAll("div, span, button")).find(e => /^(浇5次|浇水|浇1次)$/.test((e.innerText||"").trim()) && e.getBoundingClientRect().width > 20 && e.getBoundingClientRect().top > 200);
-			  if (!btn) return "";
-			  btn.click();
-			  return btn.innerText.trim();
-			})()`, false, &btnText)
+			btnText, err := singleWaterClick()
+			if err != nil {
+				return rep, err
+			}
 			if btnText == "" {
 				rep.WaterStop = "water_button_not_found"
-				stoppedEarly = true
 				break
 			}
 			rep.WaterRounds++
@@ -1695,15 +2224,47 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 			} else if rp != "" {
 				rep.RedPackets = append(rep.RedPackets, rp)
 			}
-		}
-		if stoppedEarly || rep.WaterRounds >= opts.MaxWaterRound {
-			break
+			afterSum, err := r.readFarmSummary(ctx, tid)
+			if err != nil {
+				return rep, err
+			}
+			if beforeWater != nil && afterSum != nil && afterSum.WaterNum != nil && *afterSum.WaterNum >= *beforeWater {
+				stalled++
+				if stalled >= 4 {
+					rep.WaterStop = "water_unchanged_or_daily_limit"
+					break
+				}
+			} else {
+				stalled = 0
+			}
+			if opts.WaterMode == "all" && idx%8 == 0 {
+				if opened, err := r.openTaskDrawer(ctx, tid); err != nil {
+					return rep, err
+				} else if opened {
+					cn, err := r.claimDrawerRewards(ctx, tid)
+					if err != nil {
+						return rep, err
+					}
+					rep.DrawerClaims += cn
+					if err := r.closeTaskDrawer(ctx, tid); err != nil {
+						return rep, err
+					}
+				}
+			}
 		}
 	}
 
-	if r.openTaskDrawer(ctx, tid) {
-		rep.DrawerClaims += r.claimDrawerRewards(ctx, tid)
-		r.closeTaskDrawer(ctx, tid)
+	if opened, err := r.openTaskDrawer(ctx, tid); err != nil {
+		return rep, err
+	} else if opened {
+		cn, err := r.claimDrawerRewards(ctx, tid)
+		if err != nil {
+			return rep, err
+		}
+		rep.DrawerClaims += cn
+		if err := r.closeTaskDrawer(ctx, tid); err != nil {
+			return rep, err
+		}
 	}
 	if after, err := r.readFarmSummary(ctx, tid); err == nil && after != nil {
 		rep.WaterAfter = after.Water
@@ -1726,19 +2287,23 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 			}
 		}
 		if bTID != "" {
-			_ = r.sleepCtx(ctx, 1400*time.Millisecond)
+			if err := r.sleepCtx(ctx, 1400*time.Millisecond); err != nil {
+				return rep, err
+			}
 			var info struct {
 				Text string  `json:"text"`
 				X    float64 `json:"x"`
 				Y    float64 `json:"y"`
 				VW   float64 `json:"vw"`
 			}
-			_ = r.evalJS(ctx, JDPkg, bTID, `(() => {
+			if err := r.evalJS(ctx, JDPkg, bTID, `(() => {
 			  const btn = Array.from(document.querySelectorAll("div, span, button")).find(e => /^(立即刮卡|明日再来|今日已刮)$/.test((e.innerText||"").trim()) && e.getBoundingClientRect().width > 40);
 			  if (!btn) return {text: ""};
 			  const r = btn.getBoundingClientRect();
 			  return {text: btn.innerText.trim(), x: r.left + r.width/2, y: r.top + r.height/2, vw: window.innerWidth || 393};
-			})()`, false, &info)
+			})()`, false, &info); err != nil {
+				return rep, err
+			}
 			if info.Text == "立即刮卡" {
 				vw := info.VW
 				if vw <= 0 {
@@ -1749,16 +2314,22 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 				if ty < 200 || ty > 900 {
 					tx, ty = 360, 535
 				}
-				_ = r.tapImage(ctx, tx, ty)
+				if err := r.tapImage(ctx, tx, ty); err != nil {
+					return rep, err
+				}
 				rep.BeanAction = "scratched"
-				_ = r.sleepCtx(ctx, 2200*time.Millisecond)
+				if err := r.sleepCtx(ctx, 2200*time.Millisecond); err != nil {
+					return rep, err
+				}
 			} else if info.Text != "" {
 				rep.BeanAction = "already_done:" + info.Text
 			} else {
 				rep.BeanAction = "no_scratch_button"
 			}
 			var afterTxt string
-			_ = r.evalJS(ctx, JDPkg, bTID, `(document.body?.innerText || "").slice(0, 300)`, false, &afterTxt)
+			if err := r.evalJS(ctx, JDPkg, bTID, `(document.body?.innerText || "").slice(0, 300)`, false, &afterTxt); err != nil {
+				return rep, err
+			}
 			if m := regexp.MustCompile(`可抵[\d.]+元`).FindString(afterTxt); m != "" {
 				rep.BeanWorth = m
 			}
@@ -1787,13 +2358,18 @@ func (r *Runner) RunDailyAll(ctx context.Context) (*DailyAllReport, error) {
 		out.MSError = msErr.Error()
 		r.logf("[DailyAll] MS Rewards error: %v", msErr)
 	}
+	var jdErr error
 	if ctx.Err() == nil {
-		jdRep, jdErr := r.RunJDDaily(ctx, JDDailyOptions{BrowseSec: 8.5, MaxBrowse: 24, WaterMode: "tasks"})
+		var jdRep *JDDailyReport
+		jdRep, jdErr = r.RunJDDaily(ctx, JDDailyOptions{BrowseSec: 8.5, MaxBrowse: 24, WaterMode: "tasks"})
 		out.JDDaily = jdRep
 		if jdErr != nil {
 			out.JDError = jdErr.Error()
 			r.logf("[DailyAll] JD Daily error: %v", jdErr)
 		}
+	} else {
+		jdErr = ctx.Err()
+		out.JDError = jdErr.Error()
 	}
 	out.ElapsedSec = math.Round(time.Since(t0).Seconds()*10) / 10
 	summary := fmt.Sprintf("耗时 %.1fs", out.ElapsedSec)
@@ -1803,6 +2379,24 @@ func (r *Runner) RunDailyAll(ctx context.Context) (*DailyAllReport, error) {
 	if out.JDDaily != nil && out.JDDaily.WaterAfter != "" {
 		summary += fmt.Sprintf(" | 农场 %s (%s)", out.JDDaily.WaterAfter, out.JDDaily.StageAfter)
 	}
-	_ = r.backend.PostNotification(ctx, "daily_all", "每日任务完成", summary)
+	notifTitle := "每日任务完成"
+	if msErr != nil && jdErr != nil {
+		notifTitle = "每日任务失败"
+	} else if msErr != nil || jdErr != nil {
+		notifTitle = "每日任务部分失败"
+	}
+	if r.backend != nil {
+		_ = r.backend.PostNotification(ctx, "daily_all", notifTitle, summary)
+	}
+	if msErr != nil || jdErr != nil {
+		var errs []error
+		if msErr != nil {
+			errs = append(errs, fmt.Errorf("ms_rewards: %w", msErr))
+		}
+		if jdErr != nil {
+			errs = append(errs, fmt.Errorf("jd_daily: %w", jdErr))
+		}
+		return out, errors.Join(errs...)
+	}
 	return out, nil
 }

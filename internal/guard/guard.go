@@ -131,39 +131,57 @@ func New(opts Options) *Guard {
 	}
 }
 
-// DefaultScreenChecker performs a zero-fork sysfs backlight check.
+// DefaultScreenChecker performs a zero-fork sysfs display check.
+// When DRM dpms status is exposed, it must report "On" alongside backlight brightness > 0
+// so OLED AOD (brightness > 0 while dpms != On) does not falsely appear screen-on.
 // If no display sysfs entries exist (e.g. non-Android test hosts), it returns true.
 func DefaultScreenChecker() bool {
-	checked := false
-	for _, pat := range []string{"/sys/class/backlight/*/brightness", "/sys/class/leds/*backlight*/brightness"} {
+	return checkScreenSysfs(
+		[]string{"/sys/class/backlight/*/brightness", "/sys/class/leds/*backlight*/brightness"},
+		[]string{"/sys/class/drm/card*-DSI-*/dpms"},
+	)
+}
+
+func checkScreenSysfs(backlightPatterns, dpmsPatterns []string) bool {
+	dpmsChecked := false
+	dpmsOn := false
+	for _, pat := range dpmsPatterns {
 		matches, _ := filepath.Glob(pat)
 		for _, p := range matches {
 			raw, err := os.ReadFile(p)
 			if err != nil {
 				continue
 			}
-			checked = true
-			if v, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && v > 0 {
-				return true
+			dpmsChecked = true
+			if strings.EqualFold(strings.TrimSpace(string(raw)), "On") {
+				dpmsOn = true
 			}
 		}
 	}
-	if checked {
+	if dpmsChecked && !dpmsOn {
 		return false
 	}
-	dpmsMatches, _ := filepath.Glob("/sys/class/drm/card*-DSI-*/dpms")
-	for _, p := range dpmsMatches {
-		raw, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		checked = true
-		if strings.EqualFold(strings.TrimSpace(string(raw)), "On") {
-			return true
+
+	blChecked := false
+	blOn := false
+	for _, pat := range backlightPatterns {
+		matches, _ := filepath.Glob(pat)
+		for _, p := range matches {
+			raw, err := os.ReadFile(p)
+			if err != nil {
+				continue
+			}
+			blChecked = true
+			if v, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && v > 0 {
+				blOn = true
+			}
 		}
 	}
-	if checked {
-		return false
+	if blChecked {
+		return blOn
+	}
+	if dpmsChecked {
+		return dpmsOn
 	}
 	return true
 }
@@ -340,26 +358,77 @@ func (g *Guard) Run(ctx context.Context) {
 	}
 }
 
-// AndroidForegroundDetector performs a zero-subprocess /proc scan first; only when a guarded
-// game process actually exists does it check foreground focus via oom_score_adj & dumpsys.
-type AndroidForegroundDetector struct{}
+// AndroidForegroundDetector performs a zero-subprocess delta /proc scan first; only when a
+// non-cached, non-frozen guarded game process actually exists does it check foreground focus
+// via dumpsys.
+type AndroidForegroundDetector struct {
+	mu            sync.Mutex
+	lastSeenPID   int
+	knownSafePIDs map[int]struct{}
+	volatilePIDs  map[int]struct{} // pre-forked zygote/usap/<pre-initialized> PIDs that may specialize later
+	guardedPIDs   map[int]string   // pid -> base guarded package
+	packagesKey   string
+	pollCount     uint64
+
+	// Optional overrides for deterministic unit tests (default to /proc, /sys/fs/cgroup, real dumpsys).
+	procRoot    string
+	cgroupRoot  string
+	queryFgFunc func(ctx context.Context) string
+}
 
 var pkgActivityRe = regexp.MustCompile(`u\d+\s+([a-zA-Z0-9_.]+)/([a-zA-Z0-9_.$]+)`)
+
+func (d *AndroidForegroundDetector) getProcRoot() string {
+	if d.procRoot != "" {
+		return d.procRoot
+	}
+	return "/proc"
+}
+
+func (d *AndroidForegroundDetector) getCgroupRoot() string {
+	if d.cgroupRoot != "" {
+		return d.cgroupRoot
+	}
+	return "/sys/fs/cgroup"
+}
 
 func (d *AndroidForegroundDetector) DetectGuardedForeground(ctx context.Context, packages []string) (string, error) {
 	if len(packages) == 0 {
 		return "", nil
 	}
-	// Step 1: Zero-exec /proc scan — returns immediately if none of the guarded games are running.
-	running := findRunningPackages(packages)
+	// Step 1: Zero-exec delta /proc scan — returns immediately if none of the guarded games are running.
+	running := d.findRunningPackages(packages)
 	if len(running) == 0 {
 		return "", nil
 	}
 
-	// Step 2: Check current focused window / resumed activity via lightweight dumpsys.
+	// Step 2: Filter matched guarded PIDs to non-cached (oom_score_adj <= 200) and non-frozen
+	// BEFORE forking dumpsys, avoiding continuous dumpsys storms while a game sits cached in RAM.
+	activeCandidates := make(map[string][]int)
+	for pkg, pids := range running {
+		for _, pid := range pids {
+			adj, ok := d.readOomScoreAdj(pid)
+			if !ok || adj > 200 {
+				continue
+			}
+			if d.isPIDFrozen(pid) {
+				continue
+			}
+			activeCandidates[pkg] = append(activeCandidates[pkg], pid)
+		}
+	}
+	if len(activeCandidates) == 0 {
+		return "", nil
+	}
+
+	// Step 3: Check current focused window / resumed activity via lightweight dumpsys.
 	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	if fgPkg := queryForegroundPackage(checkCtx); fgPkg != "" {
+	qfn := d.queryFgFunc
+	if qfn == nil {
+		qfn = queryForegroundPackage
+	}
+	if fgPkg := qfn(checkCtx); fgPkg != "" {
 		for _, target := range packages {
 			if fgPkg == target {
 				return target, nil
@@ -368,10 +437,10 @@ func (d *AndroidForegroundDetector) DetectGuardedForeground(ctx context.Context,
 		return "", nil
 	}
 
-	// Fallback if dumpsys was temporarily unavailable: check oom_score_adj == 0 (foreground app)
-	for pkg, pids := range running {
+	// Fallback if dumpsys was temporarily unavailable: check oom_score_adj <= 0 (foreground app)
+	for pkg, pids := range activeCandidates {
 		for _, pid := range pids {
-			if isForegroundOom(pid) {
+			if d.isForegroundOom(pid) {
 				return pkg, nil
 			}
 		}
@@ -379,15 +448,145 @@ func (d *AndroidForegroundDetector) DetectGuardedForeground(ctx context.Context,
 	return "", nil
 }
 
-func findRunningPackages(packages []string) map[string][]int {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return nil
+func isVolatileAppProc(procName string) bool {
+	if procName == "" {
+		return true
 	}
+	low := strings.ToLower(procName)
+	return strings.HasPrefix(low, "usap") ||
+		strings.HasPrefix(low, "zygote") ||
+		strings.HasPrefix(low, "webview_zygote") ||
+		strings.Contains(low, "<pre-initialized>")
+}
+
+func matchGuardedPackage(procName string, targets map[string]struct{}) (string, bool) {
+	if procName == "" {
+		return "", false
+	}
+	if _, ok := targets[procName]; ok {
+		return procName, true
+	}
+	// Handle sub-processes like com.tencent.tmgp.sgame:xg_vip_service
+	if colon := strings.IndexByte(procName, ':'); colon > 0 {
+		base := procName[:colon]
+		if _, ok := targets[base]; ok {
+			return base, true
+		}
+	}
+	return "", false
+}
+
+func (d *AndroidForegroundDetector) readLastPID() int {
+	raw, err := os.ReadFile(filepath.Join(d.getProcRoot(), "loadavg"))
+	if err != nil {
+		return 0
+	}
+	fields := strings.Fields(string(raw))
+	if len(fields) < 5 {
+		return 0
+	}
+	pid, err := strconv.Atoi(fields[4])
+	if err != nil || pid <= 0 {
+		return 0
+	}
+	return pid
+}
+
+func (d *AndroidForegroundDetector) readCmdline(pid int) (string, bool) {
+	raw, err := os.ReadFile(filepath.Join(d.getProcRoot(), strconv.Itoa(pid), "cmdline"))
+	if err != nil {
+		return "", false
+	}
+	if len(raw) == 0 {
+		return "", true
+	}
+	if idx := bytes.IndexByte(raw, 0); idx >= 0 {
+		raw = raw[:idx]
+	}
+	return string(raw), true
+}
+
+func (d *AndroidForegroundDetector) findRunningPackages(packages []string) map[string][]int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	pkgKey := strings.Join(packages, "\x00")
+	if d.packagesKey != pkgKey || d.knownSafePIDs == nil {
+		d.knownSafePIDs = make(map[int]struct{})
+		d.volatilePIDs = make(map[int]struct{})
+		d.guardedPIDs = make(map[int]string)
+		d.lastSeenPID = 0
+		d.packagesKey = pkgKey
+		d.pollCount = 0
+	}
+
 	targets := make(map[string]struct{}, len(packages))
 	for _, p := range packages {
 		targets[p] = struct{}{}
 	}
+
+	d.pollCount++
+	curLastPID := d.readLastPID()
+	needPrune := d.pollCount%30 == 0
+	// If PID counter wrapped around, reset knownSafePIDs so recycled PIDs are re-checked.
+	if curLastPID > 0 && d.lastSeenPID > 0 && curLastPID < d.lastSeenPID {
+		d.knownSafePIDs = make(map[int]struct{})
+	}
+
+	// Fast path: /proc/loadavg lastPID unchanged since previous poll -> no new processes forked.
+	// Only re-check tracked guarded PIDs and any pre-forked volatile (usap/zygote) PIDs.
+	if d.pollCount > 1 && curLastPID > 0 && curLastPID == d.lastSeenPID && !needPrune {
+		for pid := range d.volatilePIDs {
+			procName, ok := d.readCmdline(pid)
+			if !ok {
+				delete(d.volatilePIDs, pid)
+				continue
+			}
+			if pkg, matched := matchGuardedPackage(procName, targets); matched {
+				delete(d.volatilePIDs, pid)
+				d.guardedPIDs[pid] = pkg
+			} else if !isVolatileAppProc(procName) {
+				delete(d.volatilePIDs, pid)
+				d.knownSafePIDs[pid] = struct{}{}
+			}
+		}
+		found := make(map[string][]int)
+		for pid := range d.guardedPIDs {
+			procName, ok := d.readCmdline(pid)
+			if !ok {
+				delete(d.guardedPIDs, pid)
+				continue
+			}
+			if pkg, matched := matchGuardedPackage(procName, targets); matched {
+				d.guardedPIDs[pid] = pkg
+				found[pkg] = append(found[pkg], pid)
+			} else {
+				delete(d.guardedPIDs, pid)
+				if isVolatileAppProc(procName) {
+					d.volatilePIDs[pid] = struct{}{}
+				} else {
+					d.knownSafePIDs[pid] = struct{}{}
+				}
+			}
+		}
+		return found
+	}
+
+	procDir := d.getProcRoot()
+	entries, err := os.ReadDir(procDir)
+	if err != nil {
+		return nil
+	}
+	if curLastPID > 0 {
+		d.lastSeenPID = curLastPID
+	}
+
+	var alive map[int]struct{}
+	if needPrune {
+		alive = make(map[int]struct{}, len(entries))
+	}
+	filterSystemUID := d.procRoot == ""
+
 	found := make(map[string][]int)
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -397,45 +596,146 @@ func findRunningPackages(packages []string) map[string][]int {
 		if err != nil || pid <= 0 {
 			continue
 		}
-		// Android app UIDs are >= 10000; skip kernel/system daemons without opening /proc/<pid>/cmdline.
-		if info, ierr := e.Info(); ierr == nil {
-			if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Uid < 10000 {
+		if alive != nil {
+			alive[pid] = struct{}{}
+		}
+		if _, safe := d.knownSafePIDs[pid]; safe {
+			continue
+		}
+		if _, tracked := d.guardedPIDs[pid]; tracked {
+			procName, ok := d.readCmdline(pid)
+			if !ok {
+				delete(d.guardedPIDs, pid)
 				continue
 			}
-		}
-		raw, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
-		if err != nil || len(raw) == 0 {
+			if pkg, matched := matchGuardedPackage(procName, targets); matched {
+				d.guardedPIDs[pid] = pkg
+				found[pkg] = append(found[pkg], pid)
+			} else {
+				delete(d.guardedPIDs, pid)
+				if isVolatileAppProc(procName) {
+					d.volatilePIDs[pid] = struct{}{}
+				} else {
+					d.knownSafePIDs[pid] = struct{}{}
+				}
+			}
 			continue
 		}
-		if idx := bytes.IndexByte(raw, 0); idx >= 0 {
-			raw = raw[:idx]
+
+		// New PID (or volatile PID): inspect UID / cmdline once and classify.
+		isSystemUID := false
+		if filterSystemUID {
+			if info, ierr := e.Info(); ierr == nil {
+				if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Uid < 10000 {
+					isSystemUID = true
+				}
+			}
 		}
-		procName := string(raw)
-		if _, ok := targets[procName]; ok {
-			found[procName] = append(found[procName], pid)
+		procName, ok := d.readCmdline(pid)
+		if !ok {
+			delete(d.volatilePIDs, pid)
 			continue
 		}
-		// Handle sub-processes like com.tencent.tmgp.sgame:xg_vip_service
-		if colon := strings.IndexByte(procName, ':'); colon > 0 {
-			base := procName[:colon]
-			if _, ok := targets[base]; ok {
-				found[base] = append(found[base], pid)
+		if isSystemUID {
+			// System/kernel processes cannot be third-party games, EXCEPT unspecialized
+			// zygote/usap pool processes which later setuid(>=10000) and specialize into apps.
+			if procName != "" && isVolatileAppProc(procName) {
+				d.volatilePIDs[pid] = struct{}{}
+			} else {
+				delete(d.volatilePIDs, pid)
+				d.knownSafePIDs[pid] = struct{}{}
+			}
+			continue
+		}
+		if pkg, matched := matchGuardedPackage(procName, targets); matched {
+			delete(d.volatilePIDs, pid)
+			d.guardedPIDs[pid] = pkg
+			found[pkg] = append(found[pkg], pid)
+			continue
+		}
+		if isVolatileAppProc(procName) {
+			d.volatilePIDs[pid] = struct{}{}
+			continue
+		}
+		delete(d.volatilePIDs, pid)
+		d.knownSafePIDs[pid] = struct{}{}
+	}
+
+	if alive != nil {
+		for pid := range d.knownSafePIDs {
+			if _, ok := alive[pid]; !ok {
+				delete(d.knownSafePIDs, pid)
+			}
+		}
+		for pid := range d.volatilePIDs {
+			if _, ok := alive[pid]; !ok {
+				delete(d.volatilePIDs, pid)
+			}
+		}
+		for pid := range d.guardedPIDs {
+			if _, ok := alive[pid]; !ok {
+				delete(d.guardedPIDs, pid)
 			}
 		}
 	}
 	return found
 }
 
-func isForegroundOom(pid int) bool {
-	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid))
+func (d *AndroidForegroundDetector) readOomScoreAdj(pid int) (int, bool) {
+	raw, err := os.ReadFile(filepath.Join(d.getProcRoot(), strconv.Itoa(pid), "oom_score_adj"))
 	if err != nil {
-		return false
+		return 0, false
 	}
 	adj, err := strconv.Atoi(strings.TrimSpace(string(raw)))
 	if err != nil {
+		return 0, false
+	}
+	return adj, true
+}
+
+func (d *AndroidForegroundDetector) isForegroundOom(pid int) bool {
+	adj, ok := d.readOomScoreAdj(pid)
+	return ok && adj <= 0
+}
+
+func (d *AndroidForegroundDetector) isPIDFrozen(pid int) bool {
+	if pid <= 0 {
 		return false
 	}
-	return adj <= 0
+	pidStr := strconv.Itoa(pid)
+	procDir := d.getProcRoot()
+	if raw, err := os.ReadFile(filepath.Join(procDir, pidStr, "cgroup")); err == nil {
+		cgRoot := d.getCgroupRoot()
+		for _, line := range strings.Split(string(raw), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, ":", 3)
+			if len(parts) == 3 && parts[0] == "0" && parts[1] == "" && parts[2] != "" {
+				cgDir := filepath.Join(cgRoot, strings.TrimPrefix(parts[2], "/"))
+				if evRaw, err := os.ReadFile(filepath.Join(cgDir, "cgroup.events")); err == nil {
+					for _, evLine := range strings.Split(string(evRaw), "\n") {
+						fields := strings.Fields(evLine)
+						if len(fields) >= 2 && fields[0] == "frozen" && fields[1] == "1" {
+							return true
+						}
+					}
+				}
+				if frRaw, err := os.ReadFile(filepath.Join(cgDir, "cgroup.freeze")); err == nil {
+					if strings.TrimSpace(string(frRaw)) == "1" {
+						return true
+					}
+				}
+			}
+		}
+	}
+	if raw, err := os.ReadFile(filepath.Join(procDir, pidStr, "wchan")); err == nil {
+		if strings.Contains(strings.ToLower(string(raw)), "freezer") {
+			return true
+		}
+	}
+	return false
 }
 
 func queryForegroundPackage(ctx context.Context) string {

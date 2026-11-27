@@ -2,8 +2,8 @@
 
 小米 13（`fuxi` / Android 16 / API 36 / HyperOS 3.0 / KernelSU 3.3.1）原生低延迟 AI Agent 底座。
 
-- **当前状态**：**`v0.3.3-streaming` 实时流式执行与 HyperOS 超级岛升级版 — 已实现 SSE 全链路实时步骤流 + 断线重放（Run Replay）+ 一键急停、DSH Go 风格可折叠呼吸时间线 `/ui`（含 KernelSU WebUI），以及零 Hook HyperOS 3.0 超级岛焦点通知实时进度反馈**。
-- **架构亮点**：零外部 Go 依赖静态单文件（内嵌 `_ "time/tzdata"`），内置标准 **MCP Streamable HTTP (`2025-03-26`)** 服务端（`25` 个工具）、懒加载 `app_process64` 微内核（3 分钟空闲销毁 + 杂讯隔离 + 王者荣耀秒杀熔断 + 焦点通知通道）、`evdev` 亮屏解锁门禁、2MB 进程内日志轮转、DNS Rebinding/Origin 防护与本机 `127.0.0.1:8765` 默认监听。
+- **当前状态**：**`v0.3.4` 可靠性、低功耗与安全加固版 — 在 `v0.3.3-streaming` 实时流式 SSE / Run Replay / 零 Hook HyperOS 3.0 超级岛基础上，全面修复闲置功耗、CDP 冻结重连、横屏坐标缩放、WebUI 断线防卡死与多项安全隐私漏洞**。
+- **架构亮点**：零外部 Go 依赖静态单文件（内嵌 `_ "time/tzdata"`），内置标准 **MCP Streamable HTTP (`2025-03-26`)** 服务端（`26` 个工具，内置 LLM 大脑自动隐藏 `agent_pause`/`agent_resume` 防自锁）、懒加载 `app_process64` 微内核（3 分钟空闲销毁 + 杂讯隔离 + 王者荣耀秒杀熔断 + 焦点通知通道）、`evdev` 亮屏解锁门禁、2MB 进程内日志轮转、严格 Origin/Host 防护与本机 `127.0.0.1:8765` 默认监听。
 
 ---
 
@@ -144,6 +144,26 @@
 3. **零 Hook HyperOS 3.0 超级岛焦点通知（`island.go` + `AgentKernel.smali`）**
    - 不修改 `system_server` / `SystemUI`、不依赖 LSPosed Hook，直接利用常驻 `AgentKernel`（`uid=2000`）向 HyperOS 3.0 发送含 `miui.focus.enable` / `miui.focus.ticker` / `miui.focus.param`（`param_island`）的高权重静默焦点通知（实测 **5ms** 亮起顶部超级岛胶囊）：
    - 空闲零打扰；执行期间 `350ms` 节流刷新；完成/取消 3 秒自动收起；触及 `SOUL.md` 付款/确认红线时保留提醒胶囊；王者荣耀进前台熔断时优先秒消超级岛再终止微内核。
+
+---
+
+## 2.7 `v0.3.4` 可靠性、功耗与安全加固摘要
+
+在真机长期运行遥测与全链路代码审计后，`v0.3.4` 重点完成了以下修复与加固：
+
+1. **MCP Server 与安全加固（`internal/mcp/server.go`）**
+   - **横屏坐标精准映射**：`phone_screenshot` 缓存最近一次截屏的 `(OrigWidth, OrigHeight, Width, Height)`，`resolveCoords()` 分别计算 `scaleX` / `scaleY`，修复横屏 `coord_space="image"` 点击/滑动偏移。
+   - **严格 Origin / Host 与动态 Token 校验**：拒绝空 `Host` 及未绑定外部 IP；`Origin` 严格校验 `scheme://host[:port]` 与请求 `Host` 一致（不再放行任意回环端口）；Bearer Token 改为动态读取 `cfgMu` + `sha256` 常量时间比对。
+   - **会话与协议卫生**：MCP JSON-RPC 批处理同样校验 `Mcp-Session-Id`，自动回收超过 2 小时闲置会话；`/api/v1/chat/stream` 在响应头后立即刷新 `: connected\n\n`；`/api/v1/schedule` 严格校验 `HH:MM` 格式与 `window_end > window_start`。
+   - **任务串行化与隐私脱敏**：MCP `run_daily_all` / `run_ms_rewards` / `run_jd_daily` 统一经由 `JobManager` 串行执行并支持 UI 追踪/取消；内置 LLM `ToolSpecs()` 隐藏 `agent_pause`/`agent_resume` 防自锁；`ExecuteTool` 与 `/api/v1/chat/history` 对剪贴板和输入敏感值进行脱敏。
+
+2. **WebUI / KernelSU WebUI 体验与稳定性（`ui.html` / `ksu-module/webroot/index.html`）**
+   - **修复重启/未知 `run_id` 永久卡死**：`replayOnce()` 遇到 `not_found`、HTTP 404 或 `(!active && !finished)` 时立即解除锁定并清理本地 `active_run_id`，不再无限 450ms 轮询；支持 `accumulated_text` 文本恢复与 `tool_start` 清理中间流文本。
+   - **首次鉴权与省电轮询**：提取 `bootstrapAuthedUI()`，首次保存 Token 后立即加载历史/计划并启动轮询；按 `run_id` 去重避免刷新重复渲染气泡；页面隐藏（`document.hidden`）时暂停轮询，切回前台（`visibilitychange`）立即刷新。
+   - **交互与配置保护**：`saveSchedule()` 编辑主计划时完整保留 `config.schedule.entries` 中的其他条目；弹窗内新增内联错误/提示条；`needs_confirmation` 确认横幅新增 **`[我已处理，继续]` / `[截屏核对]` / `[放弃任务]`** 快捷操作按钮（零外链，完全兼容本地 CSP）。
+
+3. **端侧引擎、大脑与工作流协同加固**
+   - 包含闲置 CPU/子进程减负（`guard.go` / `shell.go`）、CDP 冻结检测与跨 Socket 防误路由（`cdp.go`）、LLM 流式错误透传与并行工具调用兼容（`llm.go` / `agent.go`）、定时任务锁屏检查与多端设备互斥租约（`scheduler.go` / `workflows.go`）。
 
 ---
 

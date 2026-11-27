@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,11 +26,25 @@ import (
 
 var ErrUnavailable = errors.New("browser devtools abstract socket unavailable")
 
+type frozenError struct{}
+
+func (frozenError) Error() string        { return "cdp target process is frozen" }
+func (frozenError) IsTargetFrozen() bool { return true }
+
+var ErrTargetFrozen = frozenError{}
+
+var (
+	procRoot   = "/proc"
+	cgroupRoot = "/sys/fs/cgroup"
+)
+
 type SocketInfo struct {
 	Socket  string `json:"socket"`
 	Name    string `json:"name"`
 	PID     int    `json:"pid,omitempty"`
 	Process string `json:"process,omitempty"`
+	Frozen  bool   `json:"frozen,omitempty"`
+	OomAdj  int    `json:"oom_adj"`
 }
 
 type Client struct {
@@ -78,7 +93,8 @@ func NewClient(socketName string) *Client {
 }
 
 // ListSockets discovers all active *_devtools_remote* abstract Unix sockets on the device
-// along with their owning process name when a PID suffix is present (e.g. webview_devtools_remote_787).
+// along with their owning process name, frozen state, and oom_score_adj when a PID suffix
+// is present (e.g. webview_devtools_remote_787).
 func ListSockets() []SocketInfo {
 	names := discoverDevToolsSockets()
 	out := make([]SocketInfo, 0, len(names))
@@ -87,10 +103,12 @@ func ListSockets() []SocketInfo {
 			Socket: "@" + name,
 			Name:   name,
 		}
-		if idx := strings.LastIndexByte(name, '_'); idx > 0 && idx+1 < len(name) {
-			if pid, err := strconv.Atoi(name[idx+1:]); err == nil && pid > 0 {
-				info.PID = pid
-				info.Process = readProcCmdline(pid)
+		if pid := parseSocketPID(name); pid > 0 {
+			info.PID = pid
+			info.Process = readProcCmdline(pid)
+			info.Frozen = isPIDFrozen(pid)
+			if adj, ok := readProcOomAdj(pid); ok {
+				info.OomAdj = adj
 			}
 		}
 		out = append(out, info)
@@ -98,8 +116,17 @@ func ListSockets() []SocketInfo {
 	return out
 }
 
+func parseSocketPID(name string) int {
+	if idx := strings.LastIndexByte(name, '_'); idx > 0 && idx+1 < len(name) {
+		if pid, err := strconv.Atoi(name[idx+1:]); err == nil && pid > 0 {
+			return pid
+		}
+	}
+	return 0
+}
+
 func readProcCmdline(pid int) string {
-	raw, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
+	raw, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "cmdline"))
 	if err != nil || len(raw) == 0 {
 		return ""
 	}
@@ -109,10 +136,85 @@ func readProcCmdline(pid int) string {
 	return strings.TrimSpace(string(raw))
 }
 
+func readProcOomAdj(pid int) (int, bool) {
+	raw, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "oom_score_adj"))
+	if err != nil {
+		return 0, false
+	}
+	adj, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return 0, false
+	}
+	return adj, true
+}
+
+func isPIDFrozen(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	pidStr := strconv.Itoa(pid)
+	if raw, err := os.ReadFile(filepath.Join(procRoot, pidStr, "cgroup")); err == nil {
+		for _, line := range strings.Split(string(raw), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, ":", 3)
+			if len(parts) == 3 && parts[0] == "0" && parts[1] == "" && parts[2] != "" {
+				cgDir := filepath.Join(cgroupRoot, strings.TrimPrefix(parts[2], "/"))
+				if evRaw, err := os.ReadFile(filepath.Join(cgDir, "cgroup.events")); err == nil {
+					for _, evLine := range strings.Split(string(evRaw), "\n") {
+						fields := strings.Fields(evLine)
+						if len(fields) >= 2 && fields[0] == "frozen" && fields[1] == "1" {
+							return true
+						}
+					}
+				}
+				if frRaw, err := os.ReadFile(filepath.Join(cgDir, "cgroup.freeze")); err == nil {
+					if strings.TrimSpace(string(frRaw)) == "1" {
+						return true
+					}
+				}
+			}
+		}
+	}
+	if raw, err := os.ReadFile(filepath.Join(procRoot, pidStr, "wchan")); err == nil {
+		if strings.Contains(strings.ToLower(string(raw)), "freezer") {
+			return true
+		}
+	}
+	return false
+}
+
+// rankSocketCandidates orders candidates by:
+// 1) non-frozen before frozen
+// 2) lowest oom_score_adj
+// 3) main process (no ':' suffix) before sub-process (':push', ':web', etc.)
+func rankSocketCandidates(cands []SocketInfo) []SocketInfo {
+	ranked := make([]SocketInfo, len(cands))
+	copy(ranked, cands)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		a, b := ranked[i], ranked[j]
+		if a.Frozen != b.Frozen {
+			return !a.Frozen
+		}
+		if a.OomAdj != b.OomAdj {
+			return a.OomAdj < b.OomAdj
+		}
+		aSub := strings.Contains(a.Process, ":")
+		bSub := strings.Contains(b.Process, ":")
+		if aSub != bSub {
+			return !aSub
+		}
+		return false
+	})
+	return ranked
+}
+
 // ForSocket returns a Client bound to a specific socket selector:
 // - "" -> returns c unchanged (default socket, e.g. @chrome_devtools_remote)
-// - "webview" -> first discovered @webview_devtools_remote* socket
-// - package substring (e.g. "com.jingdong.app.mall" or "jingdong") -> matching PID's webview socket
+// - "webview" -> best ranked discovered @webview_devtools_remote* socket
+// - package substring (e.g. "com.jingdong.app.mall" or "jingdong") -> best ranked matching PID's webview socket
 // - exact socket name (with or without leading '@') -> that exact socket
 func (c *Client) ForSocket(selector string) (*Client, error) {
 	sel := strings.TrimPrefix(strings.TrimSpace(selector), "@")
@@ -120,22 +222,41 @@ func (c *Client) ForSocket(selector string) (*Client, error) {
 		return c, nil
 	}
 	if strings.EqualFold(sel, "webview") {
+		var cands []SocketInfo
 		for _, s := range ListSockets() {
 			if strings.HasPrefix(s.Name, "webview_devtools_remote") {
-				return NewClient(s.Name), nil
+				cands = append(cands, s)
 			}
 		}
-		return nil, fmt.Errorf("%w: no @webview_devtools_remote* socket active", ErrUnavailable)
+		if len(cands) == 0 {
+			return nil, fmt.Errorf("%w: no @webview_devtools_remote* socket active", ErrUnavailable)
+		}
+		best := rankSocketCandidates(cands)[0]
+		if best.Frozen {
+			return nil, fmt.Errorf("%w: %s (pid=%d)", ErrTargetFrozen, best.Socket, best.PID)
+		}
+		return NewClient(best.Name), nil
 	}
 	// If selector looks like a package/process name rather than a devtools socket name, match by owning process
 	if !strings.Contains(sel, "devtools_remote") {
 		low := strings.ToLower(sel)
+		var cands []SocketInfo
 		for _, s := range ListSockets() {
 			if s.Process != "" && strings.Contains(strings.ToLower(s.Process), low) {
-				return NewClient(s.Name), nil
+				cands = append(cands, s)
 			}
 		}
-		return nil, fmt.Errorf("%w: no devtools socket found for process matching %q", ErrUnavailable, sel)
+		if len(cands) == 0 {
+			return nil, fmt.Errorf("%w: no devtools socket found for process matching %q", ErrUnavailable, sel)
+		}
+		best := rankSocketCandidates(cands)[0]
+		if best.Frozen {
+			return nil, fmt.Errorf("%w: %s (pid=%d)", ErrTargetFrozen, best.Socket, best.PID)
+		}
+		return NewClient(best.Name), nil
+	}
+	if pid := parseSocketPID(sel); pid > 0 && isPIDFrozen(pid) {
+		return nil, fmt.Errorf("%w: @%s (pid=%d)", ErrTargetFrozen, sel, pid)
 	}
 	return NewClient(sel), nil
 }
@@ -151,41 +272,68 @@ func (c *Client) SocketDisplay() string {
 }
 
 func (c *Client) dial(ctx context.Context) (net.Conn, error) {
-	// Try configured/primary socket first
-	if conn, err := c.dialer(ctx, c.configuredSocket); err == nil {
-		c.mu.Lock()
-		c.activeSocket = c.configuredSocket
-		c.mu.Unlock()
-		return conn, nil
-	} else if !c.autoDetect && c.configuredSocket != "chrome_devtools_remote" {
-		return nil, err
+	// Check if configured target process is frozen before attempting dial.
+	var frozenCand *SocketInfo
+	if pid := parseSocketPID(c.configuredSocket); pid > 0 && isPIDFrozen(pid) {
+		if !c.autoDetect {
+			return nil, fmt.Errorf("%w: @%s (pid=%d)", ErrTargetFrozen, c.configuredSocket, pid)
+		}
+		frozenCand = &SocketInfo{Socket: "@" + c.configuredSocket, Name: c.configuredSocket, PID: pid, Frozen: true}
+	} else {
+		// Try configured/primary socket first
+		if conn, err := c.dialer(ctx, c.configuredSocket); err == nil {
+			c.mu.Lock()
+			c.activeSocket = c.configuredSocket
+			c.mu.Unlock()
+			return conn, nil
+		} else if !c.autoDetect {
+			return nil, err
+		}
 	}
 
-	// Auto-probe other *_devtools_remote* abstract sockets exposed by Chromium/Edge/WebView
-	for _, cand := range discoverDevToolsSockets() {
-		if cand == c.configuredSocket {
+	// Auto-probe other *_devtools_remote* abstract sockets strictly when autoDetect is enabled.
+	for _, cand := range rankSocketCandidates(ListSockets()) {
+		if cand.Name == c.configuredSocket {
 			continue
 		}
-		if conn, err := c.dialer(ctx, cand); err == nil {
+		if cand.Frozen {
+			if frozenCand == nil {
+				fc := cand
+				frozenCand = &fc
+			}
+			continue
+		}
+		if conn, err := c.dialer(ctx, cand.Name); err == nil {
 			c.mu.Lock()
-			c.activeSocket = cand
+			c.activeSocket = cand.Name
 			c.mu.Unlock()
 			return conn, nil
 		}
+	}
+	if frozenCand != nil {
+		return nil, fmt.Errorf("%w: %s (pid=%d)", ErrTargetFrozen, frozenCand.Socket, frozenCand.PID)
 	}
 	return nil, fmt.Errorf("connect @%s: no active *_devtools_remote* socket found", c.configuredSocket)
 }
 
 func discoverDevToolsSockets() []string {
-	raw, err := os.ReadFile("/proc/net/unix")
+	raw, err := os.ReadFile(filepath.Join(procRoot, "net", "unix"))
 	if err != nil {
 		return nil
 	}
+	return parseProcNetUnix(string(raw))
+}
+
+func parseProcNetUnix(raw string) []string {
 	seen := make(map[string]struct{})
 	var primary, others []string
-	for _, line := range strings.Split(string(raw), "\n") {
+	for _, line := range strings.Split(raw, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 8 {
+			continue
+		}
+		// Only accept listening sockets (SO_ACCEPTCON=00010000, SS_UNCONNECTED=01).
+		if fields[3] != "00010000" || fields[5] != "01" {
 			continue
 		}
 		path := fields[len(fields)-1]
@@ -272,6 +420,9 @@ func (c *Client) httpGet(ctx context.Context, path string) ([]byte, error) {
 	}
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
+		if errors.Is(err, ErrTargetFrozen) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 	defer resp.Body.Close()
@@ -329,6 +480,9 @@ func (c *Client) SendCommand(ctx context.Context, targetID, method string, param
 
 	conn, err := c.dial(ctx)
 	if err != nil {
+		if errors.Is(err, ErrTargetFrozen) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 	defer conn.Close()
@@ -339,8 +493,24 @@ func (c *Client) SendCommand(ctx context.Context, targetID, method string, param
 		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	}
 
+	// Ensure cancellation interrupts handshake and writes immediately instead of waiting for deadline.
+	stopWatch := make(chan struct{})
+	if ctx != nil && ctx.Done() != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = conn.SetDeadline(time.Now())
+			case <-stopWatch:
+			}
+		}()
+	}
+	defer close(stopWatch)
+
 	br, err := wsHandshake(conn, wsPath)
 	if err != nil {
+		if ctx != nil && ctx.Err() != nil {
+			return nil, fmt.Errorf("cdp websocket handshake: %w", ctx.Err())
+		}
 		return nil, fmt.Errorf("cdp websocket handshake: %w", err)
 	}
 
@@ -362,7 +532,7 @@ func (c *Client) SendCommand(ctx context.Context, targetID, method string, param
 
 	// Read frames until we receive the matching response id (skipping CDP events).
 	for {
-		opcode, msg, err := wsReadFrame(br)
+		opcode, msg, err := wsReadFrameCtx(ctx, conn, br)
 		if err != nil {
 			return nil, fmt.Errorf("cdp read frame: %w", err)
 		}
@@ -371,6 +541,8 @@ func (c *Client) SendCommand(ctx context.Context, targetID, method string, param
 			return nil, errors.New("cdp websocket closed before response")
 		case 0x9: // ping -> pong
 			_ = wsWriteFrame(conn, 0xA, msg)
+			continue
+		case 0xA: // pong
 			continue
 		case 0x1, 0x2:
 			var env struct {
@@ -478,30 +650,56 @@ func wsWriteFrame(w io.Writer, opcode byte, payload []byte) error {
 }
 
 func wsReadFrame(br *bufio.Reader) (byte, []byte, error) {
+	return wsReadFrameCtx(context.Background(), nil, br)
+}
+
+func wsReadFrameCtx(ctx context.Context, conn net.Conn, br *bufio.Reader) (byte, []byte, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return 0, nil, ctx.Err()
+	}
+	if conn != nil && ctx != nil && ctx.Done() != nil {
+		stopWatch := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = conn.SetReadDeadline(time.Now())
+			case <-stopWatch:
+			}
+		}()
+		defer close(stopWatch)
+	}
+
 	var out []byte
 	var firstOpcode byte
 	for {
 		var h [2]byte
 		if _, err := io.ReadFull(br, h[:]); err != nil {
+			if ctx != nil && ctx.Err() != nil {
+				return 0, nil, ctx.Err()
+			}
 			return 0, nil, err
 		}
 		fin := (h[0] & 0x80) != 0
 		op := h[0] & 0x0F
-		if firstOpcode == 0 {
-			firstOpcode = op
-		}
+		isControl := op >= 0x8
 		masked := (h[1] & 0x80) != 0
 		length := uint64(h[1] & 0x7F)
 		switch length {
 		case 126:
 			var ext [2]byte
 			if _, err := io.ReadFull(br, ext[:]); err != nil {
+				if ctx != nil && ctx.Err() != nil {
+					return 0, nil, ctx.Err()
+				}
 				return 0, nil, err
 			}
 			length = uint64(binary.BigEndian.Uint16(ext[:]))
 		case 127:
 			var ext [8]byte
 			if _, err := io.ReadFull(br, ext[:]); err != nil {
+				if ctx != nil && ctx.Err() != nil {
+					return 0, nil, ctx.Err()
+				}
 				return 0, nil, err
 			}
 			length = binary.BigEndian.Uint64(ext[:])
@@ -512,17 +710,42 @@ func wsReadFrame(br *bufio.Reader) (byte, []byte, error) {
 		var mask [4]byte
 		if masked {
 			if _, err := io.ReadFull(br, mask[:]); err != nil {
+				if ctx != nil && ctx.Err() != nil {
+					return 0, nil, ctx.Err()
+				}
 				return 0, nil, err
 			}
 		}
 		buf := make([]byte, length)
 		if _, err := io.ReadFull(br, buf); err != nil {
+			if ctx != nil && ctx.Err() != nil {
+				return 0, nil, ctx.Err()
+			}
 			return 0, nil, err
 		}
 		if masked {
 			for i := range buf {
 				buf[i] ^= mask[i%4]
 			}
+		}
+		if isControl {
+			// RFC 6455 section 5.4/5.5: control frames (opcode >= 0x8) may be injected
+			// in the middle of a fragmented data message without corrupting its payload.
+			if firstOpcode == 0 {
+				return op, buf, nil
+			}
+			switch op {
+			case 0x8: // close
+				return op, buf, nil
+			case 0x9: // ping -> pong immediately while continuing fragmented read
+				if conn != nil {
+					_ = wsWriteFrame(conn, 0xA, buf)
+				}
+			}
+			continue
+		}
+		if firstOpcode == 0 {
+			firstOpcode = op
 		}
 		out = append(out, buf...)
 		if fin {

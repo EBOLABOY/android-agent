@@ -34,6 +34,8 @@ type fakeBackend struct {
 	lastSwipe        [4]int
 	lastText         string
 	clip             string
+	shotOrigW        int
+	shotOrigH        int
 	microKernelStops int
 	liveUpdates      []backend.LiveProgressSpec
 	liveCancels      []string
@@ -46,9 +48,15 @@ func (f *fakeBackend) ScreenInfo(_ context.Context) (backend.ScreenInfo, error) 
 	return backend.ScreenInfo{Width: 1080, Height: 2400, Density: 440}, nil
 }
 func (f *fakeBackend) Screenshot(_ context.Context, targetWidth, quality int) (*backend.ScreenshotResult, error) {
-	img := image.NewRGBA(image.Rect(0, 0, 1080, 2400))
-	for y := 0; y < 100; y++ {
-		for x := 0; x < 100; x++ {
+	f.mu.Lock()
+	origW, origH := f.shotOrigW, f.shotOrigH
+	f.mu.Unlock()
+	if origW <= 0 || origH <= 0 {
+		origW, origH = 1080, 2400
+	}
+	img := image.NewRGBA(image.Rect(0, 0, origW, origH))
+	for y := 0; y < 100 && y < origH; y++ {
+		for x := 0; x < 100 && x < origW; x++ {
 			img.SetRGBA(x, y, color.RGBA{R: 20, G: 180, B: 90, A: 255})
 		}
 	}
@@ -72,8 +80,18 @@ func (f *fakeBackend) Tap(_ context.Context, x, y int) error {
 	f.mu.Unlock()
 	return nil
 }
-func (f *fakeBackend) LongPress(_ context.Context, _, _, _ int) error    { return nil }
-func (f *fakeBackend) Swipe(_ context.Context, _, _, _, _, _ int) error  { return nil }
+func (f *fakeBackend) LongPress(_ context.Context, x, y, _ int) error {
+	f.mu.Lock()
+	f.lastTap = [2]int{x, y}
+	f.mu.Unlock()
+	return nil
+}
+func (f *fakeBackend) Swipe(_ context.Context, x1, y1, x2, y2, _ int) error {
+	f.mu.Lock()
+	f.lastSwipe = [4]int{x1, y1, x2, y2}
+	f.mu.Unlock()
+	return nil
+}
 func (f *fakeBackend) KeyEvent(_ context.Context, _ string) error        { return nil }
 func (f *fakeBackend) InputText(_ context.Context, text, _ string, _ bool) (string, error) {
 	f.mu.Lock()
@@ -927,5 +945,257 @@ func TestStreamingChatReplayCancelAndGuardIslandClear(t *testing.T) {
 	}
 	if cancelIdx == -1 || stopIdx == -1 || cancelIdx > stopIdx {
 		t.Fatalf("expected CancelLiveProgress before StopMicroKernel in StopForGuard, got eventLog=%v", evLog)
+	}
+}
+
+func TestV034LandscapeCoordsStrictOriginHostScheduleToolSpecsAndSessions(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := config.Default()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.BearerToken = "tok-v034-initial-secret"
+	cfg.PauseFlagPath = ""
+	cfg.MemoryDir = filepath.Join(tmpDir, "memory")
+	cfg.CDPSocket = "nonexistent_test_cdp_socket_034"
+
+	fb := &fakeBackend{shotOrigW: 2400, shotOrigH: 1080}
+	det := &testDetector{}
+	g := guard.New(guard.Options{Packages: []string{"com.tencent.tmgp.sgame"}, PollInterval: time.Second, Detector: det})
+	srv := NewServer(cfg, fb, g, cdp.NewClient(cfg.CDPSocket), nil)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	defer srv.Close()
+	baseURL := "http://" + srv.Addr()
+
+	// 1. ToolSpecs() hides agent_pause and agent_resume from in-process LLM brain
+	specs := srv.ToolSpecs()
+	defs := toolDefinitions()
+	if len(defs) != 26 {
+		t.Fatalf("expected 26 total MCP tools, got %d", len(defs))
+	}
+	if len(specs) != len(defs)-2 {
+		t.Fatalf("expected ToolSpecs() to hide 2 pause/resume tools (%d), got %d", len(defs)-2, len(specs))
+	}
+	for _, sp := range specs {
+		if sp.Name == "agent_pause" || sp.Name == "agent_resume" {
+			t.Fatalf("ToolSpecs() must hide %s from LLM brain", sp.Name)
+		}
+	}
+	if out := srv.ExecuteTool(context.Background(), "agent_pause", map[string]any{"reason": "llm"}); !out.IsError {
+		t.Fatalf("expected ExecuteTool(agent_pause) to fail for LLM brain, got %+v", out)
+	}
+
+	// 2. Landscape resolveCoords uses cached screenshot (2400x1080 -> 720x324) with separate scaleX/scaleY
+	shotRes := srv.callTool(context.Background(), "phone_screenshot", map[string]any{"width": 720})
+	if shotRes["isError"] == true {
+		t.Fatalf("landscape phone_screenshot failed: %v", shotRes)
+	}
+	tapRes := srv.callTool(context.Background(), "phone_tap", map[string]any{"x": 360, "y": 162, "coord_space": "image"})
+	if tapRes["isError"] == true {
+		t.Fatalf("landscape phone_tap failed: %v", tapRes)
+	}
+	if fb.lastTap != [2]int{1200, 540} {
+		t.Fatalf("expected landscape tap [1200 540], got %v", fb.lastTap)
+	}
+	swipeRes := srv.callTool(context.Background(), "phone_swipe", map[string]any{
+		"x1": 180, "y1": 162, "x2": 540, "y2": 162, "coord_space": "image",
+	})
+	if swipeRes["isError"] == true {
+		t.Fatalf("landscape phone_swipe failed: %v", swipeRes)
+	}
+	if fb.lastSwipe != [4]int{600, 540, 1800, 540} {
+		t.Fatalf("expected landscape swipe [600 540 1800 540], got %v", fb.lastSwipe)
+	}
+
+	// 3. Strict Origin & Host validation
+	// 3a. Empty Host -> 403
+	reqEmptyHost := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	reqEmptyHost.Host = ""
+	reqEmptyHost.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	rec := httptest.NewRecorder()
+	srv.handler.ServeHTTP(rec, reqEmptyHost)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for empty Host header, got %d", rec.Code)
+	}
+
+	// 3b. Arbitrary non-bound IP Host -> 403
+	reqForeignIP := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	reqForeignIP.Host = "192.168.99.99:8765"
+	reqForeignIP.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	rec = httptest.NewRecorder()
+	srv.handler.ServeHTTP(rec, reqForeignIP)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-bound IP Host header, got %d", rec.Code)
+	}
+
+	// 3c. Helper allows exact bound host
+	if !isAllowedHostHeader("192.168.100.100:8765", "192.168.100.100") {
+		t.Fatal("expected bound host 192.168.100.100:8765 to be allowed")
+	}
+	if !isAllowedHostHeader("[::1]:8765", "127.0.0.1") {
+		t.Fatal("expected loopback IPv6 [::1]:8765 to be allowed")
+	}
+
+	// 3d. Arbitrary loopback port in Origin MUST be rejected (403)
+	for _, badOrigin := range []string{
+		"http://127.0.0.1:3000",
+		"http://localhost:3000",
+		"http://localhost:" + strings.Split(srv.Addr(), ":")[1],
+		"https://" + srv.Addr(),
+		"http://" + srv.Addr() + "/extra",
+	} {
+		reqBadOri, _ := http.NewRequest(http.MethodGet, baseURL+"/api/v1/status", nil)
+		reqBadOri.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+		reqBadOri.Header.Set("Origin", badOrigin)
+		respBadOri, err := http.DefaultClient.Do(reqBadOri)
+		if err != nil {
+			t.Fatalf("request with Origin %q failed: %v", badOrigin, err)
+		}
+		respBadOri.Body.Close()
+		if respBadOri.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected 403 for Origin %q against Host %q, got %d", badOrigin, srv.Addr(), respBadOri.StatusCode)
+		}
+	}
+
+	// 3e. Exact scheme://host:port Origin MUST succeed (200)
+	reqGoodOri, _ := http.NewRequest(http.MethodGet, baseURL+"/api/v1/status", nil)
+	reqGoodOri.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	reqGoodOri.Header.Set("Origin", baseURL)
+	respGoodOri, err := http.DefaultClient.Do(reqGoodOri)
+	if err != nil {
+		t.Fatalf("exact Origin request failed: %v", err)
+	}
+	respGoodOri.Body.Close()
+	if respGoodOri.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for exact matching Origin %q, got %d", baseURL, respGoodOri.StatusCode)
+	}
+
+	// 3f. Dynamic SHA-256 Bearer token comparison under cfgMu
+	srv.cfgMu.Lock()
+	srv.cfg.BearerToken = "tok-v034-rotated-secret"
+	srv.cfgMu.Unlock()
+
+	reqOldTok, _ := http.NewRequest(http.MethodGet, baseURL+"/health", nil)
+	reqOldTok.Header.Set("Authorization", "Bearer tok-v034-initial-secret")
+	respOldTok, err := http.DefaultClient.Do(reqOldTok)
+	if err != nil {
+		t.Fatalf("old token req err: %v", err)
+	}
+	respOldTok.Body.Close()
+	if respOldTok.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for rotated-out token, got %d", respOldTok.StatusCode)
+	}
+
+	reqNewTok, _ := http.NewRequest(http.MethodGet, baseURL+"/health", nil)
+	reqNewTok.Header.Set("Authorization", "Bearer tok-v034-rotated-secret")
+	respNewTok, err := http.DefaultClient.Do(reqNewTok)
+	if err != nil {
+		t.Fatalf("new token req err: %v", err)
+	}
+	respNewTok.Body.Close()
+	if respNewTok.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for rotated-in token, got %d", respNewTok.StatusCode)
+	}
+
+	// 4. POST /api/v1/schedule strict HH:MM validation
+	invalidSchedules := []map[string]any{
+		{"enabled": true, "entries": []map[string]any{{"job": "daily_all", "window_start": "25:00", "window_end": "23:59"}}},
+		{"enabled": true, "entries": []map[string]any{{"job": "daily_all", "window_start": "8:15", "window_end": "09:30"}}},
+		{"enabled": true, "entries": []map[string]any{{"job": "daily_all", "window_start": "08:15", "window_end": "24:00"}}},
+		{"enabled": true, "entries": []map[string]any{{"job": "daily_all", "window_start": "09:30", "window_end": "09:30"}}},
+		{"enabled": true, "entries": []map[string]any{{"job": "daily_all", "window_start": "10:00", "window_end": "09:00"}}},
+	}
+	for i, sched := range invalidSchedules {
+		b, _ := json.Marshal(sched)
+		reqS, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/schedule", bytes.NewReader(b))
+		reqS.Header.Set("Authorization", "Bearer tok-v034-rotated-secret")
+		reqS.Header.Set("Content-Type", "application/json")
+		respS, err := http.DefaultClient.Do(reqS)
+		if err != nil {
+			t.Fatalf("schedule case %d err: %v", i, err)
+		}
+		respS.Body.Close()
+		if respS.StatusCode != http.StatusBadRequest {
+			t.Fatalf("schedule case %d expected 400, got %d", i, respS.StatusCode)
+		}
+	}
+	validSched, _ := json.Marshal(map[string]any{
+		"enabled": true,
+		"entries": []map[string]any{
+			{"id": "morning", "job": "daily_all", "enabled": true, "window_start": "00:00", "window_end": "23:59"},
+		},
+	})
+	reqValidS, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/schedule", bytes.NewReader(validSched))
+	reqValidS.Header.Set("Authorization", "Bearer tok-v034-rotated-secret")
+	reqValidS.Header.Set("Content-Type", "application/json")
+	respValidS, err := http.DefaultClient.Do(reqValidS)
+	if err != nil {
+		t.Fatalf("valid schedule err: %v", err)
+	}
+	respValidS.Body.Close()
+	if respValidS.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for valid 00:00..23:59 schedule, got %d", respValidS.StatusCode)
+	}
+
+	// 5. MCP batch session validation + >2h session eviction
+	srv.sessMu.Lock()
+	srv.sessions["stale-session-id"] = time.Now().Add(-3 * time.Hour)
+	srv.sessions["fresh-session-id"] = time.Now()
+	srv.sessMu.Unlock()
+
+	batchPayload := []byte(`[{"jsonrpc":"2.0","id":1,"method":"ping"}]`)
+	reqBatchBad, _ := http.NewRequest(http.MethodPost, baseURL+"/mcp", bytes.NewReader(batchPayload))
+	reqBatchBad.Header.Set("Authorization", "Bearer tok-v034-rotated-secret")
+	reqBatchBad.Header.Set("Content-Type", "application/json")
+	reqBatchBad.Header.Set("Mcp-Session-Id", "stale-session-id")
+	respBatchBad, err := http.DefaultClient.Do(reqBatchBad)
+	if err != nil {
+		t.Fatalf("batch stale session req err: %v", err)
+	}
+	respBatchBad.Body.Close()
+	if respBatchBad.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for expired Mcp-Session-Id on batch, got %d", respBatchBad.StatusCode)
+	}
+	srv.sessMu.RLock()
+	_, staleStillThere := srv.sessions["stale-session-id"]
+	_, freshStillThere := srv.sessions["fresh-session-id"]
+	srv.sessMu.RUnlock()
+	if staleStillThere || !freshStillThere {
+		t.Fatalf("expected stale session evicted and fresh kept: stale=%v fresh=%v", staleStillThere, freshStillThere)
+	}
+
+	// 6. ExecuteTool redacts sensitive clipboard secrets & keeps summary line clean
+	_ = fb.SetClipboard(context.Background(), "验证码: 849201 token=sk-live1234567890abcdef")
+	clipOut := srv.ExecuteTool(context.Background(), "phone_clipboard_get", map[string]any{})
+	if clipOut.IsError {
+		t.Fatalf("ExecuteTool phone_clipboard_get failed: %+v", clipOut)
+	}
+	firstLine := strings.SplitN(clipOut.Text, "\n", 2)[0]
+	if strings.Contains(firstLine, "849201") || strings.Contains(firstLine, "sk-live") {
+		t.Fatalf("clipboard summary line leaked secrets: %q", firstLine)
+	}
+	if strings.Contains(clipOut.Text, "849201") || strings.Contains(clipOut.Text, "sk-live1234567890abcdef") {
+		t.Fatalf("clipboard output did not redact secrets: %q", clipOut.Text)
+	}
+
+	// 7. MCP run_ms_rewards / run_jd_daily serialized through s.jobs
+	blockJob := make(chan struct{})
+	if _, err := srv.jobs.Start("daily_all", func(ctx context.Context, _ func(string)) (any, error) {
+		select {
+		case <-blockJob:
+		case <-ctx.Done():
+		}
+		return map[string]any{"ok": true}, nil
+	}); err != nil {
+		t.Fatalf("start blocking job: %v", err)
+	}
+	defer close(blockJob)
+	busyRes := srv.callTool(context.Background(), "run_ms_rewards", map[string]any{})
+	if busyRes["isError"] != true {
+		t.Fatalf("expected run_ms_rewards to reject when s.jobs already busy, got %v", busyRes)
+	}
+	busyJD := srv.callTool(context.Background(), "run_jd_daily", map[string]any{})
+	if busyJD["isError"] != true {
+		t.Fatalf("expected run_jd_daily to reject when s.jobs already busy, got %v", busyJD)
 	}
 }

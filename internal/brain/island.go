@@ -43,6 +43,7 @@ type LiveProgressClient interface {
 // millisecond cancellation when game-guard triggers.
 type IslandController struct {
 	mu                sync.Mutex
+	ipcMu             sync.Mutex // serializes UpdateLiveProgress vs CancelLiveProgress (lock order: ipcMu -> mu)
 	client            LiveProgressClient
 	tag               string
 	id                int
@@ -52,6 +53,7 @@ type IslandController struct {
 
 	active          bool
 	needsConfirm    bool
+	doneSent        bool
 	gen             uint64
 	lastSentAt      time.Time
 	clearTimer      *time.Timer
@@ -180,6 +182,11 @@ func (c *IslandController) HandleEvent(ev RunEvent) {
 	case "done":
 		c.mu.Lock()
 		hadConfirm := c.needsConfirm || ev.NeedsConfirmation
+		if c.doneSent && c.needsConfirm {
+			c.mu.Unlock()
+			return
+		}
+		c.doneSent = true
 		c.mu.Unlock()
 		if hadConfirm {
 			// Preserve prominent confirmation banner rather than clearing in 3s.
@@ -253,6 +260,7 @@ func (c *IslandController) sendUpdate(u LiveProgressUpdate, force bool, resetSta
 			c.clearTimer = nil
 		}
 		c.needsConfirm = false
+		c.doneSent = false
 		c.gen++
 	}
 	if confirm {
@@ -265,8 +273,18 @@ func (c *IslandController) sendUpdate(u LiveProgressUpdate, force bool, resetSta
 	}
 	c.active = true
 	c.lastSentAt = now
+	gen := c.gen
 	client := c.client
 	c.mu.Unlock()
+
+	c.ipcMu.Lock()
+	defer c.ipcMu.Unlock()
+	c.mu.Lock()
+	stale := c.gen != gen || !c.active
+	c.mu.Unlock()
+	if stale {
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -287,6 +305,9 @@ func (c *IslandController) scheduleClear(delay time.Duration) {
 	tag, id := c.tag, c.id
 	client := c.client
 	c.clearTimer = time.AfterFunc(delay, func() {
+		c.ipcMu.Lock()
+		defer c.ipcMu.Unlock()
+
 		c.mu.Lock()
 		if c.gen != gen || !c.active {
 			c.mu.Unlock()
@@ -294,6 +315,7 @@ func (c *IslandController) scheduleClear(delay time.Duration) {
 		}
 		c.active = false
 		c.needsConfirm = false
+		c.doneSent = false
 		c.clearTimer = nil
 		c.mu.Unlock()
 
@@ -316,9 +338,11 @@ func (c *IslandController) ClearImmediate(_ string) {
 		c.clearTimer = nil
 	}
 	c.gen++
+	clearGen := c.gen
 	wasActive := c.active
 	c.active = false
 	c.needsConfirm = false
+	c.doneSent = false
 	tag, id := c.tag, c.id
 	client := c.client
 	c.mu.Unlock()
@@ -326,6 +350,16 @@ func (c *IslandController) ClearImmediate(_ string) {
 	if !wasActive {
 		return
 	}
+	c.ipcMu.Lock()
+	defer c.ipcMu.Unlock()
+
+	c.mu.Lock()
+	superseded := c.gen != clearGen
+	c.mu.Unlock()
+	if superseded {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
 	_ = client.CancelLiveProgress(ctx, tag, id)

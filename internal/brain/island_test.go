@@ -125,3 +125,30 @@ func TestIslandControllerLifecycleThrottleConfirmAndGuardClear(t *testing.T) {
 		t.Fatalf("expected no stale double-cancel after ClearImmediate, got %d", canFinal)
 	}
 }
+
+func TestIslandDuplicateDonePreservesConfirmation(t *testing.T) {
+	client := &mockLiveProgressClient{}
+	ctrl := NewIslandController(client)
+	ctrl.doneClearDelay = 40 * time.Millisecond
+	ctrl.confirmClearDelay = 300 * time.Millisecond
+
+	ctrl.HandleEvent(RunEvent{Type: "run_start", Summary: "测试确认", MaxSteps: 3})
+	ctrl.HandleEvent(RunEvent{Type: "needs_confirmation", Step: 2, MaxSteps: 3})
+	ctrl.HandleEvent(RunEvent{Type: "done", NeedsConfirmation: true, Reply: "停在付款页", Steps: 2, MaxSteps: 3})
+	upBefore, _ := client.counts()
+
+	// Duplicate done (even with NeedsConfirmation=false) must NOT overwrite confirmation state or shorten clear delay.
+	ctrl.HandleEvent(RunEvent{Type: "done", NeedsConfirmation: false, Reply: "重复done", Steps: 2, MaxSteps: 3})
+	upAfter, _ := client.counts()
+	if upAfter != upBefore {
+		t.Fatalf("expected duplicate done after confirmation to be ignored, updates went %d -> %d", upBefore, upAfter)
+	}
+	time.Sleep(80 * time.Millisecond)
+	if !ctrl.IsActive() {
+		t.Fatal("expected confirmation state to survive past doneClearDelay after duplicate done")
+	}
+	if last, ok := client.lastUpdate(); !ok || last.Title != "⚠ 待人工确认订单/验证" {
+		t.Fatalf("expected confirmation title preserved, got %+v", last)
+	}
+	ctrl.ClearImmediate("cleanup")
+}

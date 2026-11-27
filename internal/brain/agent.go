@@ -63,12 +63,62 @@ type RunEvent struct {
 }
 
 type RunReplaySnapshot struct {
-	RunID       string     `json:"run_id"`
-	UserMessage string     `json:"user_message,omitempty"`
-	Active      bool       `json:"active"`
-	Finished    bool       `json:"finished"`
-	LastSeq     int        `json:"last_seq"`
-	Events      []RunEvent `json:"events"`
+	RunID           string     `json:"run_id"`
+	NotFound        bool       `json:"not_found,omitempty"`
+	UserMessage     string     `json:"user_message,omitempty"`
+	Active          bool       `json:"active"`
+	Finished        bool       `json:"finished"`
+	LastSeq         int        `json:"last_seq"`
+	AccumulatedText string     `json:"accumulated_text,omitempty"`
+	Events          []RunEvent `json:"events"`
+}
+
+// DeviceLease provides mutual exclusion over phone screen/CDP control
+// so interactive Agent chat turns and background JobManager workflows cannot collide.
+type DeviceLease struct {
+	mu    sync.Mutex
+	owner string
+}
+
+func NewDeviceLease() *DeviceLease {
+	return &DeviceLease{}
+}
+
+// TryLock attempts to acquire the device lease for owner.
+// Returns ("", true) if acquired, or (currentOwner, false) if already held.
+func (l *DeviceLease) TryLock(owner string) (string, bool) {
+	if l == nil {
+		return "", true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.owner != "" {
+		return l.owner, false
+	}
+	l.owner = owner
+	return "", true
+}
+
+// Unlock releases the device lease if held by owner.
+func (l *DeviceLease) Unlock(owner string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.owner == owner {
+		l.owner = ""
+	}
+}
+
+// Owner returns the current lease holder (empty if unlocked).
+func (l *DeviceLease) Owner() string {
+	if l == nil {
+		return ""
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.owner
 }
 
 type EventSink func(ev RunEvent)
@@ -87,6 +137,7 @@ type runEventStore struct {
 	active      bool
 	finished    bool
 	lastSeq     int
+	accumText   strings.Builder
 	steps       []RunEvent // structural events (run_start/thinking/tool_start/tool_end/needs_confirmation/done/cancelled/error)
 	deltas      []RunEvent // text_delta events
 	subs        map[int]chan RunEvent
@@ -107,6 +158,7 @@ func (s *runEventStore) beginRun(runID, userMessage string) {
 	s.active = true
 	s.finished = false
 	s.lastSeq = 0
+	s.accumText.Reset()
 	s.steps = s.steps[:0]
 	s.deltas = s.deltas[:0]
 	for id, ch := range s.subs {
@@ -125,11 +177,18 @@ func (s *runEventStore) emit(ev RunEvent) RunEvent {
 		ev.TS = time.Now().Format(time.RFC3339Nano)
 	}
 	if ev.Type == "text_delta" {
+		s.accumText.WriteString(ev.Delta)
 		s.deltas = append(s.deltas, ev)
 		if len(s.deltas) > maxReplayDeltaEvents {
 			s.deltas = append([]RunEvent(nil), s.deltas[len(s.deltas)-maxReplayDeltaEvents:]...)
 		}
 	} else {
+		if ev.Type == "tool_start" {
+			s.accumText.Reset()
+		} else if ev.Type == "done" && ev.Reply != "" {
+			s.accumText.Reset()
+			s.accumText.WriteString(ev.Reply)
+		}
 		s.steps = append(s.steps, ev)
 		if len(s.steps) > maxReplayStepEvents {
 			s.steps = append([]RunEvent(nil), s.steps[len(s.steps)-maxReplayStepEvents:]...)
@@ -155,36 +214,47 @@ func (s *runEventStore) emit(ev RunEvent) RunEvent {
 func (s *runEventStore) snapshot(runID string, afterSeq int) RunReplaySnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.runID == "" || (runID != "" && runID != s.runID) {
+	if runID != "" && runID != s.runID {
 		return RunReplaySnapshot{
-			RunID:  runID,
+			RunID:    runID,
+			NotFound: true,
+			Events:   []RunEvent{},
+		}
+	}
+	if s.runID == "" {
+		return RunReplaySnapshot{
 			Events: []RunEvent{},
 		}
 	}
 	events := s.collectAfterLocked(afterSeq)
 	return RunReplaySnapshot{
-		RunID:       s.runID,
-		UserMessage: s.userMessage,
-		Active:      s.active,
-		Finished:    s.finished,
-		LastSeq:     s.lastSeq,
-		Events:      events,
+		RunID:           s.runID,
+		UserMessage:     s.userMessage,
+		Active:          s.active,
+		Finished:        s.finished,
+		LastSeq:         s.lastSeq,
+		AccumulatedText: s.accumText.String(),
+		Events:          events,
 	}
 }
 
 func (s *runEventStore) subscribe(runID string, afterSeq int) (RunReplaySnapshot, <-chan RunEvent, func(), bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.runID == "" || (runID != "" && runID != s.runID) {
-		return RunReplaySnapshot{RunID: runID, Events: []RunEvent{}}, nil, func() {}, false
+	if runID != "" && runID != s.runID {
+		return RunReplaySnapshot{RunID: runID, NotFound: true, Events: []RunEvent{}}, nil, func() {}, false
+	}
+	if s.runID == "" {
+		return RunReplaySnapshot{Events: []RunEvent{}}, nil, func() {}, false
 	}
 	snap := RunReplaySnapshot{
-		RunID:       s.runID,
-		UserMessage: s.userMessage,
-		Active:      s.active,
-		Finished:    s.finished,
-		LastSeq:     s.lastSeq,
-		Events:      s.collectAfterLocked(afterSeq),
+		RunID:           s.runID,
+		UserMessage:     s.userMessage,
+		Active:          s.active,
+		Finished:        s.finished,
+		LastSeq:         s.lastSeq,
+		AccumulatedText: s.accumText.String(),
+		Events:          s.collectAfterLocked(afterSeq),
 	}
 	if s.finished {
 		return snap, nil, func() {}, true
@@ -244,6 +314,7 @@ type Agent struct {
 	exec        ToolExecutor
 	guard       *guard.Guard
 	memory      *MemoryStore
+	lease       *DeviceLease
 	history     []ChatMessage
 	events      *runEventStore
 	obsMu       sync.RWMutex
@@ -257,6 +328,18 @@ func NewAgent(cfg config.LLMConfig, exec ToolExecutor, g *guard.Guard) *Agent {
 		guard:  g,
 		events: newRunEventStore(),
 	}
+}
+
+func (a *Agent) SetDeviceLease(lease *DeviceLease) {
+	a.mu.Lock()
+	a.lease = lease
+	a.mu.Unlock()
+}
+
+func (a *Agent) getDeviceLease() *DeviceLease {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lease
 }
 
 func (a *Agent) SetEventObserver(fn EventSink) {
@@ -368,10 +451,25 @@ func (a *Agent) StartChatAsync(userMessage string) (string, error) {
 	}
 
 	runID := a.nextRunID()
+	lease := a.getDeviceLease()
+	leaseOwner := "chat:" + runID
+	if holder, ok := lease.TryLock(leaseOwner); !ok {
+		a.chatMu.Unlock()
+		return "", fmt.Errorf("device busy (%s is running)", holder)
+	}
+
+	// Bind activeCancel synchronously BEFORE spawning the goroutine so immediate CancelActive/IsRunning never races.
+	runCtx, cancel := context.WithCancel(context.Background())
+	a.activeMu.Lock()
+	a.activeCancel = cancel
+	a.activeReason = ""
+	a.activeMu.Unlock()
+
 	a.events.beginRun(runID, userMessage)
 	go func() {
 		defer a.chatMu.Unlock()
-		_, _ = a.runLocked(context.Background(), runID, userMessage, nil)
+		defer lease.Unlock(leaseOwner)
+		_, _ = a.runLocked(runCtx, cancel, lease, leaseOwner, runID, userMessage, nil)
 	}()
 	return runID, nil
 }
@@ -392,16 +490,28 @@ func (a *Agent) ChatStream(ctx context.Context, userMessage string, sink EventSi
 	defer a.chatMu.Unlock()
 
 	runID := a.nextRunID()
-	a.events.beginRun(runID, userMessage)
-	return a.runLocked(ctx, runID, userMessage, sink)
-}
+	lease := a.getDeviceLease()
+	leaseOwner := "chat:" + runID
+	if holder, ok := lease.TryLock(leaseOwner); !ok {
+		return nil, fmt.Errorf("device busy (%s is running)", holder)
+	}
+	defer lease.Unlock(leaseOwner)
 
-func (a *Agent) runLocked(ctx context.Context, runID, userMessage string, sink EventSink) (*ChatTurnResult, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	a.activeMu.Lock()
 	a.activeCancel = cancel
 	a.activeReason = ""
 	a.activeMu.Unlock()
+
+	a.events.beginRun(runID, userMessage)
+	return a.runLocked(runCtx, cancel, lease, leaseOwner, runID, userMessage, sink)
+}
+
+func isWorkflowTool(name string) bool {
+	return name == "run_daily_all" || name == "run_ms_rewards" || name == "run_jd_daily"
+}
+
+func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lease *DeviceLease, leaseOwner, runID, userMessage string, sink EventSink) (*ChatTurnResult, error) {
 	defer func() {
 		cancel()
 		a.activeMu.Lock()
@@ -493,6 +603,7 @@ func (a *Agent) runLocked(ctx context.Context, runID, userMessage string, sink E
 			Summary:  fmt.Sprintf("第 %d 步推理规划中...", steps),
 		})
 
+		compactInFlightHistory(history)
 		resp, err := callLLMStream(runCtx, cfg, sysPrompt, history, tools, StreamCallbacks{
 			OnTextDelta: func(delta string) {
 				if delta == "" {
@@ -571,7 +682,21 @@ func (a *Agent) runLocked(ctx context.Context, runID, userMessage string, sink E
 
 			toolsUsed = append(toolsUsed, tc.Name)
 			toolStart := time.Now()
+			// Yield device lease across native workflow tools that route through JobManager so they don't self-deadlock.
+			yieldedLease := false
+			if lease != nil && isWorkflowTool(tc.Name) {
+				lease.Unlock(leaseOwner)
+				yieldedLease = true
+			}
 			out := a.exec.ExecuteTool(runCtx, tc.Name, tc.Args)
+			if yieldedLease {
+				for attempt := 0; attempt < 20; attempt++ {
+					if _, ok := lease.TryLock(leaseOwner); ok {
+						break
+					}
+					time.Sleep(25 * time.Millisecond)
+				}
+			}
 			elapsedMs := time.Since(toolStart).Milliseconds()
 
 			sigBytes, _ := json.Marshal(tc.Args)
@@ -598,7 +723,7 @@ func (a *Agent) runLocked(ctx context.Context, runID, userMessage string, sink E
 				toolText += "\n[系统防死循环提示] 检测到连续重复调用相同工具且未取得进展，请立即更换操作策略（如滑动、截屏兜底）或直接向用户汇报当前状态。"
 			}
 
-			stepSum := summarizeToolOutcome(out)
+			stepSum := summarizeToolOutcome(tc.Name, out)
 			stepEntry := ToolStep{
 				Step:      len(trace) + 1,
 				Tool:      tc.Name,
@@ -679,7 +804,11 @@ func friendlyToolDescriptions(toolName string, args map[string]any) (string, str
 	case "phone_swipe":
 		return "正在执行拟人滑动...", "滑动"
 	case "phone_input_text":
-		return "正在输入文本内容...", "输入"
+		return "正在输入文本内容（已脱敏）...", "输入"
+	case "phone_clipboard_set":
+		return "正在写入剪贴板（已脱敏）...", "写剪贴板"
+	case "phone_clipboard_get":
+		return "正在读取剪贴板...", "读剪贴板"
 	case "phone_keyevent":
 		return fmt.Sprintf("正在发送按键 %v...", args["keycode"]), "按键"
 	case "phone_screenshot":
@@ -753,7 +882,30 @@ func classifyToolCategory(name string) string {
 	}
 }
 
-func summarizeToolOutcome(out ToolOutput) string {
+func isSensitiveTool(name string) bool {
+	switch name {
+	case "phone_input_text", "phone_clipboard_set", "phone_clipboard_get":
+		return true
+	default:
+		return false
+	}
+}
+
+func summarizeToolOutcome(toolName string, out ToolOutput) string {
+	if isSensitiveTool(toolName) {
+		if out.IsError {
+			return "操作失败（敏感内容已脱敏）"
+		}
+		switch toolName {
+		case "phone_input_text":
+			return "已输入文本（内容已脱敏）"
+		case "phone_clipboard_set":
+			return "剪贴板已写入（内容已脱敏）"
+		case "phone_clipboard_get":
+			return "已读取剪贴板（内容已脱敏）"
+		}
+		return "[敏感内容已脱敏]"
+	}
 	if len(out.ImageJPEG) > 0 {
 		return fmt.Sprintf("截屏视觉图像 (%d KB)", len(out.ImageJPEG)/1024)
 	}
@@ -768,33 +920,166 @@ func summarizeToolOutcome(out ToolOutput) string {
 	return first
 }
 
-func replyNeedsConfirmation(reply string) bool {
-	if reply == "" {
-		return false
+var confirmNegationMarkers = []string{
+	"无需", "不需要", "不用", "不必",
+	"未发现", "没有发现", "未遇到", "没有遇到",
+	"未出现", "没有出现", "未触发", "没有触发",
+	"未检测到", "没有检测到", "未见",
+	"没有", "并未", "并非", "不存在",
+	"无验证码", "无滑块", "无须",
+}
+
+func isNegatedInClause(reply string, matchByteIdx, kwLen int) bool {
+	endIdx := matchByteIdx + kwLen
+	if endIdx > len(reply) {
+		endIdx = len(reply)
 	}
-	keywords := []string{"需要人工确认", "人工操作", "停在确认", "确认订单", "确认页", "自行付款", "亲自完成", "滑块", "验证码"}
-	for _, kw := range keywords {
-		if strings.Contains(reply, kw) {
+	clause := reply[:endIdx]
+	// Stop at the nearest clause/sentence boundary before the match so earlier clauses don't negate later ones.
+	prefix := reply[:matchByteIdx]
+	if sepIdx := strings.LastIndexAny(prefix, "。！？\n;；,，:："); sepIdx >= 0 {
+		clause = reply[sepIdx+1 : endIdx]
+		prefix = prefix[sepIdx+1:]
+	}
+	// Limit inspection to the local phrase leading into the keyword.
+	pr := []rune(prefix)
+	if len(pr) > 12 {
+		clause = string(pr[len(pr)-12:]) + reply[matchByteIdx:endIdx]
+	}
+	for _, neg := range confirmNegationMarkers {
+		if strings.Contains(clause, neg) {
 			return true
 		}
 	}
 	return false
 }
 
-func (a *Agent) saveHistory(h []ChatMessage) {
-	// Keep the last 24 messages cleanly aligned on a user turn boundary
-	const maxKeep = 24
-	if len(h) > maxKeep {
-		trimmed := h[len(h)-maxKeep:]
-		for i, m := range trimmed {
-			if m.Role == "user" && m.Text != "" {
-				h = trimmed[i:]
+func replyNeedsConfirmation(reply string) bool {
+	if reply == "" {
+		return false
+	}
+	keywords := []string{
+		"需要人工确认", "人工操作", "停在确认", "确认订单", "确认页",
+		"自行付款", "亲自完成", "滑块", "验证码",
+		"请完成支付", "登录失效", "支付密码", "请手动确认",
+	}
+	for _, kw := range keywords {
+		searchFrom := 0
+		for searchFrom < len(reply) {
+			rel := strings.Index(reply[searchFrom:], kw)
+			if rel < 0 {
 				break
+			}
+			idx := searchFrom + rel
+			if !isNegatedInClause(reply, idx, len(kw)) {
+				return true
+			}
+			searchFrom = idx + len(kw)
+		}
+	}
+	return false
+}
+
+// compactInFlightHistory bounds token & memory usage during multi-step ReAct turns:
+// - Keeps only the latest 1 ImageJPEG across the conversation in-flight.
+// - Collapses verbose phone_ui_tree outputs older than 2 assistant steps.
+func compactInFlightHistory(history []ChatMessage) {
+	// 1. Keep only the latest 1 screenshot JPEG in-flight.
+	seenImg := false
+	for i := len(history) - 1; i >= 0; i-- {
+		if len(history[i].ImageJPEG) > 0 {
+			if seenImg {
+				history[i].ImageJPEG = nil
+			} else {
+				seenImg = true
 			}
 		}
 	}
+
+	// 2. Collapse phone_ui_tree outputs that are older than 2 assistant steps.
+	assistantAfter := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == "assistant" {
+			assistantAfter++
+			continue
+		}
+		if history[i].Role == "tool" && history[i].ToolName == "phone_ui_tree" && assistantAfter >= 2 {
+			if len(history[i].Text) > 160 {
+				firstLine := history[i].Text
+				if nl := strings.IndexByte(firstLine, '\n'); nl >= 0 {
+					firstLine = strings.TrimSpace(firstLine[:nl])
+				}
+				if len([]rune(firstLine)) > 64 {
+					firstLine = string([]rune(firstLine)[:64]) + "…"
+				}
+				history[i].Text = fmt.Sprintf("[旧 UI 树已压缩: %s]", firstLine)
+			}
+		}
+	}
+}
+
+func (a *Agent) saveHistory(h []ChatMessage) {
+	// Strip all ImageJPEG blobs so old screenshots are never re-uploaded on future turns.
+	cleaned := make([]ChatMessage, len(h))
+	for i, m := range h {
+		m.ImageJPEG = nil
+		cleaned[i] = m
+	}
+	h = cleaned
+
+	// Hard-trim to at most 24 messages while keeping valid user/assistant/tool boundaries.
+	const maxKeep = 24
+	if len(h) > maxKeep {
+		prefix := h[:len(h)-maxKeep]
+		trimmed := h[len(h)-maxKeep:]
+		cut := -1
+		for i, m := range trimmed {
+			if m.Role == "user" && m.Text != "" {
+				cut = i
+				break
+			}
+		}
+		if cut >= 0 {
+			h = trimmed[cut:]
+		} else {
+			// No user message inside the last 24 messages (e.g. a >12-step tool turn).
+			// Skip leading orphan "tool" messages so providers never reject the sequence.
+			start := 0
+			for start < len(trimmed) && trimmed[start].Role == "tool" {
+				start++
+			}
+			tail := trimmed[start:]
+			// Prepend the most recent user message from before the cut if room allows.
+			lastUserIdx := -1
+			for i := len(prefix) - 1; i >= 0; i-- {
+				if prefix[i].Role == "user" && prefix[i].Text != "" {
+					lastUserIdx = i
+					break
+				}
+			}
+			if lastUserIdx >= 0 {
+				if len(tail) >= maxKeep {
+					// Drop leading assistant+its tool responses to make room for the user message.
+					drop := 1
+					for drop < len(tail) && tail[drop].Role == "tool" {
+						drop++
+					}
+					tail = tail[drop:]
+				}
+				res := make([]ChatMessage, 0, 1+len(tail))
+				res = append(res, prefix[lastUserIdx])
+				res = append(res, tail...)
+				h = res
+			} else {
+				h = tail
+			}
+		}
+	}
+
+	final := make([]ChatMessage, len(h))
+	copy(final, h)
 	a.mu.Lock()
-	a.history = h
+	a.history = final
 	a.mu.Unlock()
 }
 
@@ -816,6 +1101,7 @@ type JobManager struct {
 	seq    int
 	status JobStatus
 	cancel context.CancelFunc
+	lease  *DeviceLease
 }
 
 func NewJobManager() *JobManager {
@@ -824,12 +1110,25 @@ func NewJobManager() *JobManager {
 	}
 }
 
+func (jm *JobManager) SetDeviceLease(lease *DeviceLease) {
+	jm.mu.Lock()
+	jm.lease = lease
+	jm.mu.Unlock()
+}
+
 func (jm *JobManager) Start(name string, fn func(ctx context.Context, logFn func(string)) (any, error)) (JobStatus, error) {
 	jm.mu.Lock()
 	if jm.status.State == "running" {
 		cur := jm.copyStatusLocked()
 		jm.mu.Unlock()
 		return cur, fmt.Errorf("job %q is already running", cur.Name)
+	}
+	lease := jm.lease
+	leaseOwner := "job:" + name
+	if holder, ok := lease.TryLock(leaseOwner); !ok {
+		cur := jm.copyStatusLocked()
+		jm.mu.Unlock()
+		return cur, fmt.Errorf("device busy (%s is running)", holder)
 	}
 	jm.seq++
 	id := fmt.Sprintf("job-%d", jm.seq)
@@ -848,10 +1147,20 @@ func (jm *JobManager) Start(name string, fn func(ctx context.Context, logFn func
 
 	go func() {
 		defer cancel()
+		released := false
+		releaseLease := func() {
+			if !released {
+				released = true
+				lease.Unlock(leaseOwner)
+			}
+		}
+		defer releaseLease()
+
 		logFn := func(line string) {
 			jm.appendLog(id, line)
 		}
 		res, err := fn(ctx, logFn)
+		releaseLease()
 		jm.finish(id, now, res, err)
 	}()
 	return snap, nil
