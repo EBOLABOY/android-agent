@@ -188,7 +188,7 @@ func (c *IslandController) HandleEvent(ev RunEvent) {
 	case "run_start":
 		maxS := ev.MaxSteps
 		if maxS <= 0 {
-			maxS = 20
+			maxS = DefaultMaxSteps
 		}
 		c.enqueue(LiveProgressUpdate{
 			Tag:       c.tag,
@@ -209,20 +209,26 @@ func (c *IslandController) HandleEvent(ev RunEvent) {
 	case "thinking":
 		maxS := ev.MaxSteps
 		if maxS <= 0 {
-			maxS = 20
+			maxS = DefaultMaxSteps
 		}
 		step := ev.Step
 		if step < 1 {
 			step = 1
 		}
 		pct := calcProgressPct(step, maxS)
+		bodyText := fmt.Sprintf("第 %d/%d 步 · 正在分析界面与下一步操作", step, maxS)
+		shortText := fmt.Sprintf("思考 %d/%d", step, maxS)
+		if maxS >= 40 {
+			bodyText = fmt.Sprintf("第 %d 步 · 推理", step)
+			shortText = fmt.Sprintf("第 %d 步", step)
+		}
 		c.enqueue(LiveProgressUpdate{
 			Tag:       c.tag,
 			ID:        c.id,
 			State:     "thinking",
 			Title:     "Agent 正在推理",
-			Text:      fmt.Sprintf("第 %d/%d 步 · 正在分析界面与下一步操作", step, maxS),
-			ShortText: fmt.Sprintf("思考 %d/%d", step, maxS),
+			Text:      bodyText,
+			ShortText: shortText,
 			SubText:   "推理",
 			Step:      step,
 			Max:       maxS,
@@ -235,7 +241,7 @@ func (c *IslandController) HandleEvent(ev RunEvent) {
 	case "tool_start":
 		maxS := ev.MaxSteps
 		if maxS <= 0 {
-			maxS = 20
+			maxS = DefaultMaxSteps
 		}
 		step := ev.Step
 		if step < 1 {
@@ -243,7 +249,13 @@ func (c *IslandController) HandleEvent(ev RunEvent) {
 		}
 		state, title, short := formatToolIslandTitles(ev.Tool, ev.Label)
 		detail := cleanIslandBody(ev.Summary)
-		if detail == "" {
+		if maxS >= 40 {
+			if detail == "" {
+				detail = fmt.Sprintf("第 %d 步 · %s", step, short)
+			} else if !strings.HasPrefix(detail, "第 ") {
+				detail = fmt.Sprintf("第 %d 步 · %s", step, detail)
+			}
+		} else if detail == "" {
 			detail = fmt.Sprintf("第 %d/%d 步 · %s", step, maxS, short)
 		}
 		c.enqueue(LiveProgressUpdate{
@@ -328,14 +340,22 @@ func (c *IslandController) HandleEvent(ev RunEvent) {
 		if ev.ElapsedSec > 0 || ev.Steps > 0 {
 			summary = fmt.Sprintf("耗时 %.1fs · 共 %d 步", ev.ElapsedSec, ev.Steps)
 		}
+		doneTitle := "任务已完成"
+		doneShort := "已完成"
+		doneSub := "完成"
+		if ev.CheckpointPaused {
+			doneTitle = "阶段检查点"
+			doneShort = "待继续"
+			doneSub = "暂停"
+		}
 		c.enqueue(LiveProgressUpdate{
 			Tag:       c.tag,
 			ID:        c.id,
 			State:     "done",
-			Title:     "任务已完成",
+			Title:     doneTitle,
 			Text:      summary,
-			ShortText: "已完成",
-			SubText:   "完成",
+			ShortText: doneShort,
+			SubText:   doneSub,
 			Step:      maxS,
 			Max:       maxS,
 			Progress:  100,
@@ -892,6 +912,19 @@ func (c *IslandController) ClearImmediate(_ string) {
 func calcProgressPct(step, maxSteps int) int {
 	if maxSteps <= 0 || step <= 0 {
 		return 0
+	}
+	if maxSteps >= 40 {
+		if step >= maxSteps {
+			return 95
+		}
+		pct := 16 + (76*step)/(step+6)
+		if pct < 16 {
+			pct = 16
+		}
+		if pct > 92 {
+			pct = 92
+		}
+		return pct
 	}
 	if step >= maxSteps {
 		return 100

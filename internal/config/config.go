@@ -67,6 +67,8 @@ type Config struct {
 	Schedule              ScheduleConfig `json:"schedule,omitempty"`
 }
 
+const DefaultMaxSteps = 80
+
 func Default() *Config {
 	return &Config{
 		ListenAddr:            "127.0.0.1:8765",
@@ -84,7 +86,7 @@ func Default() *Config {
 		MemoryDir:             "/data/adb/android_agent/memory",
 		LLM: LLMConfig{
 			Provider:   "openai",
-			MaxSteps:   20,
+			MaxSteps:   DefaultMaxSteps,
 			TimeoutSec: 60,
 		},
 		Schedule: ScheduleConfig{

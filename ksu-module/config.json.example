@@ -19,7 +19,7 @@
     "base_url": "https://api.deepseek.com/v1",
     "api_key": "",
     "model": "deepseek-chat",
-    "max_steps": 20,
+    "max_steps": 80,
     "timeout_sec": 60
   },
   "schedule": {

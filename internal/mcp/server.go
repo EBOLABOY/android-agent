@@ -34,9 +34,14 @@ import (
 
 const (
 	ServerName          = "android-agent"
-	ServerVersion       = "0.4.0"
+	ServerVersion       = "0.4.1"
 	DefaultProtoVersion = "2025-03-26"
 	mcpSessionTTL       = 2 * time.Hour
+)
+
+var (
+	autoObserveFastSettle   = 350 * time.Millisecond
+	autoObserveLaunchSettle = 900 * time.Millisecond
 )
 
 type backendIslandAdapter struct {
@@ -47,6 +52,10 @@ func (a *backendIslandAdapter) UpdateLiveProgress(ctx context.Context, u brain.L
 	if a == nil || a.be == nil {
 		return nil
 	}
+	step, maxV := u.Step, u.Max
+	if u.Ongoing && u.Max >= 40 && u.Progress > 0 {
+		step, maxV = u.Progress, 100
+	}
 	return a.be.UpdateLiveProgress(ctx, backend.LiveProgressSpec{
 		Tag:       u.Tag,
 		ID:        u.ID,
@@ -55,8 +64,8 @@ func (a *backendIslandAdapter) UpdateLiveProgress(ctx context.Context, u brain.L
 		Text:      u.Text,
 		ShortText: u.ShortText,
 		SubText:   u.SubText,
-		Step:      u.Step,
-		Max:       u.Max,
+		Step:      step,
+		Max:       maxV,
 		Progress:  u.Progress,
 		ClickURI:  u.ClickURI,
 		Focus:     u.Focus,
@@ -2613,6 +2622,63 @@ func sanitizeChatHistory(msgs []brain.ChatMessage) []brain.ChatMessage {
 	return out
 }
 
+func autoObserveSettleDelay(toolName string) time.Duration {
+	switch toolName {
+	case "phone_tap", "phone_tap_node", "phone_long_press",
+		"phone_swipe", "phone_scroll_node", "phone_keyevent",
+		"phone_input_text", "phone_tap_and_type":
+		return autoObserveFastSettle
+	case "phone_launch_app", "phone_open_deeplink":
+		return autoObserveLaunchSettle
+	default:
+		return 0
+	}
+}
+
+func shouldAutoObserve(args map[string]any) bool {
+	if args == nil {
+		return true
+	}
+	v, ok := args["observe"]
+	if !ok || v == nil {
+		return true
+	}
+	switch val := v.(type) {
+	case bool:
+		return val
+	case string:
+		s := strings.ToLower(strings.TrimSpace(val))
+		return s != "false" && s != "0" && s != "no"
+	case float64:
+		return val != 0
+	case int:
+		return val != 0
+	}
+	return true
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(d)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return false
+	case <-timer.C:
+		return ctx.Err() == nil
+	}
+}
+
+func (s *Server) isActionGuardBlocked() bool {
+	if s.guard == nil {
+		return false
+	}
+	blocked, _ := s.guard.IsActionBlocked()
+	return blocked
+}
+
 // ToolSpecs implements brain.ToolExecutor for in-process zero-HTTP LLM tool calls.
 // agent_pause and agent_resume are intentionally hidden from the in-process LLM brain
 // (while remaining available to external MCP clients and HTTP /api/v1/{pause,resume}).
@@ -2626,6 +2692,24 @@ func (s *Server) ToolSpecs() []brain.ToolSpec {
 		}
 		desc, _ := d["description"].(string)
 		schema, _ := d["inputSchema"].(map[string]any)
+		if autoObserveSettleDelay(name) > 0 && schema != nil {
+			clonedSchema := make(map[string]any, len(schema))
+			for k, v := range schema {
+				clonedSchema[k] = v
+			}
+			clonedProps := map[string]any{}
+			if origProps, ok := schema["properties"].(map[string]any); ok {
+				for k, v := range origProps {
+					clonedProps[k] = v
+				}
+			}
+			clonedProps["observe"] = map[string]any{
+				"type":        "boolean",
+				"description": "Auto-capture refreshed [操作后最新界面] UI tree after action settles (default true)",
+			}
+			clonedSchema["properties"] = clonedProps
+			schema = clonedSchema
+		}
 		specs = append(specs, brain.ToolSpec{
 			Name:        name,
 			Description: desc,
@@ -2685,6 +2769,18 @@ func (s *Server) ExecuteTool(ctx context.Context, name string, args map[string]a
 		outText = redactSensitiveText(outText)
 		s.logger("brain tool %s: is_err=%v (input len=%d, redacted)", name, isErr, len([]rune(rawInput)))
 	}
+
+	if !isErr && s.backend != nil && shouldAutoObserve(args) {
+		if settle := autoObserveSettleDelay(name); settle > 0 && ctx.Err() == nil && !s.isActionGuardBlocked() {
+			if sleepWithContext(ctx, settle) && !s.isActionGuardBlocked() {
+				if treeRes, err := s.backend.UITree(ctx, backend.UITreeOptions{MaxTokens: 450}); err == nil && treeRes != nil && !treeRes.Empty && strings.TrimSpace(treeRes.Text) != "" {
+					uiText := redactSensitiveText(strings.TrimSpace(treeRes.Text))
+					outText += "\n\n[操作后最新界面]\n" + uiText
+				}
+			}
+		}
+	}
+
 	return brain.ToolOutput{
 		Text:      outText,
 		ImageJPEG: imgBytes,

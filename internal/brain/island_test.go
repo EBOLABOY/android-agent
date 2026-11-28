@@ -286,3 +286,53 @@ func TestIslandWorkflowProgressAndPreviewDemo(t *testing.T) {
 	client.mu.Unlock()
 	ctrl.ClearImmediate("cleanup")
 }
+
+func TestIslandHighMaxStepsCleanFormatting(t *testing.T) {
+	client := &mockLiveProgressClient{}
+	ctrl := NewIslandController(client)
+	defer ctrl.Close()
+	ctrl.minUpdateInterval = 20 * time.Millisecond
+	ctrl.doneClearDelay = 80 * time.Millisecond
+
+	ctrl.HandleEvent(RunEvent{RunID: "run-80", Type: "run_start", Summary: "长任务", MaxSteps: 80})
+	waitForCondition(t, 300*time.Millisecond, "run_start", func() bool {
+		u, _ := client.counts()
+		return u >= 1
+	})
+
+	time.Sleep(30 * time.Millisecond)
+	ctrl.HandleEvent(RunEvent{RunID: "run-80", Type: "thinking", Step: 3, MaxSteps: 80})
+	waitForCondition(t, 300*time.Millisecond, "thinking step 3", func() bool {
+		last, ok := client.lastUpdate()
+		return ok && last.State == "thinking" && last.Step == 3
+	})
+	thinkUpd, _ := client.lastUpdate()
+	if thinkUpd.Text != "第 3 步 · 推理" || thinkUpd.ShortText != "第 3 步" || strings.Contains(thinkUpd.Text+thinkUpd.ShortText, "/80") {
+		t.Fatalf("expected clean '第 3 步' formatting when MaxSteps>=40, got %+v", thinkUpd)
+	}
+	if thinkUpd.Progress < 20 || thinkUpd.Progress > 92 {
+		t.Fatalf("expected sleek soft progress in 20..92, got %d", thinkUpd.Progress)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	ctrl.HandleEvent(RunEvent{RunID: "run-80", Type: "tool_start", Step: 3, MaxSteps: 80, Tool: "phone_tap_node", Label: "点击控件", Summary: "点击节点 #2"})
+	waitForCondition(t, 300*time.Millisecond, "tool_start step 3", func() bool {
+		last, ok := client.lastUpdate()
+		return ok && last.State == "acting"
+	})
+	actUpd, _ := client.lastUpdate()
+	if !strings.HasPrefix(actUpd.Text, "第 3 步 · ") || strings.Contains(actUpd.Text+actUpd.ShortText, "/80") {
+		t.Fatalf("expected clean '第 3 步 · ...' tool_start formatting when MaxSteps>=40, got %+v", actUpd)
+	}
+
+	ctrl.HandleEvent(RunEvent{RunID: "run-80", Type: "done", Steps: 3, MaxSteps: 80, CheckpointPaused: true, ElapsedSec: 1.2})
+	waitForCondition(t, 300*time.Millisecond, "checkpoint done", func() bool {
+		last, ok := client.lastUpdate()
+		return ok && last.State == "done"
+	})
+	doneUpd, _ := client.lastUpdate()
+	if doneUpd.Title != "阶段检查点" || doneUpd.ShortText != "待继续" {
+		t.Fatalf("expected checkpoint done title/shortText, got %+v", doneUpd)
+	}
+	ctrl.ClearImmediate("cleanup")
+}

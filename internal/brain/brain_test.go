@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -250,7 +251,7 @@ func TestAgentLLMRetryAndLoopDetection(t *testing.T) {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		for _, m := range req.Messages {
-			if c, ok := m["content"].(string); ok && strings.Contains(c, "[系统防死循环提示]") {
+			if c, ok := m["content"].(string); ok && strings.Contains(c, "[系统防卡死提示]") {
 				sawLoopNudge.Store(true)
 			}
 		}
@@ -259,7 +260,7 @@ func TestAgentLLMRetryAndLoopDetection(t *testing.T) {
 		if sawLoopNudge.Load() {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"choices": []map[string]any{{
-					"message": map[string]any{"role": "assistant", "content": "已收到防死循环提示，切换策略汇报。"},
+					"message": map[string]any{"role": "assistant", "content": "已收到防卡死提示，切换策略汇报。"},
 				}},
 			})
 			return
@@ -294,7 +295,7 @@ func TestAgentLLMRetryAndLoopDetection(t *testing.T) {
 	if !sawLoopNudge.Load() {
 		t.Fatal("expected loop detection prompt to be injected after 3 identical tool calls")
 	}
-	if !strings.Contains(res.Reply, "防死循环") {
+	if !strings.Contains(res.Reply, "防卡死") {
 		t.Fatalf("unexpected reply: %q", res.Reply)
 	}
 }
@@ -822,23 +823,32 @@ func TestRunReplayNotFoundAndAccumulatedText(t *testing.T) {
 }
 
 func TestHistoryCompactionRedactionAndConfirmationNegation(t *testing.T) {
-	// 1. In-flight compaction: keep only latest 1 JPEG & collapse phone_ui_tree older than 2 steps
-	longTree := "pkg=com.example.app\n" + strings.Repeat("[1] btn 按钮\n", 40)
+	// 1. In-flight compaction: keep only latest 1 JPEG & keep only latest 2 UI-tree blocks
+	longTree1 := "Timing: 4ms | raw=80 | truncated=false\nApp: com.example.app (1080x2400, 20 nodes, ~200 tok)\n" + strings.Repeat("[1] Btn \"按钮1\" (click)\n", 10)
+	longTree2 := "Timing: 5ms | raw=80 | truncated=false\nApp: com.example.app (1080x2400, 20 nodes, ~200 tok)\n[1] Btn \"按钮2\" (click)"
+	longTree3 := "{\"ok\":true,\"id\":1}\n\n[操作后最新界面]\nApp: com.example.app (1080x2400, 5 nodes, ~60 tok)\n[1] Btn \"按钮3\" (click)"
 	h := []ChatMessage{
 		{Role: "user", Text: "start"},
 		{Role: "assistant", ToolCalls: []ToolCall{{ID: "1", Name: "phone_ui_tree"}}},
-		{Role: "tool", ToolCallID: "1", ToolName: "phone_ui_tree", Text: longTree},
+		{Role: "tool", ToolCallID: "1", ToolName: "phone_ui_tree", Text: longTree1},
 		{Role: "assistant", ToolCalls: []ToolCall{{ID: "2", Name: "phone_screenshot"}}},
 		{Role: "tool", ToolCallID: "2", ToolName: "phone_screenshot", Text: "img1", ImageJPEG: []byte{1, 2, 3}},
-		{Role: "assistant", ToolCalls: []ToolCall{{ID: "3", Name: "phone_screenshot"}}},
-		{Role: "tool", ToolCallID: "3", ToolName: "phone_screenshot", Text: "img2", ImageJPEG: []byte{4, 5, 6}},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "3", Name: "phone_ui_tree"}}},
+		{Role: "tool", ToolCallID: "3", ToolName: "phone_ui_tree", Text: longTree2},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "4", Name: "phone_screenshot"}}},
+		{Role: "tool", ToolCallID: "4", ToolName: "phone_screenshot", Text: "img2", ImageJPEG: []byte{4, 5, 6}},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "5", Name: "phone_tap_node"}}},
+		{Role: "tool", ToolCallID: "5", ToolName: "phone_tap_node", Text: longTree3},
 	}
 	compactInFlightHistory(h)
-	if h[4].ImageJPEG != nil || len(h[6].ImageJPEG) == 0 {
-		t.Fatalf("expected only latest ImageJPEG kept in-flight, got h[4]=%v h[6]=%v", h[4].ImageJPEG, h[6].ImageJPEG)
+	if h[4].ImageJPEG != nil || len(h[8].ImageJPEG) == 0 {
+		t.Fatalf("expected only latest ImageJPEG kept in-flight, got h[4]=%v h[8]=%v", h[4].ImageJPEG, h[8].ImageJPEG)
 	}
-	if !strings.HasPrefix(h[2].Text, "[旧 UI 树已压缩:") {
-		t.Fatalf("expected old phone_ui_tree to be collapsed, got %q", h[2].Text)
+	if h[2].Text != collapsedUITreeMarker {
+		t.Fatalf("expected 3rd-newest phone_ui_tree to be collapsed to %q, got %q", collapsedUITreeMarker, h[2].Text)
+	}
+	if !strings.Contains(h[6].Text, "按钮2") || !strings.Contains(h[10].Text, "按钮3") {
+		t.Fatalf("expected latest 2 UI-tree observations kept intact, got h[6]=%q h[10]=%q", h[6].Text, h[10].Text)
 	}
 
 	// 2. saveHistory strips ALL ImageJPEG and hard-trims even when last 24 messages have no user message
@@ -1115,5 +1125,363 @@ func TestJobManagerProgressObserverRecentLogsAndCancel(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for workflow context cancellation")
+	}
+}
+
+type v041Exec struct {
+	mu      sync.Mutex
+	calls   []string
+	sameUI  bool
+	stepNum int
+}
+
+func (e *v041Exec) ToolSpecs() []ToolSpec {
+	return []ToolSpec{
+		{Name: "phone_tap_node", Description: "tap node", Parameters: map[string]any{"type": "object"}},
+		{Name: "phone_scroll_node", Description: "scroll node", Parameters: map[string]any{"type": "object"}},
+		{Name: "phone_status", Description: "status", Parameters: map[string]any{"type": "object"}},
+	}
+}
+
+func (e *v041Exec) ExecuteTool(_ context.Context, name string, args map[string]any) ToolOutput {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.stepNum++
+	b, _ := json.Marshal(args)
+	e.calls = append(e.calls, name+":"+string(b))
+
+	if name == "phone_status" {
+		return ToolOutput{Text: `{"guard":{"state":"active"}}`}
+	}
+	nodeLine := fmt.Sprintf("[1] Btn \"动态按钮_%d\" (click)", e.stepNum)
+	if e.sameUI {
+		nodeLine = `[1] Btn "被弹窗遮挡的死按钮" (click)`
+	}
+	return ToolOutput{
+		Text: fmt.Sprintf(`{"ok":true,"step":%d}`+"\n\n[操作后最新界面]\nApp: com.sankuai.meituan (1080x2400, 1 nodes, ~25 tok)\n%s", e.stepNum, nodeLine),
+	}
+}
+
+func TestV041PeriodCyclesUnchangedFingerprintAndEarlyStallBreak(t *testing.T) {
+	// 1. Direct unit checks on detectToolCallCycle (period 1, 2, 3) & extractUITreeFingerprint
+	if got := detectToolCallCycle([]string{"A", "A", "A"}); got != 1 {
+		t.Fatalf("expected period-1 cycle, got %d", got)
+	}
+	if got := detectToolCallCycle([]string{"A", "B", "A", "B"}); got != 2 {
+		t.Fatalf("expected period-2 cycle, got %d", got)
+	}
+	if got := detectToolCallCycle([]string{"A", "B", "C", "A", "B", "C"}); got != 3 {
+		t.Fatalf("expected period-3 cycle, got %d", got)
+	}
+	if got := detectToolCallCycle([]string{"A", "B", "C", "D"}); got != 0 {
+		t.Fatalf("expected no cycle, got %d", got)
+	}
+
+	// 2. Period-2 cycle (A -> B -> A -> B) triggers [系统防卡死提示]
+	t.Run("period-2 A->B->A->B cycle triggers anti-stall prompt", func(t *testing.T) {
+		var round atomic.Int32
+		var sawPeriod2Hint atomic.Bool
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				Messages []map[string]any `json:"messages"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			for _, m := range req.Messages {
+				if c, ok := m["content"].(string); ok && strings.Contains(c, "[系统防卡死提示]") && strings.Contains(c, "周期-2") {
+					sawPeriod2Hint.Store(true)
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if sawPeriod2Hint.Load() {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"choices": []map[string]any{{
+						"message": map[string]any{"role": "assistant", "content": "已识别到 A->B->A->B 周期循环，立即结束并汇报。"},
+					}},
+				})
+				return
+			}
+			n := round.Add(1)
+			var tcName, tcArgs string
+			if n%2 == 1 {
+				tcName, tcArgs = "phone_tap_node", `{"id":1}`
+			} else {
+				tcName, tcArgs = "phone_scroll_node", `{"direction":"down","id":3}`
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{
+						"role": "assistant",
+						"tool_calls": []map[string]any{{
+							"id":       fmt.Sprintf("tc_%d", n),
+							"type":     "function",
+							"function": map[string]any{"name": tcName, "arguments": tcArgs},
+						}},
+					},
+				}},
+			})
+		}))
+		defer srv.Close()
+
+		exec := &v041Exec{sameUI: false}
+		ag := NewAgent(config.LLMConfig{
+			Provider: "openai",
+			BaseURL:  srv.URL,
+			APIKey:   "sk-test",
+			Model:    "gpt-test",
+			MaxSteps: 12,
+		}, exec, nil)
+
+		res, err := ag.Chat(context.Background(), "测试 A->B->A->B 检测")
+		if err != nil {
+			t.Fatalf("Chat failed: %v", err)
+		}
+		if !sawPeriod2Hint.Load() {
+			t.Fatal("expected period-2 cycle [系统防卡死提示] after A->B->A->B")
+		}
+		if res.Steps != 5 {
+			t.Fatalf("expected completion on step 5 right after period-2 hint on step 4, got steps=%d", res.Steps)
+		}
+	})
+
+	// 3. 3x unchanged UI fingerprint (distinct mutating calls!) triggers [系统防卡死提示],
+	//    and 6x unchanged breaks early out of an 80-step ceiling into tool-free summary!
+	t.Run("3x unchanged UI fingerprint warns and 6x breaks early before MaxSteps=80", func(t *testing.T) {
+		var round atomic.Int32
+		var sawUnchangedAtStep4 atomic.Bool
+		var finalCallHadNoTools atomic.Bool
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := round.Add(1)
+			var req map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			msgs, _ := req["messages"].([]any)
+			for _, rawM := range msgs {
+				m, _ := rawM.(map[string]any)
+				if c, ok := m["content"].(string); ok && strings.Contains(c, "[系统防卡死提示]") && strings.Contains(c, "UI 指纹") {
+					if n == 4 {
+						sawUnchangedAtStep4.Store(true)
+					}
+				}
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			if _, hasTools := req["tools"]; !hasTools {
+				finalCallHadNoTools.Store(true)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"choices": []map[string]any{{
+						"message": map[string]any{
+							"role":    "assistant",
+							"content": "1) 已尝试点击多个入口；2) 当前被弹窗遮挡无变化；3) 请手动关闭弹窗后点击继续执行。",
+						},
+					}},
+				})
+				return
+			}
+
+			// Every step calls a DIFFERENT node id so it is NOT a tool-signature cycle, ONLY unchanged UI fingerprint!
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{
+						"role": "assistant",
+						"tool_calls": []map[string]any{{
+							"id":       fmt.Sprintf("tc_u_%d", n),
+							"type":     "function",
+							"function": map[string]any{"name": "phone_tap_node", "arguments": fmt.Sprintf(`{"id":%d}`, n)},
+						}},
+					},
+				}},
+			})
+		}))
+		defer srv.Close()
+
+		exec := &v041Exec{sameUI: true}
+		ag := NewAgent(config.LLMConfig{
+			Provider: "openai",
+			BaseURL:  srv.URL,
+			APIKey:   "sk-test",
+			Model:    "gpt-test",
+			MaxSteps: 80,
+		}, exec, nil)
+
+		res, err := ag.Chat(context.Background(), "测试连续无变化提前熔断")
+		if err != nil {
+			t.Fatalf("Chat failed: %v", err)
+		}
+		if !sawUnchangedAtStep4.Load() {
+			t.Fatal("expected 3x unchanged UI fingerprint [系统防卡死提示] to be visible on LLM call #4")
+		}
+		if res.Steps != 6 {
+			t.Fatalf("expected early stall break at 6 unchanged steps (not 80), got steps=%d", res.Steps)
+		}
+		if !finalCallHadNoTools.Load() || !res.CheckpointPaused {
+			t.Fatalf("expected tool-free summary and CheckpointPaused=true, got noTools=%v res=%+v", finalCallHadNoTools.Load(), res)
+		}
+	})
+}
+
+func TestV041MaxStepsGracefulToolFreeSummaryAndFallback(t *testing.T) {
+	t.Run("streams tool-free final LLM summary and sets CheckpointPaused", func(t *testing.T) {
+		histFile := filepath.Join(t.TempDir(), "chat_history.json")
+		var calls atomic.Int32
+		var sawSummaryPrompt, summaryOmittedTools atomic.Bool
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := calls.Add(1)
+			rawBody, _ := io.ReadAll(r.Body)
+			var req map[string]any
+			_ = json.Unmarshal(rawBody, &req)
+
+			if n <= 3 {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"choices": []map[string]any{{
+						"message": map[string]any{
+							"role": "assistant",
+							"tool_calls": []map[string]any{{
+								"id":       fmt.Sprintf("step_%d", n),
+								"type":     "function",
+								"function": map[string]any{"name": "phone_tap_node", "arguments": fmt.Sprintf(`{"id":%d}`, n)},
+							}},
+						},
+					}},
+				})
+				return
+			}
+
+			// 4th call MUST be the tool-free checkpoint summary!
+			if _, hasTools := req["tools"]; !hasTools {
+				summaryOmittedTools.Store(true)
+			}
+			if strings.Contains(string(rawBody), "已到达当前阶段步数检查点") {
+				sawSummaryPrompt.Store(true)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"已完成前 3 步点击，\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"如需继续请点击下方「继续执行」。\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		}))
+		defer srv.Close()
+
+		exec := &v041Exec{sameUI: false}
+		ag := NewAgent(config.LLMConfig{
+			Provider: "openai",
+			BaseURL:  srv.URL,
+			APIKey:   "sk-test",
+			Model:    "gpt-test",
+			MaxSteps: 3,
+		}, exec, nil)
+		ag.SetHistoryFile(histFile)
+
+		var streamedDeltas strings.Builder
+		var doneEvent RunEvent
+		res, err := ag.ChatStream(context.Background(), "执行长链路多步任务", func(ev RunEvent) {
+			if ev.Type == "text_delta" {
+				streamedDeltas.WriteString(ev.Delta)
+			}
+			if ev.Type == "done" {
+				doneEvent = ev
+			}
+		})
+		if err != nil {
+			t.Fatalf("ChatStream failed: %v", err)
+		}
+		if !summaryOmittedTools.Load() || !sawSummaryPrompt.Load() {
+			t.Fatalf("expected tool-free summary call with checkpoint prompt: noTools=%v sawPrompt=%v", summaryOmittedTools.Load(), sawSummaryPrompt.Load())
+		}
+		if !res.CheckpointPaused || !doneEvent.CheckpointPaused {
+			t.Fatalf("expected CheckpointPaused=true on result & done event: res=%+v ev=%+v", res, doneEvent)
+		}
+		if !strings.Contains(streamedDeltas.String(), "已完成前 3 步点击") || res.Reply != streamedDeltas.String() {
+			t.Fatalf("unexpected streamed checkpoint summary: deltas=%q reply=%q", streamedDeltas.String(), res.Reply)
+		}
+		turns := ag.SavedTurns()
+		if len(turns) != 1 || !turns[0].CheckpointPaused {
+			t.Fatalf("expected SavedTurn with CheckpointPaused=true, got %+v", turns)
+		}
+	})
+
+	t.Run("falls back cleanly to trace summary if final LLM call fails", func(t *testing.T) {
+		oldDelay := llmRetryBaseDelay
+		llmRetryBaseDelay = time.Millisecond
+		defer func() { llmRetryBaseDelay = oldDelay }()
+
+		var calls atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := calls.Add(1)
+			if n <= 2 {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"choices": []map[string]any{{
+						"message": map[string]any{
+							"role": "assistant",
+							"tool_calls": []map[string]any{{
+								"id":       fmt.Sprintf("s_%d", n),
+								"type":     "function",
+								"function": map[string]any{"name": "phone_tap_node", "arguments": fmt.Sprintf(`{"id":%d}`, n)},
+							}},
+						},
+					}},
+				})
+				return
+			}
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("upstream error"))
+		}))
+		defer srv.Close()
+
+		exec := &v041Exec{sameUI: false}
+		ag := NewAgent(config.LLMConfig{
+			Provider: "openai",
+			BaseURL:  srv.URL,
+			APIKey:   "sk-test",
+			Model:    "gpt-test",
+			MaxSteps: 2,
+		}, exec, nil)
+
+		res, err := ag.Chat(context.Background(), "测试汇总失败兜底")
+		if err != nil {
+			t.Fatalf("expected graceful fallback summary instead of error, got %v", err)
+		}
+		if !res.CheckpointPaused || !strings.Contains(res.Reply, "继续执行剩余步骤") {
+			t.Fatalf("unexpected fallback summary result: %+v", res)
+		}
+	})
+}
+
+func TestV041SlidingWindowAutoObservedCompaction(t *testing.T) {
+	mkObs := func(id int, label string) string {
+		return fmt.Sprintf(`{"ok":true,"id":%d,"label":%q}`+"\n\n[操作后最新界面]\nApp: com.sankuai.meituan (1080x2400, 12 nodes, ~180 tok)\n[1] Btn %q (click)", id, label, label)
+	}
+	h := []ChatMessage{
+		{Role: "user", Text: "点选商品"},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "phone_tap_node"}}},
+		{Role: "tool", ToolCallID: "c1", ToolName: "phone_tap_node", Text: mkObs(1, "第一页外卖")},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "c2", Name: "phone_tap_node"}}},
+		{Role: "tool", ToolCallID: "c2", ToolName: "phone_tap_node", Text: mkObs(2, "第二页奶茶")},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "c3", Name: "phone_tap_node"}}},
+		{Role: "tool", ToolCallID: "c3", ToolName: "phone_tap_node", Text: mkObs(3, "第三页选规格")},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "c4", Name: "phone_tap_node"}}},
+		{Role: "tool", ToolCallID: "c4", ToolName: "phone_tap_node", Text: mkObs(4, "第四页加购")},
+	}
+
+	compactInFlightHistory(h)
+
+	// Older 2 tool messages (h[2], h[4]) MUST preserve action JSON header and collapse [操作后最新界面]
+	for _, idx := range []int{2, 4} {
+		if !strings.HasPrefix(h[idx].Text, `{"ok":true,`) {
+			t.Fatalf("h[%d] lost JSON action header: %q", idx, h[idx].Text)
+		}
+		if strings.Contains(h[idx].Text, "[操作后最新界面]") {
+			t.Fatalf("h[%d] should have collapsed [操作后最新界面]: %q", idx, h[idx].Text)
+		}
+		if !strings.Contains(h[idx].Text, collapsedUITreeMarker) {
+			t.Fatalf("h[%d] missing collapsed marker %q: %q", idx, collapsedUITreeMarker, h[idx].Text)
+		}
+	}
+	// Latest 2 tool messages (h[6], h[8]) MUST keep full [操作后最新界面]
+	if !strings.Contains(h[6].Text, "[操作后最新界面]") || !strings.Contains(h[6].Text, "第三页选规格") {
+		t.Fatalf("expected 2nd latest UI tree kept intact in h[6], got %q", h[6].Text)
+	}
+	if !strings.Contains(h[8].Text, "[操作后最新界面]") || !strings.Contains(h[8].Text, "第四页加购") {
+		t.Fatalf("expected latest UI tree kept intact in h[8], got %q", h[8].Text)
 	}
 }

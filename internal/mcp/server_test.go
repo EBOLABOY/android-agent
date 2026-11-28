@@ -1331,8 +1331,8 @@ func TestV040BootstrapLongPollScreenRemoteLLMTestIslandAndCompositeTools(t *test
 		}
 	}
 	stMap, _ := boot["status"].(map[string]any)
-	if stMap["version"] != "0.4.0" {
-		t.Fatalf("expected version 0.4.0 in bootstrap status, got %v", stMap["version"])
+	if stMap["version"] != "0.4.1" {
+		t.Fatalf("expected version 0.4.1 in bootstrap status, got %v", stMap["version"])
 	}
 
 	// 2. POST /api/v1/llm/test
@@ -1539,6 +1539,70 @@ func TestV040BootstrapLongPollScreenRemoteLLMTestIslandAndCompositeTools(t *test
 	fb.mu.Unlock()
 	if !foundWorkflowIsland {
 		t.Fatalf("expected workflow progress observer to drive IslandController workflow state")
+	}
+}
+
+func TestV041AutoObserveExecuteToolAndDefaults(t *testing.T) {
+	oldFast := autoObserveFastSettle
+	oldLaunch := autoObserveLaunchSettle
+	autoObserveFastSettle = 15 * time.Millisecond
+	autoObserveLaunchSettle = 25 * time.Millisecond
+	defer func() {
+		autoObserveFastSettle = oldFast
+		autoObserveLaunchSettle = oldLaunch
+	}()
+
+	defCfg := config.Default()
+	if defCfg.LLM.MaxSteps != 80 {
+		t.Fatalf("expected default LLM.MaxSteps=80, got %d", defCfg.LLM.MaxSteps)
+	}
+	if ServerVersion != "0.4.1" {
+		t.Fatalf("expected ServerVersion=0.4.1, got %q", ServerVersion)
+	}
+
+	defCfg.ListenAddr = "127.0.0.1:0"
+	defCfg.BearerToken = "tok-v041-auto-observe"
+	defCfg.PauseFlagPath = ""
+	defCfg.MemoryDir = filepath.Join(t.TempDir(), "memory")
+	defCfg.CDPSocket = "nonexistent_test_cdp_socket_041"
+
+	fb := &fakeBackend{}
+	det := &testDetector{}
+	g := guard.New(guard.Options{Packages: []string{"com.tencent.tmgp.sgame"}, PollInterval: time.Second, Detector: det})
+	srv := NewServer(defCfg, fb, g, cdp.NewClient(defCfg.CDPSocket), nil)
+	defer srv.Close()
+
+	// 1. phone_keyevent (HOME) auto-observes UI tree AND populates cachedNodes without calling phone_ui_tree!
+	outKey := srv.ExecuteTool(context.Background(), "phone_keyevent", map[string]any{"keycode": "KEYCODE_HOME"})
+	if outKey.IsError {
+		t.Fatalf("ExecuteTool(phone_keyevent) failed: %+v", outKey)
+	}
+	if !strings.Contains(outKey.Text, "[操作后最新界面]\nApp: com.sankuai.meituan") || !strings.Contains(outKey.Text, `[2] Btn "外卖"`) {
+		t.Fatalf("expected [操作后最新界面] appended to mutating tool output, got %q", outKey.Text)
+	}
+
+	// 2. Immediately call phone_tap_node using [2] from the auto-observed tree (no prior phone_ui_tree needed!)
+	outTapNode := srv.ExecuteTool(context.Background(), "phone_tap_node", map[string]any{"id": 2})
+	if outTapNode.IsError {
+		t.Fatalf("ExecuteTool(phone_tap_node) using auto-observed node id failed: %+v", outTapNode)
+	}
+	if !strings.Contains(outTapNode.Text, `"label":"外卖"`) || !strings.Contains(outTapNode.Text, "[操作后最新界面]") {
+		t.Fatalf("expected action JSON + [操作后最新界面] on phone_tap_node, got %q", outTapNode.Text)
+	}
+
+	// 3. observe:false skips auto-observation
+	outNoObs := srv.ExecuteTool(context.Background(), "phone_launch_app", map[string]any{
+		"package": "com.sankuai.meituan",
+		"observe": false,
+	})
+	if outNoObs.IsError || strings.Contains(outNoObs.Text, "[操作后最新界面]") {
+		t.Fatalf("expected observe:false to skip [操作后最新界面], got %+v", outNoObs)
+	}
+
+	// 4. Error result skips auto-observation
+	outErr := srv.ExecuteTool(context.Background(), "phone_tap", map[string]any{"x": 100}) // missing y
+	if !outErr.IsError || strings.Contains(outErr.Text, "[操作后最新界面]") {
+		t.Fatalf("expected error tool output not to append [操作后最新界面], got %+v", outErr)
 	}
 }
 

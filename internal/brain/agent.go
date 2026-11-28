@@ -2,6 +2,8 @@ package brain
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +22,13 @@ import (
 
 var ErrChatBusy = errors.New("another chat turn is already in progress")
 
+const (
+	DefaultMaxSteps           = 80
+	autoObservedSectionHeader = "[操作后最新界面]"
+	collapsedUITreeMarker     = "[历史界面已折叠，请以最新界面为准]"
+	checkpointSummaryPrompt   = "已到达当前阶段步数检查点（或页面连续无变化），请用简洁中文向用户汇报：1) 已经完成了哪些步骤；2) 当前界面停在哪里；3) 如需继续请点击下方「继续执行」或人工处理阻碍项。"
+)
+
 const SystemPrompt = `你是运行在用户小米 13（Android 16 / HyperOS 3.0）本机上的 AI Agent 大脑（android-agent）。
 你能直接调用混合分层设备控制工具（4ms 内存 UI 树 + 纯 Go evdev 物理拟人触控 + 720p 视觉兜底）、WebView CDP 工具（Edge/Bing/京东 20ms DOM）、0-Token 原生日常任务引擎，以及端侧持久化 Markdown 记忆。
 
@@ -28,9 +37,10 @@ const SystemPrompt = `你是运行在用户小米 13（Android 16 / HyperOS 3.0�
 2. 【绝不绕过验证码】只要看到任何滑块、人机验证（CAPTCHA）或登录失效弹窗，必须立即停止并告知用户在手机上亲自完成。
 3. 【尊重游戏风控守护】当 guard.state != "active"（如王者荣耀前台或手动暂停）时拒绝操作。
 4. 【交易与下单绝对停在确认页】严格遵守 SOUL.md 红线：浏览、加购后只要到达确认订单/支付/转账/开通会员页，必须立刻停手，绝对不能替用户点击最终下单或付款按钮，并在回复中明确写出「需要人工确认」。
-5. 【先 DOM 与 UI 树、最后看图】操作 Edge / Bing / 京东优先用 cdp_list_sockets + cdp_list_targets + cdp_command；操作美团、微信、系统设置等原生 App 优先用 phone_ui_tree + phone_tap_node + phone_scroll_node（纯文本快且极省 Token）；仅在控件树为空（自绘/游戏页面）或需要视觉核查时再调用 phone_screenshot。
-6. 【善用自主记忆】当用户明确交代新偏好/习惯时，用 append_memory 写入 MEMORY.md；遇到页面适配踩坑或纠错经验时，用 append_memory 写入 LEARNINGS.md。
-7. 回复简洁清晰，使用中文分点总结实际观测到的结果、数值与耗时。`
+5. 【先 DOM 与 UI 树、最后看图】操作 Edge / Bing / 京东优先用 cdp_list_sockets + cdp_list_targets + cdp_command；操作美团、微信、系统设置等原生 App 优先用 UI 树与节点交互工具（phone_tap_node + phone_scroll_node + phone_tap_and_type，纯文本快且极省 Token）；仅在控件树为空（自绘/游戏页面）或操作受阻需视觉核查遮挡弹窗时再调用 phone_screenshot。
+6. 【单步动作自动返回最新界面（严禁冗余抓树）】所有界面变更工具（phone_tap_node、phone_tap、phone_long_press、phone_scroll_node、phone_swipe、phone_keyevent、phone_input_text、phone_tap_and_type、phone_launch_app、phone_open_deeplink）执行后都会自动等待界面稳定，并在返回结果末尾附带 [操作后最新界面] 及刷新后的最新 [id] 控件编号！因此：仅在第一步未知当前屏幕（且第一步无需先按键回桌面或拉起/跳转应用）或遇到慢速异步网络加载尚未渲染完成时才单独调用 phone_ui_tree；每次点击、按键、输入、滑动或拉起应用后请直接基于返回中的 [操作后最新界面] 规划下一步，切勿在动作后再额外调用 phone_ui_tree！
+7. 【善用自主记忆】当用户明确交代新偏好/习惯时，用 append_memory 写入 MEMORY.md；遇到页面适配踩坑或纠错经验时，用 append_memory 写入 LEARNINGS.md。
+8. 回复简洁清晰，使用中文分点总结实际观测到的结果、数值与耗时。`
 
 type ToolStep struct {
 	Step      int    `json:"step"`
@@ -62,6 +72,7 @@ type RunEvent struct {
 	ElapsedMs         int64      `json:"elapsed_ms,omitempty"`
 	ElapsedSec        float64    `json:"elapsed_sec,omitempty"`
 	NeedsConfirmation bool       `json:"needs_confirmation,omitempty"`
+	CheckpointPaused  bool       `json:"checkpoint_paused,omitempty"`
 	ToolsUsed         []string   `json:"tools_used,omitempty"`
 	ToolTrace         []ToolStep `json:"tool_trace,omitempty"`
 }
@@ -328,6 +339,7 @@ type SavedTurn struct {
 	ElapsedSec        float64    `json:"elapsed_sec"`
 	Steps             int        `json:"steps"`
 	NeedsConfirmation bool       `json:"needs_confirmation,omitempty"`
+	CheckpointPaused  bool       `json:"checkpoint_paused,omitempty"`
 	ToolTrace         []ToolStep `json:"tool_trace,omitempty"`
 }
 
@@ -337,6 +349,7 @@ type ChatTurnResult struct {
 	ToolsUsed         []string   `json:"tools_used,omitempty"`
 	ToolTrace         []ToolStep `json:"tool_trace,omitempty"`
 	NeedsConfirmation bool       `json:"needs_confirmation,omitempty"`
+	CheckpointPaused  bool       `json:"checkpoint_paused,omitempty"`
 	Steps             int        `json:"steps"`
 	ElapsedSec        float64    `json:"elapsed_sec"`
 }
@@ -708,7 +721,7 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 
 	maxSteps := cfg.MaxSteps
 	if maxSteps <= 0 {
-		maxSteps = 20
+		maxSteps = DefaultMaxSteps
 	}
 
 	history = append(history, ChatMessage{Role: "user", Text: userMessage})
@@ -716,9 +729,13 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 	var toolsUsed []string
 	var trace []ToolStep
 	steps := 0
-	lastCallSig := ""
-	repeatCount := 0
+	var recentSigs []string
+	lastMutatingFP := ""
+	sameMutatingFPCount := 0
+	lastObservedFP := ""
 	repeatErrCount := 0
+	stalledStepStreak := 0
+	earlyStallBreak := false
 
 	a.dispatchEvent(sink, RunEvent{
 		Type:     "run_start",
@@ -821,6 +838,7 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 		})
 
 		if len(resp.ToolCalls) == 0 {
+			compactInFlightHistory(history)
 			a.saveHistory(history)
 			needsConfirm := replyNeedsConfirmation(resp.Text)
 			if needsConfirm {
@@ -846,6 +864,7 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 			a.dispatchEvent(sink, RunEvent{
 				Type:              "done",
 				Step:              steps,
+				Steps:             steps,
 				MaxSteps:          maxSteps,
 				Reply:             resp.Text,
 				NeedsConfirmation: needsConfirm,
@@ -864,6 +883,8 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 			}, nil
 		}
 
+		stepStalled := false
+		stepUIChanged := false
 		for _, tc := range resp.ToolCalls {
 			if a.guard != nil {
 				if blocked, reason := a.guard.IsActionBlocked(); blocked {
@@ -902,28 +923,55 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 			}
 			elapsedMs := time.Since(toolStart).Milliseconds()
 
-			sigBytes, _ := json.Marshal(tc.Args)
-			sig := tc.Name + ":" + string(sigBytes)
-			if sig == lastCallSig {
-				repeatCount++
-				if out.IsError {
-					repeatErrCount++
-				} else {
-					repeatErrCount = 0
-				}
+			sig := canonicalToolCallSig(tc.Name, tc.Args)
+			recentSigs = append(recentSigs, sig)
+			cyclePeriod := detectToolCallCycle(recentSigs)
+
+			if out.IsError {
+				repeatErrCount++
 			} else {
-				lastCallSig = sig
-				repeatCount = 1
-				if out.IsError {
-					repeatErrCount = 1
-				} else {
-					repeatErrCount = 0
+				repeatErrCount = 0
+			}
+
+			fp := extractUITreeFingerprint(out.Text)
+			if fp != "" {
+				if lastObservedFP != "" && fp != lastObservedFP {
+					stepUIChanged = true
+				}
+				lastObservedFP = fp
+			}
+
+			unchangedTriggered := false
+			if isUIMutatingTool(tc.Name) {
+				if !out.IsError && fp != "" {
+					if fp == lastMutatingFP {
+						sameMutatingFPCount++
+					} else {
+						lastMutatingFP = fp
+						sameMutatingFPCount = 1
+					}
+					if sameMutatingFPCount >= 3 {
+						unchangedTriggered = true
+					}
+				} else if !out.IsError && fp == "" {
+					lastMutatingFP = ""
+					sameMutatingFPCount = 0
 				}
 			}
 
 			toolText := out.Text
-			if repeatCount >= 3 || repeatErrCount >= 2 {
-				toolText += "\n[系统防死循环提示] 检测到连续重复调用相同工具且未取得进展，请立即更换操作策略（如滑动、截屏兜底）或直接向用户汇报当前状态。"
+			if cyclePeriod > 0 || unchangedTriggered || repeatErrCount >= 2 {
+				stepStalled = true
+				switch {
+				case cyclePeriod > 0 && unchangedTriggered:
+					toolText += fmt.Sprintf("\n\n[系统防卡死提示] 检测到最近调用陷入周期-%d 重复循环，且连续 %d 次操作后界面结构完全未变（可能存在弹窗遮挡、按钮不可点或列表已到底）。请立即改变策略：先关闭遮挡弹窗、调整滑动方向（phone_scroll_node / phone_swipe）、调用 phone_screenshot 视觉核查真实画面，或直接结束汇报当前状态。", cyclePeriod, sameMutatingFPCount)
+				case cyclePeriod > 0:
+					toolText += fmt.Sprintf("\n\n[系统防卡死提示] 检测到最近工具调用陷入周期-%d 重复循环且未取得新进展。请勿继续重复相同调用：请检查是否有遮挡弹窗需关闭、尝试滚动页面、调用 phone_screenshot 视觉兜底核查，或直接向用户汇报当前结果。", cyclePeriod)
+				case unchangedTriggered:
+					toolText += fmt.Sprintf("\n\n[系统防卡死提示] 检测到连续 %d 次界面操作后页面 UI 指纹完全未发生变化，点击或滑动未生效（可能被弹窗遮挡、控件禁用或已滑到底部）。请尝试关闭弹窗、换方向滚动、调用 phone_screenshot 视觉核查，或结束操作向用户汇报。", sameMutatingFPCount)
+				default:
+					toolText += "\n\n[系统防卡死提示] 检测到工具连续调用报错且未取得进展，请立即更换操作方式（如改用 phone_screenshot 视觉定位或 cdp_* 工具）或直接向用户汇报当前阻碍。"
+				}
 			}
 
 			stepSum := summarizeToolOutcome(tc.Name, out)
@@ -961,12 +1009,80 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 				ImageJPEG:  out.ImageJPEG,
 			})
 		}
+
+		if stepStalled && !stepUIChanged {
+			stalledStepStreak++
+		} else if stepUIChanged || !stepStalled {
+			stalledStepStreak = 0
+		}
+		if stalledStepStreak >= 6 || sameMutatingFPCount >= 6 {
+			earlyStallBreak = true
+			break
+		}
 	}
 
+	if err := runCtx.Err(); err != nil {
+		return finishCancelled(err)
+	}
+
+	a.dispatchEvent(sink, RunEvent{
+		Type:     "thinking",
+		Step:     steps,
+		MaxSteps: maxSteps,
+		Summary:  "已到达阶段检查点，正在汇总进展...",
+	})
+
+	summaryHistory := append([]ChatMessage(nil), history...)
+	compactInFlightHistory(summaryHistory)
+	if strings.EqualFold(strings.TrimSpace(cfg.Provider), "gemini") && len(summaryHistory) > 0 && summaryHistory[len(summaryHistory)-1].Role == "tool" {
+		summaryHistory[len(summaryHistory)-1].Text += "\n\n" + checkpointSummaryPrompt
+	} else {
+		summaryHistory = append(summaryHistory, ChatMessage{Role: "user", Text: checkpointSummaryPrompt})
+	}
+
+	var streamedSummary strings.Builder
+	sumResp, sumErr := callLLMStream(runCtx, cfg, sysPrompt, summaryHistory, nil, StreamCallbacks{
+		OnTextDelta: func(delta string) {
+			if delta == "" {
+				return
+			}
+			streamedSummary.WriteString(delta)
+			a.dispatchEvent(sink, RunEvent{
+				Type:     "text_delta",
+				Step:     steps,
+				MaxSteps: maxSteps,
+				Delta:    delta,
+			})
+		},
+	})
+	if runCtx.Err() != nil && (errors.Is(sumErr, context.Canceled) || errors.Is(runCtx.Err(), context.Canceled)) {
+		return finishCancelled(sumErr)
+	}
+
+	var reply string
+	if sumErr == nil && sumResp != nil && strings.TrimSpace(sumResp.Text) != "" {
+		reply = strings.TrimSpace(sumResp.Text)
+	} else if strings.TrimSpace(streamedSummary.String()) != "" {
+		reply = strings.TrimSpace(streamedSummary.String())
+	} else {
+		reply = buildCheckpointFallbackSummary(trace, steps, earlyStallBreak)
+	}
+
+	history = append(history, ChatMessage{Role: "assistant", Text: reply})
+	compactInFlightHistory(history)
 	a.saveHistory(history)
-	reply := "已达到单轮最大工具调用步数限制，请查看当前结果或继续指示下一步。"
+
 	elapsed := float64(int(time.Since(t0).Seconds()*10)) / 10
 	needsConfirm := replyNeedsConfirmation(reply)
+	if needsConfirm {
+		a.dispatchEvent(sink, RunEvent{
+			Type:              "needs_confirmation",
+			Step:              steps,
+			MaxSteps:          maxSteps,
+			NeedsConfirmation: true,
+			Summary:           "需要人工确认",
+		})
+	}
 	a.recordSavedTurn(SavedTurn{
 		RunID:             runID,
 		Timestamp:         t0.Format(time.RFC3339),
@@ -975,14 +1091,17 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 		ElapsedSec:        elapsed,
 		Steps:             steps,
 		NeedsConfirmation: needsConfirm,
+		CheckpointPaused:  true,
 		ToolTrace:         trace,
 	})
 	a.dispatchEvent(sink, RunEvent{
 		Type:              "done",
 		Step:              steps,
+		Steps:             steps,
 		MaxSteps:          maxSteps,
 		Reply:             reply,
 		NeedsConfirmation: needsConfirm,
+		CheckpointPaused:  true,
 		ElapsedSec:        elapsed,
 		ToolsUsed:         toolsUsed,
 		ToolTrace:         trace,
@@ -993,6 +1112,7 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 		ToolsUsed:         toolsUsed,
 		ToolTrace:         trace,
 		NeedsConfirmation: needsConfirm,
+		CheckpointPaused:  true,
 		Steps:             steps,
 		ElapsedSec:        elapsed,
 	}, nil
@@ -1190,6 +1310,9 @@ func summarizeToolOutcome(toolName string, out ToolOutput) string {
 		return fmt.Sprintf("屏幕快照 (%d KB)", kb)
 	}
 	trimmed := strings.TrimSpace(out.Text)
+	if idx := strings.Index(trimmed, autoObservedSectionHeader); idx >= 0 {
+		trimmed = strings.TrimSpace(trimmed[:idx])
+	}
 	if trimmed == "" {
 		if out.IsError {
 			return "执行出错"
@@ -1210,6 +1333,9 @@ func summarizeToolOutcome(toolName string, out ToolOutput) string {
 						return truncateSummaryRunes(fmt.Sprintf("已点击「%s」", strings.TrimSpace(lbl)), 68)
 					}
 				}
+				if lbl, ok := obj["label"].(string); ok && strings.TrimSpace(lbl) != "" {
+					return truncateSummaryRunes(fmt.Sprintf("已点击「%s」", strings.TrimSpace(lbl)), 68)
+				}
 			case "phone_foreground_app":
 				if pkg, ok := obj["package"].(string); ok && strings.TrimSpace(pkg) != "" {
 					return fmt.Sprintf("前台应用: %s", friendlyPackageName(pkg))
@@ -1217,6 +1343,10 @@ func summarizeToolOutcome(toolName string, out ToolOutput) string {
 			case "phone_launch_app":
 				if pkg, ok := obj["package"].(string); ok && strings.TrimSpace(pkg) != "" {
 					return fmt.Sprintf("已启动 %s", friendlyPackageName(pkg))
+				}
+			case "phone_open_deeplink":
+				if pkg, ok := obj["package"].(string); ok && strings.TrimSpace(pkg) != "" {
+					return fmt.Sprintf("已跳转 %s", friendlyPackageName(pkg))
 				}
 			case "phone_status":
 				if g, ok := obj["guard"].(map[string]any); ok {
@@ -1308,9 +1438,137 @@ func replyNeedsConfirmation(reply string) bool {
 	return false
 }
 
-// compactInFlightHistory bounds token & memory usage during multi-step ReAct turns:
+func isUIMutatingTool(name string) bool {
+	switch name {
+	case "phone_tap", "phone_tap_node", "phone_long_press",
+		"phone_swipe", "phone_scroll_node", "phone_keyevent",
+		"phone_input_text", "phone_tap_and_type",
+		"phone_launch_app", "phone_open_deeplink":
+		return true
+	default:
+		return false
+	}
+}
+
+func canonicalToolCallSig(name string, args map[string]any) string {
+	if len(args) == 0 {
+		return name + ":{}"
+	}
+	b, err := json.Marshal(args)
+	if err != nil {
+		return fmt.Sprintf("%s:%v", name, args)
+	}
+	return name + ":" + string(b)
+}
+
+// detectToolCallCycle checks recentSigs for period-1 (A,A,A), period-2 (A,B,A,B),
+// or period-3 (A,B,C,A,B,C) repetitive tool call cycles.
+func detectToolCallCycle(recentSigs []string) int {
+	n := len(recentSigs)
+	if n >= 3 &&
+		recentSigs[n-1] == recentSigs[n-2] &&
+		recentSigs[n-2] == recentSigs[n-3] {
+		return 1
+	}
+	if n >= 4 &&
+		recentSigs[n-1] == recentSigs[n-3] &&
+		recentSigs[n-2] == recentSigs[n-4] {
+		return 2
+	}
+	if n >= 6 &&
+		recentSigs[n-1] == recentSigs[n-4] &&
+		recentSigs[n-2] == recentSigs[n-5] &&
+		recentSigs[n-3] == recentSigs[n-6] {
+		return 3
+	}
+	return 0
+}
+
+var uiNodeLinePrefixRe = regexp.MustCompile(`^\[\d+\]\s+`)
+
+// extractUITreeFingerprint hashes the canonical App:/pkg= header + [id] node lines
+// from either a standalone phone_ui_tree output or an [操作后最新界面] block.
+func extractUITreeFingerprint(text string) string {
+	if text == "" {
+		return ""
+	}
+	section := text
+	if idx := strings.Index(section, autoObservedSectionHeader); idx >= 0 {
+		section = section[idx+len(autoObservedSectionHeader):]
+	}
+	var canon []string
+	hasNodes := false
+	for _, rawLine := range strings.Split(section, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "App:") || strings.HasPrefix(line, "pkg="):
+			canon = append(canon, line)
+		case uiNodeLinePrefixRe.MatchString(line):
+			hasNodes = true
+			canon = append(canon, line)
+		}
+	}
+	if !hasNodes {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.Join(canon, "\n")))
+	return hex.EncodeToString(sum[:16])
+}
+
+func buildCheckpointFallbackSummary(trace []ToolStep, steps int, stalled bool) string {
+	var sb strings.Builder
+	if stalled {
+		sb.WriteString("已检测到当前页面连续多次操作无变化，为避免无效消耗已暂停在阶段检查点：\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("已完成当前阶段 %d 步检查点操作，阶段进展汇报如下：\n", steps))
+	}
+	if len(trace) > 0 {
+		start := 0
+		if len(trace) > 5 {
+			start = len(trace) - 5
+		}
+		var items []string
+		for _, st := range trace[start:] {
+			lbl := st.Label
+			if lbl == "" {
+				lbl = st.Tool
+			}
+			if st.Summary != "" {
+				items = append(items, fmt.Sprintf("%s（%s）", lbl, st.Summary))
+			} else {
+				items = append(items, lbl)
+			}
+		}
+		sb.WriteString(fmt.Sprintf("1. **已完成步骤**（累计调用 %d 次工具）：%s。\n", len(trace), strings.Join(items, " → ")))
+		last := trace[len(trace)-1]
+		sb.WriteString(fmt.Sprintf("2. **当前停留位置**：最后一步执行「%s」后停留在当前屏幕。\n", last.Summary))
+	} else {
+		sb.WriteString("1. **已完成步骤**：已完成前置规划检查。\n")
+		sb.WriteString("2. **当前停留位置**：保持在当前屏幕状态。\n")
+	}
+	sb.WriteString("3. **下一步操作**：如需继续执行剩余步骤，请点击下方「继续执行剩余步骤」按钮，或先打开「查看实时画面」人工处理弹窗/阻碍项。")
+	return sb.String()
+}
+
+func isStandaloneUITreeText(toolName, text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" || strings.HasPrefix(trimmed, "ui_tree unavailable") {
+		return false
+	}
+	if toolName == "phone_ui_tree" {
+		return true
+	}
+	return strings.HasPrefix(trimmed, "Timing:") && strings.Contains(trimmed, "\nApp:")
+}
+
+// compactInFlightHistory bounds token & memory usage during long multi-step ReAct turns:
 // - Keeps only the latest 1 ImageJPEG across the conversation in-flight.
-// - Collapses verbose phone_ui_tree outputs older than 2 assistant steps.
+// - Keeps ONLY the latest 2 full UI-tree blocks (phone_ui_tree outputs OR [操作后最新界面] sections
+//   inside mutating tool outputs), collapsing older observations to a 1-line summary while
+//   keeping any action JSON header intact.
 func compactInFlightHistory(history []ChatMessage) {
 	// 1. Keep only the latest 1 screenshot JPEG in-flight.
 	seenImg := false
@@ -1324,23 +1582,33 @@ func compactInFlightHistory(history []ChatMessage) {
 		}
 	}
 
-	// 2. Collapse phone_ui_tree outputs that are older than 2 assistant steps.
-	assistantAfter := 0
+	// 2. Sliding window over UI-tree observations: keep only the latest 2 full UI-tree blocks.
+	uiObsCount := 0
 	for i := len(history) - 1; i >= 0; i-- {
-		if history[i].Role == "assistant" {
-			assistantAfter++
+		if history[i].Role != "tool" {
 			continue
 		}
-		if history[i].Role == "tool" && history[i].ToolName == "phone_ui_tree" && assistantAfter >= 2 {
-			if len(history[i].Text) > 160 {
-				firstLine := history[i].Text
-				if nl := strings.IndexByte(firstLine, '\n'); nl >= 0 {
-					firstLine = strings.TrimSpace(firstLine[:nl])
+		txt := history[i].Text
+		if idx := strings.Index(txt, autoObservedSectionHeader); idx >= 0 {
+			uiObsCount++
+			if uiObsCount > 2 {
+				header := strings.TrimSpace(txt[:idx])
+				if header != "" {
+					history[i].Text = header + "\n" + collapsedUITreeMarker
+				} else {
+					history[i].Text = collapsedUITreeMarker
 				}
-				if len([]rune(firstLine)) > 64 {
-					firstLine = string([]rune(firstLine)[:64]) + "…"
-				}
-				history[i].Text = fmt.Sprintf("[旧 UI 树已压缩: %s]", firstLine)
+			}
+			continue
+		}
+		if strings.Contains(txt, collapsedUITreeMarker) {
+			uiObsCount++
+			continue
+		}
+		if isStandaloneUITreeText(history[i].ToolName, txt) {
+			uiObsCount++
+			if uiObsCount > 2 {
+				history[i].Text = collapsedUITreeMarker
 			}
 		}
 	}
