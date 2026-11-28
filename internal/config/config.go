@@ -23,11 +23,25 @@ type LLMConfig struct {
 
 type ScheduleEntry struct {
 	ID          string `json:"id"`
-	Job         string `json:"job"`           // "daily_all" | "ms_rewards" | "jd_daily"
+	TaskType    string `json:"task_type,omitempty"` // "workflow" (default) | "prompt"
+	Job         string `json:"job"`                 // "daily_all" | "ms_rewards" | "jd_daily"
+	Prompt      string `json:"prompt,omitempty"`    // custom AI prompt when task_type == "prompt"
 	Enabled     bool   `json:"enabled"`
-	WindowStart string `json:"window_start"`  // "HH:MM" local 24h time
-	WindowEnd   string `json:"window_end"`    // "HH:MM" local 24h time
-	DeferOnGame bool   `json:"defer_on_game"` // true: defer if guarded game foreground; false: skip today
+	WindowStart string `json:"window_start"`        // "HH:MM" local 24h time
+	WindowEnd   string `json:"window_end"`          // "HH:MM" local 24h time
+	DeferOnGame bool   `json:"defer_on_game"`       // true: defer if guarded game foreground; false: skip today
+}
+
+// NormalizedTaskType returns "prompt" for AI prompt entries and "workflow" otherwise.
+func (e ScheduleEntry) NormalizedTaskType() string {
+	t := strings.ToLower(strings.TrimSpace(e.TaskType))
+	if t == "prompt" {
+		return "prompt"
+	}
+	if t == "" && strings.TrimSpace(e.Job) == "" && strings.TrimSpace(e.Prompt) != "" {
+		return "prompt"
+	}
+	return "workflow"
 }
 
 type ScheduleConfig struct {
@@ -87,6 +101,14 @@ func Default() *Config {
 			},
 		},
 	}
+}
+
+// ChatHistoryPath returns the default persistent chat_history.json path alongside MemoryDir.
+func (c *Config) ChatHistoryPath() string {
+	if c == nil || strings.TrimSpace(c.MemoryDir) == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(strings.TrimSpace(c.MemoryDir)), "chat_history.json")
 }
 
 // MaskSecret returns a safe masked preview (e.g. "sk-a...wxyz") for HTTP APIs and logs.

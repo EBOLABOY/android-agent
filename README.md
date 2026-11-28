@@ -2,8 +2,8 @@
 
 小米 13（`fuxi` / Android 16 / API 36 / HyperOS 3.0 / KernelSU 3.3.1）原生低延迟 AI Agent 底座。
 
-- **当前状态**：**`v0.3.5` Anti-ACE 隐蔽加固版 — 在 `v0.3.4` 可靠性/低功耗/安全加固基础上，全面收紧游戏防风控（存活且未冻结即熔断 + 消除亮屏 30s 冷启动竞态 + 空 `cmdline` 进程防误缓存）、私有化 `0700/0600` 微内核缓存并随熔断/空闲自动清除、迁移 PID 目录至 `/data/adb/android_agent/run` 消除 `/dev` 痕迹，并去除 `401` 响应头指纹**。
-- **架构亮点**：零外部 Go 依赖静态单文件（内嵌 `_ "time/tzdata"`），内置标准 **MCP Streamable HTTP (`2025-03-26`)** 服务端（`26` 个工具，内置 LLM 大脑自动隐藏 `agent_pause`/`agent_resume` 防自锁）、懒加载 `app_process64` 微内核（3 分钟空闲销毁 + 杂讯隔离 + 王者荣耀秒杀熔断 + 焦点通知通道）、`evdev` 亮屏解锁门禁、2MB 进程内日志轮转、严格 Origin/Host 防护与本机 `127.0.0.1:8765` 默认监听。
+- **当前状态**：**`v0.4.0` 全新 60fps 移动控制台、长轮询架构与澎湃超级岛升级版 — 全新四栏 HyperOS 3 暗黑玻璃移动控制台（助手 / 画面远控 / 工作流与多规则 Cron / 系统与记忆工作台），新增 `GET /api/v1/bootstrap` 单次往返秒开、`GET /api/v1/chat/events?wait_ms=8000` 35ms 合并唤醒长轮询（消除 KSU 轮询卡顿与 95% Root 子进程开销）、实时 720p 画面点触远控与控件树叠层检查器、持久化富文本对话历史、支持自然语言 AI 指令的多规则定时调度，以及抗锯齿自定义图标的 HyperOS 3.0 超级岛实时状态胶囊**。
+- **架构亮点**：零外部 Go 依赖静态单文件（内嵌 `_ "time/tzdata"`），内置标准 **MCP Streamable HTTP (`2025-03-26`)** 服务端（`28` 个工具，新增 `phone_open_deeplink` 与 `phone_tap_and_type` 复合工具降延迟 ~40%，内置 LLM 大脑自动隐藏 `agent_pause`/`agent_resume` 防自锁）、懒加载 `app_process64` 微内核（3 分钟空闲销毁 + 杂讯隔离 + 王者荣耀秒杀熔断 + 焦点通知通道）、`evdev` 亮屏解锁门禁、2MB 进程内日志轮转、严格 Origin/Host 防护与本机 `127.0.0.1:8765` 默认监听。
 
 ---
 
@@ -183,6 +183,24 @@
 
 3. **去指纹化 `127.0.0.1:8765` 响应头（`internal/mcp/server.go`）**
    - 移除 `401 Unauthorized` 响应中 `WWW-Authenticate` 头的 `realm="android-agent"` 标识字符串（仅返回标准 `Bearer` / `Bearer error="invalid_token"`）。
+
+---
+
+## 2.9 `v0.4.0` 60fps 四栏移动控制台、长轮询减负与超级岛升级摘要
+
+1. **零卡顿通信与高价值端点/复合工具（`internal/mcp/server.go`）**
+   - **长轮询事件重放**：`GET /api/v1/chat/events?run_id=...&after_seq=...&wait_ms=8000`（上限 `12000ms`）在无新事件时静默挂起订阅，首个事件到达后合并 `35ms` 批量返回增量并支持游戏熔断即时唤醒，使 KernelSU WebUI 减少 **95%** Root Shell fork 并实现 ~35ms 丝滑响应。
+   - **1-RTT 秒开启动**：新增 `GET /api/v1/bootstrap` 一次返回 `{status, jobs, saved_turns, history, llm, schedule, memory_meta}`，消除串行启动请求。
+   - **画面远控、连通测速与超级岛预览**：新增 `GET /api/v1/screen/preview?with_tree=1`（并发抓取 720p JPEG + 前台包名 + 提纯控件树节点）、`POST /api/v1/screen/action`（支持图像坐标点触、节点点击、按键与滑动，受防风控与锁屏门禁保护）、`POST /api/v1/llm/test`（12s 超时连通性与 RTT 测速）、`POST /api/v1/island/test` 与 `POST /api/v1/schedule/run`。
+   - **新增复合工具（总计 `28` 个 MCP 工具）**：新增 `phone_open_deeplink` 与 `phone_tap_and_type`（点击目标控件/坐标 + 等待 `350ms` + 输入文本并自动脱敏记录），显著降低多步 ReAct 往返延迟。
+
+2. **HyperOS 3 暗黑玻璃四栏 `/ui` 与 KernelSU WebUI（`ui.html` / `webroot/index.html`）**
+   - **60fps 前端渲染引擎**：纯内联 SVG 图标（零廉价 Emoji、零外链资源，严格兼容本地 CSP）、`requestAnimationFrame` 帧合并增量流式更新、90px 智能滚动锁与 `↓ 回到底部` 悬浮胶囊、KSU 内一键 `#token=` 一次性移交系统浏览器极速模式（加载后自动 `history.replaceState` 抹除 URL Hash）。
+   - **四大功能视图**：
+     - **助手**：6 大高频场景卡片、可折叠步骤耗时追踪卡片、流式 Markdown 与人工核对确认卡（一键跳转实时画面）。
+     - **画面**：720p 实时屏幕预览、点触水波纹远程点击、控件树可视化边框叠层、虚拟硬件导航栏与可点击控件树检查器。
+     - **任务**：0-Token 工作流控制台（实时进度条 + 阶段提示 + 滚动日志 + 一键急停）与多规则定时调度器（同时支持内置工作流与 `task_type: "prompt"` 自然语言 AI 定时任务，支持单条开关、立即试跑、编辑与删除）。
+     - **系统**：澎湃灵动岛五态实时预览工作台、多预设大模型配置与 RTT 测速、带字节预算条与未保存提示的 Markdown 记忆工作台，以及设备遥测与守护一键暂停/恢复。
 
 ---
 

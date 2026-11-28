@@ -1,11 +1,11 @@
 #!/system/bin/sh
-# Bridge for KernelSU Manager WebUI (https://mui.kernelsu.org) -> local agentd
+# Fast Bridge (<15ms) for KernelSU Manager WebUI -> local agentd
 set -u
 
 METHOD="${1:-}"
 REQ_PATH="${2:-}"
 BODY_B64="${3:-}"
-CONF="/data/adb/android_agent/config.json"
+CONF="${KSU_AGENT_CONF:-/data/adb/android_agent/config.json}"
 
 case "$METHOD" in
   GET|POST) ;;
@@ -16,7 +16,7 @@ case "$METHOD" in
 esac
 
 case "$REQ_PATH" in
-  /api/v1/*|/health) ;;
+  /api/v1/*|/health|/health\?*) ;;
   *)
     printf '%s\n' '{"error":"forbidden API path"}'
     exit 2
@@ -24,7 +24,7 @@ case "$REQ_PATH" in
 esac
 
 case "$REQ_PATH" in
-  *..*|*%2e%2e*|*%2E%2E*|*%2e%2E*|*%2E%2e*|*\#*|*[[:space:]]*)
+  *..*|*%2e%2e*|*%2E%2E*|*%2e%2E*|*%2E%2e*|*\#*|*[[:space:]]*|*[[:cntrl:]]*)
     printf '%s\n' '{"error":"invalid API path"}'
     exit 2
     ;;
@@ -35,7 +35,63 @@ if [ ! -r "$CONF" ]; then
   exit 1
 fi
 
-TOKEN="$(grep '"bearer_token"' "$CONF" | head -n 1 | sed -E 's/.*"bearer_token"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+# Zero-fork pure shell JSON key extraction (handles both pretty-printed and single-line JSON)
+TOKEN=""
+LISTEN_ADDR=""
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    *'"bearer_token"'*)
+      if [ -z "$TOKEN" ]; then
+        rest="${line#*\"bearer_token\"}"
+        case "$rest" in
+          *:*)
+            rest="${rest#*:}"
+            while :; do
+              case "$rest" in
+                " "*|"	"*) rest="${rest#?}" ;;
+                *) break ;;
+              esac
+            done
+            case "$rest" in
+              \"*\"*)
+                rest="${rest#\"}"
+                TOKEN="${rest%%\"*}"
+                ;;
+            esac
+            ;;
+        esac
+      fi
+      ;;
+  esac
+  case "$line" in
+    *'"listen_addr"'*)
+      if [ -z "$LISTEN_ADDR" ]; then
+        rest="${line#*\"listen_addr\"}"
+        case "$rest" in
+          *:*)
+            rest="${rest#*:}"
+            while :; do
+              case "$rest" in
+                " "*|"	"*) rest="${rest#?}" ;;
+                *) break ;;
+              esac
+            done
+            case "$rest" in
+              \"*\"*)
+                rest="${rest#\"}"
+                LISTEN_ADDR="${rest%%\"*}"
+                ;;
+            esac
+            ;;
+        esac
+      fi
+      ;;
+  esac
+  if [ -n "$TOKEN" ] && [ -n "$LISTEN_ADDR" ]; then
+    break
+  fi
+done < "$CONF"
+
 if [ -z "$TOKEN" ]; then
   printf '%s\n' '{"error":"bearer_token missing in config.json"}'
   exit 1
@@ -47,7 +103,6 @@ case "$TOKEN" in
     ;;
 esac
 
-LISTEN_ADDR="$(grep '"listen_addr"' "$CONF" | head -n 1 | sed -E 's/.*"listen_addr"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
 case "$LISTEN_ADDR" in
   ""|*[![:alnum:].:_-]*)
     LISTEN_ADDR="127.0.0.1:8765"
@@ -60,14 +115,23 @@ case "$LISTEN_ADDR" in
     ;;
 esac
 
-MAX_TIME=25
+MAX_TIME=20
 case "$REQ_PATH" in
   /api/v1/chat|/api/v1/chat\?*|/api/v1/chat/stream*)
     MAX_TIME=85
     ;;
+  /api/v1/chat/events*)
+    # Supports ?wait_ms=8000..12000 long-polling cleanly
+    MAX_TIME=20
+    ;;
+  /health*|/api/v1/status*|/api/v1/bootstrap*)
+    MAX_TIME=12
+    ;;
 esac
 
 URL="http://${LISTEN_ADDR}${REQ_PATH}"
+CURL_BIN="/system/bin/curl"
+[ -x "$CURL_BIN" ] || CURL_BIN="curl"
 TMP_BODY=""
 cleanup() {
   if [ -n "$TMP_BODY" ]; then
@@ -91,14 +155,14 @@ if [ -n "$BODY_B64" ]; then
   fi
   umask "$OLD_UMASK"
   RESP="$(printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | \
-    /system/bin/curl --path-as-is -sS --connect-timeout 5 --max-time "$MAX_TIME" \
+    "$CURL_BIN" --path-as-is -sS --connect-timeout 2 --max-time "$MAX_TIME" \
       -K - -X "$METHOD" \
       -H "Content-Type: application/json" \
       --data-binary "@$TMP_BODY" \
       -w "\n%{http_code}" -- "$URL" 2>/dev/null)"
 else
   RESP="$(printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | \
-    /system/bin/curl --path-as-is -sS --connect-timeout 5 --max-time "$MAX_TIME" \
+    "$CURL_BIN" --path-as-is -sS --connect-timeout 2 --max-time "$MAX_TIME" \
       -K - -X "$METHOD" \
       -w "\n%{http_code}" -- "$URL" 2>/dev/null)"
 fi
@@ -109,8 +173,8 @@ if [ "$CURL_RC" -ne 0 ] || [ -z "$RESP" ]; then
   exit 1
 fi
 
-NL="$(printf '\nx')"
-NL="${NL%x}"
+NL='
+'
 HTTP_CODE="${RESP##*"$NL"}"
 BODY="${RESP%"$NL"*}"
 if [ "$BODY" = "$RESP" ]; then

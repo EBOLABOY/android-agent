@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -87,7 +88,29 @@ func NewClient(socketName string) *Client {
 		activeSocket:     clean,
 		dialer: func(ctx context.Context, sock string) (net.Conn, error) {
 			var d net.Dialer
-			return d.DialContext(ctx, "unix", "\x00"+sock)
+			conn, err := d.DialContext(ctx, "unix", "\x00"+sock)
+			if err != nil {
+				return nil, err
+			}
+			// Abstract sockets like @chrome_devtools_remote have no _<pid> suffix, and Linux
+			// accepts AF_UNIX stream connections into the backlog even when the browser is
+			// frozen by HyperOS cgroup freezer. Inspect SO_PEERCRED immediately (<0.1ms) so
+			// Probe() never stalls for seconds and workflows receive ErrTargetFrozen to wake it.
+			if uc, ok := conn.(*net.UnixConn); ok {
+				if rc, scErr := uc.SyscallConn(); scErr == nil {
+					var peerPID int
+					_ = rc.Control(func(fd uintptr) {
+						if cred, gerr := syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED); gerr == nil && cred != nil {
+							peerPID = int(cred.Pid)
+						}
+					})
+					if peerPID > 0 && isPIDFrozen(peerPID) {
+						_ = conn.Close()
+						return nil, fmt.Errorf("%w: @%s (pid=%d)", ErrTargetFrozen, sock, peerPID)
+					}
+				}
+			}
+			return conn, nil
 		},
 	}
 }
@@ -370,7 +393,7 @@ func (c *Client) httpClient() *http.Client {
 
 // Probe checks whether the Chrome DevTools socket is reachable without failing startup.
 func (c *Client) Probe(ctx context.Context) Status {
-	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 	defer cancel()
 
 	ver, err := c.Version(probeCtx)

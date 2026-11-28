@@ -294,6 +294,41 @@ func TestCDPFrozenDetectionRankingAndNoCrossSocketFallback(t *testing.T) {
 	if _, err := frozenDirect.ListTargets(context.Background()); !errors.Is(err, ErrTargetFrozen) {
 		t.Fatalf("expected ListTargets on frozen socket to preserve ErrTargetFrozen, got %v", err)
 	}
+
+	// Suffixless abstract socket (@chrome_devtools_remote) owned by a frozen PID (detected via SO_PEERCRED)
+	// must immediately fail with ErrTargetFrozen in <50ms instead of hanging until HTTP timeout!
+	selfPID := os.Getpid()
+	setupFakeCDPProc(t, unixContent, map[int]struct {
+		cmdline      string
+		oomAdj       string
+		wchan        string
+		cgroupPath   string
+		cgroupEvents string
+	}{
+		selfPID: {
+			cmdline:      "com.microsoft.emmx",
+			oomAdj:       "700",
+			cgroupPath:   fmt.Sprintf("/apps/uid_10200/pid_%d", selfPID),
+			cgroupEvents: "populated 1\nfrozen 1\n",
+		},
+	})
+	hungSock := fmt.Sprintf("chrome_devtools_remote_peercred_%d", selfPID)
+	ln, err := net.Listen("unix", "\x00"+hungSock)
+	if err != nil {
+		t.Fatalf("listen hung abstract socket: %v", err)
+	}
+	defer ln.Close()
+	// Intentionally never accept/respond on ln, simulating a cgroup-frozen Edge browser!
+	peerClient := NewClient(hungSock)
+	t0 := time.Now()
+	_, err = peerClient.Version(context.Background())
+	elapsed := time.Since(t0)
+	if !errors.Is(err, ErrTargetFrozen) {
+		t.Fatalf("expected SO_PEERCRED frozen check to return ErrTargetFrozen, got %v", err)
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("expected instant (<100ms) frozen detection via SO_PEERCRED, took %v", elapsed)
+	}
 }
 
 func TestCDPWSReadFrameContextCancelAndInterleavedControlFrames(t *testing.T) {

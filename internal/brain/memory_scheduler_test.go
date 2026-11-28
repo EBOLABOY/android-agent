@@ -456,3 +456,155 @@ func TestSchedulerHydrationSleepCapScreenLockDeferAndRetries(t *testing.T) {
 		t.Fatalf("expected bounded 3 total attempts (1 + 2 retries), got %d", attempts.Load())
 	}
 }
+
+func TestSchedulerCustomPromptTaskAndTriggerNow(t *testing.T) {
+	var seenUserMsg atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		for _, m := range req.Messages {
+			if m.Role == "user" {
+				seenUserMsg.Store(m.Content)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "已查询京东待收货：顺丰派送中，已记入记忆。",
+				},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	// Share a real DeviceLease between Agent and JobManager just like production server.go!
+	lease := NewDeviceLease()
+	jm := NewJobManager()
+	jm.SetDeviceLease(lease)
+
+	ag := NewAgent(config.LLMConfig{
+		Provider: "openai",
+		BaseURL:  srv.URL,
+		APIKey:   "sk-cron",
+		Model:    "gpt-cron",
+		MaxSteps: 4,
+	}, &mockExec{}, nil)
+	ag.SetDeviceLease(lease)
+	ag.SetHistoryFile(filepath.Join(t.TempDir(), "chat_history.json"))
+
+	var workflowRuns atomic.Int32
+	sched := NewScheduler(config.ScheduleConfig{
+		Enabled: false, // Disabled globally: TriggerNow must still work!
+		Entries: []config.ScheduleEntry{
+			{
+				ID:          "wf-entry",
+				TaskType:    "workflow",
+				Job:         "jd_daily",
+				Enabled:     false,
+				WindowStart: "08:00",
+				WindowEnd:   "09:00",
+			},
+			{
+				ID:          "ai-logistics",
+				TaskType:    "prompt",
+				Prompt:      "打开京东看看待收货物流并记入记忆",
+				Enabled:     true,
+				WindowStart: "12:00",
+				WindowEnd:   "12:30",
+				DeferOnGame: true,
+			},
+		},
+	}, nil, jm, filepath.Join(t.TempDir(), "sched_hist.json"), func(_ context.Context, jobName string, logFn func(string)) (any, error) {
+		workflowRuns.Add(1)
+		logFn("[JD 1/3] 领京豆签到")
+		return map[string]any{"job": jobName}, nil
+	}, nil)
+
+	sched.SetPromptRunner(func(ctx context.Context, prompt string) (any, error) {
+		return ag.Chat(ctx, prompt)
+	})
+
+	if err := sched.TriggerNow("non-existent"); err == nil {
+		t.Fatal("expected error for unknown schedule entry ID")
+	}
+
+	// 1. TriggerNow on custom AI prompt entry (must not self-deadlock on shared DeviceLease!)
+	if err := sched.TriggerNow("ai-logistics"); err != nil {
+		t.Fatalf("TriggerNow(ai-logistics) failed: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := sched.Status()
+		if len(st.Entries) == 2 && st.Entries[1].LastState == "completed" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	st := sched.Status()
+	if st.Entries[1].TaskType != "prompt" || st.Entries[1].LastState != "completed" {
+		t.Fatalf("expected prompt entry completed, got %+v", st.Entries[1])
+	}
+	if !strings.Contains(st.Entries[1].LastMessage, "顺丰派送中") {
+		t.Fatalf("expected AI reply summary in LastMessage, got %q", st.Entries[1].LastMessage)
+	}
+	if got, _ := seenUserMsg.Load().(string); got != "打开京东看看待收货物流并记入记忆" {
+		t.Fatalf("unexpected prompt sent to Agent: %q", got)
+	}
+	if len(ag.SavedTurns()) != 1 {
+		t.Fatalf("expected scheduled AI prompt turn persisted in Agent.SavedTurns(), got %d", len(ag.SavedTurns()))
+	}
+
+	// 2. TriggerNow on disabled workflow entry must also execute immediately.
+	if err := sched.TriggerNow("wf-entry"); err != nil {
+		t.Fatalf("TriggerNow(wf-entry) failed: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && workflowRuns.Load() == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if workflowRuns.Load() != 1 {
+		t.Fatalf("expected workflowRuns=1 after TriggerNow, got %d", workflowRuns.Load())
+	}
+
+	// 3. Scheduled Tick auto-triggers due prompt entry cleanly.
+	sched.UpdateConfig(config.ScheduleConfig{
+		Enabled: true,
+		Entries: []config.ScheduleEntry{
+			{
+				ID:          "auto-prompt",
+				TaskType:    "prompt",
+				Prompt:      "自动检查今日天气",
+				Enabled:     true,
+				WindowStart: "10:00",
+				WindowEnd:   "10:30",
+			},
+		},
+	})
+	dueNow := time.Date(2026, 11, 28, 10, 15, 0, 0, time.Local)
+	sched.mu.Lock()
+	sched.runtimes["auto-prompt"].plannedDate = "2026-11-28"
+	sched.runtimes["auto-prompt"].nextRunAt = time.Date(2026, 11, 28, 10, 5, 0, 0, time.Local)
+	sched.runtimes["auto-prompt"].windowEndTime = time.Date(2026, 11, 28, 10, 30, 0, 0, time.Local)
+	sched.mu.Unlock()
+
+	sched.Tick(context.Background(), dueNow)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s := sched.Status()
+		if len(s.Entries) == 1 && s.Entries[0].LastState == "completed" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if s := sched.Status(); s.Entries[0].LastState != "completed" || len(ag.SavedTurns()) != 2 {
+		t.Fatalf("expected auto-prompt Tick completed (turns=%d), got %+v", len(ag.SavedTurns()), s.Entries[0])
+	}
+}

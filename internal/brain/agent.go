@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -167,6 +171,21 @@ func (s *runEventStore) beginRun(runID, userMessage string) {
 	}
 }
 
+func (s *runEventStore) clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active {
+		return
+	}
+	s.runID = ""
+	s.userMessage = ""
+	s.finished = false
+	s.lastSeq = 0
+	s.accumText.Reset()
+	s.steps = nil
+	s.deltas = nil
+}
+
 func (s *runEventStore) emit(ev RunEvent) RunEvent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -292,6 +311,26 @@ func (s *runEventStore) collectAfterLocked(afterSeq int) []RunEvent {
 	return out
 }
 
+const (
+	maxSavedTurns            = 40
+	maxHydratedTurnExchanges = 12
+)
+
+// SavedTurn represents a completed, cancelled, or failed Agent turn persisted to chat_history.json
+// so /ui can render full rich historical timelines (including collapsible ToolTrace) across restarts.
+type SavedTurn struct {
+	RunID             string     `json:"run_id"`
+	Timestamp         string     `json:"timestamp"`
+	UserMessage       string     `json:"user_message"`
+	Reply             string     `json:"reply,omitempty"`
+	Error             string     `json:"error,omitempty"`
+	Cancelled         bool       `json:"cancelled,omitempty"`
+	ElapsedSec        float64    `json:"elapsed_sec"`
+	Steps             int        `json:"steps"`
+	NeedsConfirmation bool       `json:"needs_confirmation,omitempty"`
+	ToolTrace         []ToolStep `json:"tool_trace,omitempty"`
+}
+
 type ChatTurnResult struct {
 	RunID             string     `json:"run_id,omitempty"`
 	Reply             string     `json:"reply"`
@@ -316,18 +355,143 @@ type Agent struct {
 	memory      *MemoryStore
 	lease       *DeviceLease
 	history     []ChatMessage
+	historyFile string
+	savedTurns  []SavedTurn
 	events      *runEventStore
 	obsMu       sync.RWMutex
 	obsObserver EventSink
 }
 
 func NewAgent(cfg config.LLMConfig, exec ToolExecutor, g *guard.Guard) *Agent {
-	return &Agent{
+	a := &Agent{
 		cfg:    cfg,
 		exec:   exec,
 		guard:  g,
 		events: newRunEventStore(),
 	}
+	if envFile := strings.TrimSpace(os.Getenv("AGENT_CHAT_HISTORY_FILE")); envFile != "" {
+		a.SetHistoryFile(envFile)
+	}
+	return a
+}
+
+// SetHistoryFile binds a persistent JSON path (0600) for SavedTurns, loading existing turns
+// and hydrating in-memory LLM conversation context with up to the last 12 completed exchanges.
+func (a *Agent) SetHistoryFile(path string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.historyFile = strings.TrimSpace(path)
+	if a.historyFile == "" {
+		return
+	}
+	a.loadSavedTurnsLocked()
+}
+
+// SavedTurns returns a deep copy of the persisted rich conversation turns (up to 40).
+func (a *Agent) SavedTurns() []SavedTurn {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.savedTurns) == 0 {
+		return []SavedTurn{}
+	}
+	out := make([]SavedTurn, len(a.savedTurns))
+	for i, t := range a.savedTurns {
+		t.ToolTrace = sanitizeToolTrace(t.ToolTrace)
+		out[i] = t
+	}
+	return out
+}
+
+func sanitizeToolTrace(trace []ToolStep) []ToolStep {
+	if len(trace) == 0 {
+		return nil
+	}
+	out := make([]ToolStep, len(trace))
+	for i, st := range trace {
+		if isSensitiveTool(st.Tool) {
+			st.Summary = summarizeToolOutcome(st.Tool, ToolOutput{IsError: st.IsError})
+		}
+		out[i] = st
+	}
+	return out
+}
+
+func sanitizeSavedTurn(t SavedTurn) SavedTurn {
+	t.ToolTrace = sanitizeToolTrace(t.ToolTrace)
+	return t
+}
+
+func (a *Agent) loadSavedTurnsLocked() {
+	if a.historyFile == "" {
+		return
+	}
+	raw, err := os.ReadFile(a.historyFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) && len(a.savedTurns) > 0 {
+			a.persistSavedTurnsLocked()
+		}
+		return
+	}
+	var turns []SavedTurn
+	if err := json.Unmarshal(raw, &turns); err != nil {
+		return
+	}
+	if len(turns) > maxSavedTurns {
+		turns = turns[len(turns)-maxSavedTurns:]
+	}
+	cleaned := make([]SavedTurn, len(turns))
+	for i, t := range turns {
+		cleaned[i] = sanitizeSavedTurn(t)
+	}
+	a.savedTurns = cleaned
+
+	// Hydrate LLM context with up to the last ~12 completed user/assistant text exchanges.
+	var validExchanges []SavedTurn
+	for _, t := range cleaned {
+		if !t.Cancelled && t.Error == "" && strings.TrimSpace(t.UserMessage) != "" && strings.TrimSpace(t.Reply) != "" {
+			validExchanges = append(validExchanges, t)
+		}
+	}
+	if len(validExchanges) > maxHydratedTurnExchanges {
+		validExchanges = validExchanges[len(validExchanges)-maxHydratedTurnExchanges:]
+	}
+	if len(validExchanges) > 0 {
+		hydrated := make([]ChatMessage, 0, len(validExchanges)*2)
+		for _, t := range validExchanges {
+			hydrated = append(hydrated,
+				ChatMessage{Role: "user", Text: t.UserMessage},
+				ChatMessage{Role: "assistant", Text: t.Reply},
+			)
+		}
+		a.history = hydrated
+	}
+}
+
+func (a *Agent) persistSavedTurnsLocked() {
+	if a.historyFile == "" {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(a.historyFile), 0o700)
+	turns := a.savedTurns
+	if turns == nil {
+		turns = []SavedTurn{}
+	}
+	data, err := json.MarshalIndent(turns, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = writeAtomicFile(a.historyFile, append(data, '\n'), 0o600)
+}
+
+func (a *Agent) recordSavedTurn(t SavedTurn) {
+	t = sanitizeSavedTurn(t)
+	a.mu.Lock()
+	a.savedTurns = append(a.savedTurns, t)
+	if len(a.savedTurns) > maxSavedTurns {
+		a.savedTurns = append([]SavedTurn(nil), a.savedTurns[len(a.savedTurns)-maxSavedTurns:]...)
+	}
+	a.persistSavedTurnsLocked()
+	a.mu.Unlock()
 }
 
 func (a *Agent) SetDeviceLease(lease *DeviceLease) {
@@ -383,7 +547,15 @@ func (a *Agent) GetConfig() config.LLMConfig {
 func (a *Agent) ClearHistory() {
 	a.mu.Lock()
 	a.history = nil
+	a.savedTurns = nil
+	if a.historyFile != "" {
+		_ = os.MkdirAll(filepath.Dir(a.historyFile), 0o700)
+		_ = writeAtomicFile(a.historyFile, []byte("[]\n"), 0o600)
+	}
 	a.mu.Unlock()
+	if !a.IsRunning() {
+		a.events.clear()
+	}
 }
 
 func (a *Agent) History() []ChatMessage {
@@ -562,10 +734,21 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 		if reason != "" {
 			msg = fmt.Sprintf("任务已停止 (%s)", reason)
 		}
+		elapsed := float64(int(time.Since(t0).Seconds()*10)) / 10
+		a.recordSavedTurn(SavedTurn{
+			RunID:       runID,
+			Timestamp:   t0.Format(time.RFC3339),
+			UserMessage: userMessage,
+			Error:       msg,
+			Cancelled:   true,
+			ElapsedSec:  elapsed,
+			Steps:       steps,
+			ToolTrace:   trace,
+		})
 		a.dispatchEvent(sink, RunEvent{
 			Type:       "cancelled",
 			Error:      msg,
-			ElapsedSec: float64(int(time.Since(t0).Seconds()*10)) / 10,
+			ElapsedSec: elapsed,
 			Steps:      steps,
 			ToolsUsed:  toolsUsed,
 			ToolTrace:  trace,
@@ -580,10 +763,20 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 		if runCtx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(runCtx.Err(), context.Canceled)) {
 			return finishCancelled(err)
 		}
+		elapsed := float64(int(time.Since(t0).Seconds()*10)) / 10
+		a.recordSavedTurn(SavedTurn{
+			RunID:       runID,
+			Timestamp:   t0.Format(time.RFC3339),
+			UserMessage: userMessage,
+			Error:       err.Error(),
+			ElapsedSec:  elapsed,
+			Steps:       steps,
+			ToolTrace:   trace,
+		})
 		a.dispatchEvent(sink, RunEvent{
 			Type:       "error",
 			Error:      err.Error(),
-			ElapsedSec: float64(int(time.Since(t0).Seconds()*10)) / 10,
+			ElapsedSec: elapsed,
 			Steps:      steps,
 			ToolsUsed:  toolsUsed,
 			ToolTrace:  trace,
@@ -640,6 +833,16 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 				})
 			}
 			elapsed := float64(int(time.Since(t0).Seconds()*10)) / 10
+			a.recordSavedTurn(SavedTurn{
+				RunID:             runID,
+				Timestamp:         t0.Format(time.RFC3339),
+				UserMessage:       userMessage,
+				Reply:             resp.Text,
+				ElapsedSec:        elapsed,
+				Steps:             steps,
+				NeedsConfirmation: needsConfirm,
+				ToolTrace:         trace,
+			})
 			a.dispatchEvent(sink, RunEvent{
 				Type:              "done",
 				Step:              steps,
@@ -669,15 +872,15 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 				}
 			}
 			cat := classifyToolCategory(tc.Name)
-			uiDesc, islandShort := friendlyToolDescriptions(tc.Name, tc.Args)
+			toolLabel, actionDesc := friendlyToolDescriptions(tc.Name, tc.Args)
 			a.dispatchEvent(sink, RunEvent{
 				Type:     "tool_start",
 				Step:     steps,
 				MaxSteps: maxSteps,
 				Tool:     tc.Name,
 				Category: cat,
-				Label:    islandShort,
-				Summary:  uiDesc,
+				Label:    toolLabel,
+				Summary:  actionDesc,
 			})
 
 			toolsUsed = append(toolsUsed, tc.Name)
@@ -724,11 +927,14 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 			}
 
 			stepSum := summarizeToolOutcome(tc.Name, out)
+			if stepSum == "" {
+				stepSum = actionDesc
+			}
 			stepEntry := ToolStep{
 				Step:      len(trace) + 1,
 				Tool:      tc.Name,
 				Category:  cat,
-				Label:     uiDesc,
+				Label:     toolLabel,
 				Summary:   stepSum,
 				IsError:   out.IsError,
 				ElapsedMs: elapsedMs,
@@ -741,7 +947,7 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 				MaxSteps:  maxSteps,
 				Tool:      tc.Name,
 				Category:  cat,
-				Label:     uiDesc,
+				Label:     toolLabel,
 				Summary:   stepSum,
 				IsError:   out.IsError,
 				ElapsedMs: elapsedMs,
@@ -761,6 +967,16 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 	reply := "已达到单轮最大工具调用步数限制，请查看当前结果或继续指示下一步。"
 	elapsed := float64(int(time.Since(t0).Seconds()*10)) / 10
 	needsConfirm := replyNeedsConfirmation(reply)
+	a.recordSavedTurn(SavedTurn{
+		RunID:             runID,
+		Timestamp:         t0.Format(time.RFC3339),
+		UserMessage:       userMessage,
+		Reply:             reply,
+		ElapsedSec:        elapsed,
+		Steps:             steps,
+		NeedsConfirmation: needsConfirm,
+		ToolTrace:         trace,
+	})
 	a.dispatchEvent(sink, RunEvent{
 		Type:              "done",
 		Step:              steps,
@@ -782,59 +998,95 @@ func (a *Agent) runLocked(runCtx context.Context, cancel context.CancelFunc, lea
 	}, nil
 }
 
+// friendlyToolDescriptions returns (label, summary) with crisp, emoji-free Chinese text
+// suitable for both /ui ToolTrace timelines and HyperOS Super Island capsules.
 func friendlyToolDescriptions(toolName string, args map[string]any) (string, string) {
 	switch toolName {
 	case "phone_ui_tree":
-		return "正在解析当前界面控件树...", "读界面"
+		return "读取页面结构", "解析当前界面控件树"
 	case "phone_tap_node":
 		if id, ok := args["id"]; ok {
-			return fmt.Sprintf("正在点击控件 [%v]...", id), fmt.Sprintf("点#%v", id)
+			return "点击控件", fmt.Sprintf("点击节点 #%v", id)
 		}
-		return "正在点击界面控件...", "点控件"
+		return "点击控件", "点击界面控件"
 	case "phone_tap":
-		return fmt.Sprintf("正在点击坐标 (%v, %v)...", args["x"], args["y"]), "点击"
+		return "点击坐标", fmt.Sprintf("点击屏幕 (%v, %v)", args["x"], args["y"])
 	case "phone_long_press":
-		return fmt.Sprintf("正在长按坐标 (%v, %v)...", args["x"], args["y"]), "长按"
+		return "长按坐标", fmt.Sprintf("长按屏幕 (%v, %v)", args["x"], args["y"])
 	case "phone_scroll_node":
 		dir, _ := args["direction"].(string)
-		if dir == "" {
-			dir = "down"
-		}
-		return fmt.Sprintf("正在向 %s 滑动页面...", dir), "滑页面"
+		return "滑动页面", fmt.Sprintf("向%s滚动页面区域", friendlyDirection(dir))
 	case "phone_swipe":
-		return "正在执行拟人滑动...", "滑动"
+		return "滑动页面", "执行拟人滑动手势"
 	case "phone_input_text":
-		return "正在输入文本内容（已脱敏）...", "输入"
+		return "输入文本", "输入文本内容（已脱敏）"
+	case "phone_tap_and_type":
+		return "点击并输入", "聚焦输入框并填入文本（已脱敏）"
 	case "phone_clipboard_set":
-		return "正在写入剪贴板（已脱敏）...", "写剪贴板"
+		return "写入剪贴板", "写入剪贴板（已脱敏）"
 	case "phone_clipboard_get":
-		return "正在读取剪贴板...", "读剪贴板"
+		return "读取剪贴板", "读取剪贴板（已脱敏）"
 	case "phone_keyevent":
-		return fmt.Sprintf("正在发送按键 %v...", args["keycode"]), "按键"
+		return "系统按键", fmt.Sprintf("发送按键 %v", args["keycode"])
 	case "phone_screenshot":
-		return "正在截屏视觉兜底...", "截屏"
+		return "屏幕快照", "捕获 720p 屏幕画面"
 	case "phone_launch_app":
 		pkg, _ := args["package"].(string)
 		appName := friendlyPackageName(pkg)
-		return fmt.Sprintf("正在打开 %s...", appName), "开" + appName
+		return "打开应用", fmt.Sprintf("打开 %s", appName)
+	case "phone_open_deeplink":
+		pkg, _ := args["package"].(string)
+		if strings.TrimSpace(pkg) != "" {
+			return "跳转链接", fmt.Sprintf("跳转 %s 指定页面", friendlyPackageName(pkg))
+		}
+		return "跳转链接", "打开应用内深链页面"
 	case "phone_foreground_app":
-		return "正在查询前台应用...", "查前台"
+		return "查询前台", "查询当前前台应用"
+	case "phone_status":
+		return "设备状态", "检查设备与守护状态"
+	case "phone_notify":
+		return "系统通知", "发送本地状态通知"
 	case "cdp_list_sockets", "cdp_list_targets", "cdp_status":
-		return "正在探测 WebView CDP 页面...", "查DOM"
+		return "探测网页", "获取 WebView CDP 页面目标"
 	case "cdp_command":
-		return fmt.Sprintf("正在执行 CDP %v...", args["method"]), "控DOM"
+		method, _ := args["method"].(string)
+		if method == "" {
+			return "操作网页", "执行 WebView CDP 指令"
+		}
+		return "操作网页", fmt.Sprintf("执行 CDP %s", method)
 	case "read_memory":
-		return "正在读取端侧记忆...", "读记忆"
+		file, _ := args["file"].(string)
+		if strings.TrimSpace(file) != "" {
+			return "读取记忆", fmt.Sprintf("读取记忆 %s", strings.TrimSpace(file))
+		}
+		return "读取记忆", "读取端侧记忆"
 	case "append_memory":
-		return "正在写入端侧记忆...", "写记忆"
+		file, _ := args["file"].(string)
+		if strings.TrimSpace(file) != "" {
+			return "写入记忆", fmt.Sprintf("写入 %s", strings.TrimSpace(file))
+		}
+		return "写入记忆", "写入端侧记忆"
 	case "run_daily_all":
-		return "正在运行每日一键全清 (0-Token)...", "全清"
+		return "全套日常任务", "运行微软积分与京东日常工作流"
 	case "run_ms_rewards":
-		return "正在运行微软积分任务...", "微软分"
+		return "微软积分任务", "运行 Edge 与 Bing 积分工作流"
 	case "run_jd_daily":
-		return "正在运行京东日常任务...", "京东豆"
+		return "京东日常任务", "运行东东农场与京豆签到工作流"
 	default:
-		return fmt.Sprintf("正在调用 %s...", toolName), toolName
+		return toolName, fmt.Sprintf("调用 %s", toolName)
+	}
+}
+
+func friendlyDirection(dir string) string {
+	switch strings.ToLower(strings.TrimSpace(dir)) {
+	case "up":
+		return "上"
+	case "left":
+		return "左"
+	case "right":
+		return "右"
+	default:
+		return "下"
 	}
 }
 
@@ -867,7 +1119,7 @@ func classifyToolCategory(name string) string {
 	switch name {
 	case "phone_ui_tree":
 		return "ui_tree"
-	case "phone_tap", "phone_long_press", "phone_swipe", "phone_tap_node", "phone_scroll_node":
+	case "phone_tap", "phone_long_press", "phone_swipe", "phone_tap_node", "phone_scroll_node", "phone_tap_and_type":
 		return "touch"
 	case "phone_screenshot":
 		return "vision"
@@ -884,11 +1136,33 @@ func classifyToolCategory(name string) string {
 
 func isSensitiveTool(name string) bool {
 	switch name {
-	case "phone_input_text", "phone_clipboard_set", "phone_clipboard_get":
+	case "phone_input_text", "phone_clipboard_set", "phone_clipboard_get", "phone_tap_and_type":
 		return true
 	default:
 		return false
 	}
+}
+
+func redactSensitiveToolCalls(calls []ToolCall) []ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]ToolCall, len(calls))
+	for i, tc := range calls {
+		if len(tc.Args) > 0 {
+			cpArgs := make(map[string]any, len(tc.Args))
+			for k, v := range tc.Args {
+				if isSensitiveTool(tc.Name) && (k == "text" || k == "value" || k == "content") {
+					cpArgs[k] = "[REDACTED]"
+				} else {
+					cpArgs[k] = v
+				}
+			}
+			tc.Args = cpArgs
+		}
+		out[i] = tc
+	}
+	return out
 }
 
 func summarizeToolOutcome(toolName string, out ToolOutput) string {
@@ -899,25 +1173,79 @@ func summarizeToolOutcome(toolName string, out ToolOutput) string {
 		switch toolName {
 		case "phone_input_text":
 			return "已输入文本（内容已脱敏）"
+		case "phone_tap_and_type":
+			return "已点击并输入文本（内容已脱敏）"
 		case "phone_clipboard_set":
 			return "剪贴板已写入（内容已脱敏）"
 		case "phone_clipboard_get":
 			return "已读取剪贴板（内容已脱敏）"
 		}
-		return "[敏感内容已脱敏]"
+		return "敏感内容已脱敏"
 	}
 	if len(out.ImageJPEG) > 0 {
-		return fmt.Sprintf("截屏视觉图像 (%d KB)", len(out.ImageJPEG)/1024)
+		kb := len(out.ImageJPEG) / 1024
+		if kb <= 0 {
+			kb = 1
+		}
+		return fmt.Sprintf("屏幕快照 (%d KB)", kb)
 	}
-	first := strings.TrimSpace(out.Text)
+	trimmed := strings.TrimSpace(out.Text)
+	if trimmed == "" {
+		if out.IsError {
+			return "执行出错"
+		}
+		return "已完成"
+	}
+	if strings.HasPrefix(trimmed, "{") {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(trimmed), &obj); err == nil {
+			if errMsg, ok := obj["error"].(string); ok && strings.TrimSpace(errMsg) != "" {
+				return truncateSummaryRunes("错误: "+strings.TrimSpace(errMsg), 68)
+			}
+			switch toolName {
+			case "phone_tap_node":
+				if node, ok := obj["node"].(map[string]any); ok {
+					lbl, _ := node["label"].(string)
+					if strings.TrimSpace(lbl) != "" {
+						return truncateSummaryRunes(fmt.Sprintf("已点击「%s」", strings.TrimSpace(lbl)), 68)
+					}
+				}
+			case "phone_foreground_app":
+				if pkg, ok := obj["package"].(string); ok && strings.TrimSpace(pkg) != "" {
+					return fmt.Sprintf("前台应用: %s", friendlyPackageName(pkg))
+				}
+			case "phone_launch_app":
+				if pkg, ok := obj["package"].(string); ok && strings.TrimSpace(pkg) != "" {
+					return fmt.Sprintf("已启动 %s", friendlyPackageName(pkg))
+				}
+			case "phone_status":
+				if g, ok := obj["guard"].(map[string]any); ok {
+					if st, ok := g["state"].(string); ok && st != "" {
+						return fmt.Sprintf("设备就绪 · 守护 %s", st)
+					}
+				}
+			}
+		}
+	}
+	first := trimmed
 	if idx := strings.IndexByte(first, '\n'); idx >= 0 {
 		first = strings.TrimSpace(first[:idx])
 	}
-	r := []rune(first)
-	if len(r) > 72 {
-		return string(r[:71]) + "…"
+	if toolName == "phone_ui_tree" {
+		lines := strings.Split(trimmed, "\n")
+		if len(lines) > 1 {
+			return truncateSummaryRunes(fmt.Sprintf("%s · %d 行节点", strings.TrimSpace(lines[0]), len(lines)-1), 68)
+		}
 	}
-	return first
+	return truncateSummaryRunes(first, 68)
+}
+
+func truncateSummaryRunes(s string, maxRunes int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) > maxRunes {
+		return string(r[:maxRunes-1]) + "…"
+	}
+	return string(r)
 }
 
 var confirmNegationMarkers = []string{
@@ -1019,10 +1347,17 @@ func compactInFlightHistory(history []ChatMessage) {
 }
 
 func (a *Agent) saveHistory(h []ChatMessage) {
-	// Strip all ImageJPEG blobs so old screenshots are never re-uploaded on future turns.
+	// Strip all ImageJPEG blobs and redact sensitive tool args/outputs so neither screenshots
+	// nor passwords/clipboard contents are ever retained in memory or re-uploaded on future turns.
 	cleaned := make([]ChatMessage, len(h))
 	for i, m := range h {
 		m.ImageJPEG = nil
+		if len(m.ToolCalls) > 0 {
+			m.ToolCalls = redactSensitiveToolCalls(m.ToolCalls)
+		}
+		if m.Role == "tool" && isSensitiveTool(m.ToolName) {
+			m.Text = summarizeToolOutcome(m.ToolName, ToolOutput{IsError: false})
+		}
 		cleaned[i] = m
 	}
 	h = cleaned
@@ -1083,25 +1418,108 @@ func (a *Agent) saveHistory(h []ChatMessage) {
 	a.mu.Unlock()
 }
 
-// JobStatus represents the current/last background automation job started from /ui or API.
+const (
+	maxJobLogs       = 300
+	maxRecentJobLogs = 80
+)
+
+// WorkflowProgressEvent carries structured real-time stage & percentage updates from JobManager
+// to subscribers such as IslandController (Super Island) and WebUI status consumers.
+type WorkflowProgressEvent struct {
+	Job   string `json:"job"`
+	Step  int    `json:"step"`
+	Total int    `json:"total"`
+	Pct   int    `json:"pct"`
+	Stage string `json:"stage"`
+	Done  bool   `json:"done"`
+	Err   string `json:"err,omitempty"`
+}
+
+// JobStatus represents the current/last background automation job started from /ui, Cron, or API.
 type JobStatus struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	State      string   `json:"state"` // "idle" | "running" | "completed" | "failed" | "cancelled"
-	StartedAt  string   `json:"started_at,omitempty"`
-	FinishedAt string   `json:"finished_at,omitempty"`
-	ElapsedSec float64  `json:"elapsed_sec,omitempty"`
-	Logs       []string `json:"logs,omitempty"`
-	Result     any      `json:"result,omitempty"`
-	Error      string   `json:"error,omitempty"`
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	State        string   `json:"state"` // "idle" | "running" | "completed" | "failed" | "cancelled"
+	StartedAt    string   `json:"started_at,omitempty"`
+	FinishedAt   string   `json:"finished_at,omitempty"`
+	ElapsedSec   float64  `json:"elapsed_sec,omitempty"`
+	Step         int      `json:"step,omitempty"`
+	TotalSteps   int      `json:"total_steps,omitempty"`
+	ProgressPct  int      `json:"progress_pct,omitempty"`
+	CurrentStage string   `json:"current_stage,omitempty"`
+	RecentLogs   []string `json:"recent_logs,omitempty"`
+	Logs         []string `json:"logs,omitempty"`
+	Result       any      `json:"result,omitempty"`
+	Error        string   `json:"error,omitempty"`
+}
+
+// JobSnapshot aliases JobStatus for callers referencing snapshot terminology.
+type JobSnapshot = JobStatus
+
+var (
+	workflowStageMarkerRe = regexp.MustCompile(`^\s*\[(?:[^\]]*?\s+)?(\d+)\s*/\s*(\d+)\]\s*(.+)$`)
+	workflowSubCounterRe  = regexp.MustCompile(`[（(]\s*(\d+)\s*/\s*(\d+)`)
+)
+
+func parseWorkflowStageLine(line string) (step, total, pct int, stage string, ok bool) {
+	m := workflowStageMarkerRe.FindStringSubmatch(strings.TrimSpace(line))
+	if len(m) != 4 {
+		return 0, 0, 0, "", false
+	}
+	step, err1 := strconv.Atoi(m[1])
+	total, err2 := strconv.Atoi(m[2])
+	if err1 != nil || err2 != nil || total <= 0 || step <= 0 {
+		return 0, 0, 0, "", false
+	}
+	if step > total {
+		step = total
+	}
+	stage = strings.TrimSpace(m[3])
+	baseLow := (step - 1) * 100 / total
+	baseHigh := step * 100 / total
+	span := baseHigh - baseLow
+
+	if sub := workflowSubCounterRe.FindStringSubmatch(stage); len(sub) == 3 {
+		cur, e1 := strconv.Atoi(sub[1])
+		capV, e2 := strconv.Atoi(sub[2])
+		if e1 == nil && e2 == nil && capV > 0 {
+			if cur < 0 {
+				cur = 0
+			}
+			if cur > capV {
+				cur = capV
+			}
+			pct = baseLow + (cur*span)/capV
+		} else {
+			pct = baseLow + span/4
+		}
+	} else {
+		pct = baseLow + span/3
+		if pct == 0 {
+			pct = 5
+		}
+	}
+	if pct > 99 {
+		pct = 99
+	}
+	if pct < 0 {
+		pct = 0
+	}
+	return step, total, pct, stage, true
 }
 
 type JobManager struct {
-	mu     sync.Mutex
-	seq    int
-	status JobStatus
-	cancel context.CancelFunc
-	lease  *DeviceLease
+	mu             sync.Mutex
+	seq            int
+	status         JobStatus
+	startedTime    time.Time
+	cancel         context.CancelFunc
+	lease          *DeviceLease
+	notifyProgress bool
+	doneEmitted    bool
+
+	obsMu       sync.RWMutex
+	progressObs func(WorkflowProgressEvent)
 }
 
 func NewJobManager() *JobManager {
@@ -1116,7 +1534,40 @@ func (jm *JobManager) SetDeviceLease(lease *DeviceLease) {
 	jm.mu.Unlock()
 }
 
+func (jm *JobManager) SetProgressObserver(fn func(WorkflowProgressEvent)) {
+	jm.obsMu.Lock()
+	jm.progressObs = fn
+	jm.obsMu.Unlock()
+}
+
+func (jm *JobManager) emitProgress(ev WorkflowProgressEvent) {
+	jm.obsMu.RLock()
+	obs := jm.progressObs
+	jm.obsMu.RUnlock()
+	if obs != nil {
+		obs(ev)
+	}
+}
+
+func appendBoundedLog(slice []string, entry string, limit int) []string {
+	slice = append(slice, entry)
+	if len(slice) > limit {
+		out := make([]string, limit)
+		copy(out, slice[len(slice)-limit:])
+		return out
+	}
+	return slice
+}
+
 func (jm *JobManager) Start(name string, fn func(ctx context.Context, logFn func(string)) (any, error)) (JobStatus, error) {
+	return jm.startInternal(name, true, true, fn)
+}
+
+func (jm *JobManager) startPromptJob(name string, fn func(ctx context.Context, logFn func(string)) (any, error)) (JobStatus, error) {
+	return jm.startInternal(name, false, false, fn)
+}
+
+func (jm *JobManager) startInternal(name string, acquireLease, notifyProgress bool, fn func(ctx context.Context, logFn func(string)) (any, error)) (JobStatus, error) {
 	jm.mu.Lock()
 	if jm.status.State == "running" {
 		cur := jm.copyStatusLocked()
@@ -1125,31 +1576,57 @@ func (jm *JobManager) Start(name string, fn func(ctx context.Context, logFn func
 	}
 	lease := jm.lease
 	leaseOwner := "job:" + name
-	if holder, ok := lease.TryLock(leaseOwner); !ok {
-		cur := jm.copyStatusLocked()
-		jm.mu.Unlock()
-		return cur, fmt.Errorf("device busy (%s is running)", holder)
+	if acquireLease {
+		if holder, ok := lease.TryLock(leaseOwner); !ok {
+			cur := jm.copyStatusLocked()
+			jm.mu.Unlock()
+			return cur, fmt.Errorf("device busy (%s is running)", holder)
+		}
+	} else if lease != nil {
+		if holder := lease.Owner(); holder != "" {
+			cur := jm.copyStatusLocked()
+			jm.mu.Unlock()
+			return cur, fmt.Errorf("device busy (%s is running)", holder)
+		}
 	}
+
 	jm.seq++
 	id := fmt.Sprintf("job-%d", jm.seq)
 	ctx, cancel := context.WithCancel(context.Background())
 	jm.cancel = cancel
 	now := time.Now()
+	jm.startedTime = now
+	jm.notifyProgress = notifyProgress
+	jm.doneEmitted = false
+	firstLog := fmt.Sprintf("[%s] started %s", now.Format("15:04:05"), name)
 	jm.status = JobStatus{
-		ID:        id,
-		Name:      name,
-		State:     "running",
-		StartedAt: now.Format(time.RFC3339),
-		Logs:      []string{fmt.Sprintf("[%s] started %s", now.Format("15:04:05"), name)},
+		ID:           id,
+		Name:         name,
+		State:        "running",
+		StartedAt:    now.Format(time.RFC3339),
+		CurrentStage: "正在启动",
+		RecentLogs:   []string{firstLog},
+		Logs:         []string{firstLog},
 	}
 	snap := jm.copyStatusLocked()
 	jm.mu.Unlock()
+
+	if notifyProgress {
+		jm.emitProgress(WorkflowProgressEvent{
+			Job:   name,
+			Step:  0,
+			Total: 0,
+			Pct:   0,
+			Stage: "正在启动",
+			Done:  false,
+		})
+	}
 
 	go func() {
 		defer cancel()
 		released := false
 		releaseLease := func() {
-			if !released {
+			if acquireLease && !released {
 				released = true
 				lease.Unlock(leaseOwner)
 			}
@@ -1157,7 +1634,7 @@ func (jm *JobManager) Start(name string, fn func(ctx context.Context, logFn func
 		defer releaseLease()
 
 		logFn := func(line string) {
-			jm.appendLog(id, line)
+			jm.appendLogForID(id, line)
 		}
 		res, err := fn(ctx, logFn)
 		releaseLease()
@@ -1166,53 +1643,249 @@ func (jm *JobManager) Start(name string, fn func(ctx context.Context, logFn func
 	return snap, nil
 }
 
-func (jm *JobManager) appendLog(id, line string) {
+// AppendLog appends a timestamped line to the active job's RecentLogs (ring buffer of 80)
+// and auto-parses `[step/total]` stage markers to drive live progress percentages.
+func (jm *JobManager) AppendLog(line string) {
 	jm.mu.Lock()
-	defer jm.mu.Unlock()
-	if jm.status.ID != id {
+	id := jm.status.ID
+	running := jm.status.State == "running"
+	jm.mu.Unlock()
+	if !running || id == "" {
+		return
+	}
+	jm.appendLogForID(id, line)
+}
+
+func (jm *JobManager) appendLogForID(id, line string) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return
+	}
+	var ev *WorkflowProgressEvent
+	jm.mu.Lock()
+	if jm.status.ID != id || jm.status.State != "running" {
+		jm.mu.Unlock()
 		return
 	}
 	entry := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), line)
-	jm.status.Logs = append(jm.status.Logs, entry)
-	if len(jm.status.Logs) > 300 {
-		jm.status.Logs = jm.status.Logs[len(jm.status.Logs)-300:]
+	jm.status.Logs = appendBoundedLog(jm.status.Logs, entry, maxJobLogs)
+	jm.status.RecentLogs = appendBoundedLog(jm.status.RecentLogs, entry, maxRecentJobLogs)
+
+	if step, total, pct, stage, ok := parseWorkflowStageLine(line); ok {
+		jm.status.Step = step
+		jm.status.TotalSteps = total
+		if pct > jm.status.ProgressPct {
+			jm.status.ProgressPct = pct
+		}
+		jm.status.CurrentStage = stage
+		if jm.notifyProgress {
+			ev = &WorkflowProgressEvent{
+				Job:   jm.status.Name,
+				Step:  jm.status.Step,
+				Total: jm.status.TotalSteps,
+				Pct:   jm.status.ProgressPct,
+				Stage: jm.status.CurrentStage,
+				Done:  false,
+			}
+		}
+	}
+	jm.mu.Unlock()
+
+	if ev != nil {
+		jm.emitProgress(*ev)
+	}
+}
+
+// UpdateProgress explicitly updates step/total/pct/stage on the currently running job
+// and notifies any registered ProgressObserver.
+func (jm *JobManager) UpdateProgress(step, total, pct int, stage string) {
+	var ev *WorkflowProgressEvent
+	jm.mu.Lock()
+	if jm.status.State != "running" {
+		jm.mu.Unlock()
+		return
+	}
+	if step >= 0 {
+		jm.status.Step = step
+	}
+	if total >= 0 {
+		jm.status.TotalSteps = total
+	}
+	if pct < 0 {
+		if total > 0 && step > 0 {
+			pct = (step * 100) / total
+		} else {
+			pct = jm.status.ProgressPct
+		}
+	}
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	jm.status.ProgressPct = pct
+	if strings.TrimSpace(stage) != "" {
+		jm.status.CurrentStage = strings.TrimSpace(stage)
+	}
+	if jm.notifyProgress {
+		ev = &WorkflowProgressEvent{
+			Job:   jm.status.Name,
+			Step:  jm.status.Step,
+			Total: jm.status.TotalSteps,
+			Pct:   jm.status.ProgressPct,
+			Stage: jm.status.CurrentStage,
+			Done:  false,
+		}
+	}
+	jm.mu.Unlock()
+
+	if ev != nil {
+		jm.emitProgress(*ev)
 	}
 }
 
 func (jm *JobManager) finish(id string, started time.Time, res any, err error) {
+	var ev *WorkflowProgressEvent
 	jm.mu.Lock()
-	defer jm.mu.Unlock()
 	if jm.status.ID != id {
+		jm.mu.Unlock()
 		return
 	}
 	jm.cancel = nil
-	jm.status.FinishedAt = time.Now().Format(time.RFC3339)
-	jm.status.ElapsedSec = float64(int(time.Since(started).Seconds()*10)) / 10
+	now := time.Now()
+	jm.status.FinishedAt = now.Format(time.RFC3339)
+	jm.status.ElapsedSec = float64(int(now.Sub(started).Seconds()*10)) / 10
 	jm.status.Result = res
+
+	if jm.status.State == "cancelled" {
+		if err != nil && jm.status.Error == "" {
+			jm.status.Error = err.Error()
+		}
+		endEntry := fmt.Sprintf("[%s] ended (cancelled)", now.Format("15:04:05"))
+		jm.status.Logs = appendBoundedLog(jm.status.Logs, endEntry, maxJobLogs)
+		jm.status.RecentLogs = appendBoundedLog(jm.status.RecentLogs, endEntry, maxRecentJobLogs)
+		if jm.notifyProgress && !jm.doneEmitted {
+			jm.doneEmitted = true
+			ev = &WorkflowProgressEvent{
+				Job:   jm.status.Name,
+				Step:  jm.status.Step,
+				Total: jm.status.TotalSteps,
+				Pct:   jm.status.ProgressPct,
+				Stage: "已取消",
+				Done:  true,
+				Err:   jm.status.Error,
+			}
+		}
+		jm.mu.Unlock()
+		if ev != nil {
+			jm.emitProgress(*ev)
+		}
+		return
+	}
+
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			jm.status.State = "cancelled"
+			jm.status.CurrentStage = "已取消"
 		} else {
 			jm.status.State = "failed"
+			jm.status.CurrentStage = "执行失败"
 		}
 		jm.status.Error = err.Error()
-		jm.status.Logs = append(jm.status.Logs, fmt.Sprintf("[%s] ended (%s): %v", time.Now().Format("15:04:05"), jm.status.State, err))
+		endEntry := fmt.Sprintf("[%s] ended (%s): %v", now.Format("15:04:05"), jm.status.State, err)
+		jm.status.Logs = appendBoundedLog(jm.status.Logs, endEntry, maxJobLogs)
+		jm.status.RecentLogs = appendBoundedLog(jm.status.RecentLogs, endEntry, maxRecentJobLogs)
+		if jm.notifyProgress && !jm.doneEmitted {
+			jm.doneEmitted = true
+			ev = &WorkflowProgressEvent{
+				Job:   jm.status.Name,
+				Step:  jm.status.Step,
+				Total: jm.status.TotalSteps,
+				Pct:   jm.status.ProgressPct,
+				Stage: jm.status.CurrentStage,
+				Done:  true,
+				Err:   jm.status.Error,
+			}
+		}
 	} else {
 		jm.status.State = "completed"
-		jm.status.Logs = append(jm.status.Logs, fmt.Sprintf("[%s] completed in %.1fs", time.Now().Format("15:04:05"), jm.status.ElapsedSec))
+		jm.status.ProgressPct = 100
+		if jm.status.TotalSteps > 0 {
+			jm.status.Step = jm.status.TotalSteps
+		}
+		jm.status.CurrentStage = "已完成"
+		endEntry := fmt.Sprintf("[%s] completed in %.1fs", now.Format("15:04:05"), jm.status.ElapsedSec)
+		jm.status.Logs = appendBoundedLog(jm.status.Logs, endEntry, maxJobLogs)
+		jm.status.RecentLogs = appendBoundedLog(jm.status.RecentLogs, endEntry, maxRecentJobLogs)
+		if jm.notifyProgress && !jm.doneEmitted {
+			jm.doneEmitted = true
+			ev = &WorkflowProgressEvent{
+				Job:   jm.status.Name,
+				Step:  jm.status.Step,
+				Total: jm.status.TotalSteps,
+				Pct:   100,
+				Stage: "已完成",
+				Done:  true,
+			}
+		}
+	}
+	jm.mu.Unlock()
+
+	if ev != nil {
+		jm.emitProgress(*ev)
 	}
 }
 
-func (jm *JobManager) Cancel(reason string) bool {
+// Cancel immediately cancels the running workflow context and marks status "cancelled".
+// Accepts an optional reason string for backward compatibility with both Cancel() and Cancel(reason).
+func (jm *JobManager) Cancel(reasons ...string) bool {
+	reason := strings.TrimSpace(strings.Join(reasons, "; "))
+	var ev *WorkflowProgressEvent
 	jm.mu.Lock()
-	defer jm.mu.Unlock()
 	if jm.status.State != "running" || jm.cancel == nil {
+		jm.mu.Unlock()
 		return false
 	}
-	if reason != "" {
-		jm.status.Logs = append(jm.status.Logs, fmt.Sprintf("[%s] cancelling: %s", time.Now().Format("15:04:05"), reason))
+	cancelFn := jm.cancel
+	jm.cancel = nil
+	now := time.Now()
+	jm.status.State = "cancelled"
+	jm.status.FinishedAt = now.Format(time.RFC3339)
+	if !jm.startedTime.IsZero() {
+		jm.status.ElapsedSec = float64(int(now.Sub(jm.startedTime).Seconds()*10)) / 10
 	}
-	jm.cancel()
+	jm.status.CurrentStage = "已取消"
+	if reason != "" {
+		jm.status.Error = reason
+	} else {
+		jm.status.Error = "cancelled"
+	}
+	logMsg := "cancelled"
+	if reason != "" {
+		logMsg = "cancelled: " + reason
+	}
+	entry := fmt.Sprintf("[%s] %s", now.Format("15:04:05"), logMsg)
+	jm.status.Logs = appendBoundedLog(jm.status.Logs, entry, maxJobLogs)
+	jm.status.RecentLogs = appendBoundedLog(jm.status.RecentLogs, entry, maxRecentJobLogs)
+	if jm.notifyProgress && !jm.doneEmitted {
+		jm.doneEmitted = true
+		ev = &WorkflowProgressEvent{
+			Job:   jm.status.Name,
+			Step:  jm.status.Step,
+			Total: jm.status.TotalSteps,
+			Pct:   jm.status.ProgressPct,
+			Stage: "已取消",
+			Done:  true,
+			Err:   jm.status.Error,
+		}
+	}
+	jm.mu.Unlock()
+
+	cancelFn()
+	if ev != nil {
+		jm.emitProgress(*ev)
+	}
 	return true
 }
 
@@ -1224,9 +1897,16 @@ func (jm *JobManager) Status() JobStatus {
 
 func (jm *JobManager) copyStatusLocked() JobStatus {
 	cp := jm.status
+	if cp.State == "running" && !jm.startedTime.IsZero() {
+		cp.ElapsedSec = float64(int(time.Since(jm.startedTime).Seconds()*10)) / 10
+	}
 	if len(jm.status.Logs) > 0 {
 		cp.Logs = make([]string, len(jm.status.Logs))
 		copy(cp.Logs, jm.status.Logs)
+	}
+	if len(jm.status.RecentLogs) > 0 {
+		cp.RecentLogs = make([]string, len(jm.status.RecentLogs))
+		copy(cp.RecentLogs, jm.status.RecentLogs)
 	}
 	return cp
 }

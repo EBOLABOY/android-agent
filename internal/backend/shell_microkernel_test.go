@@ -144,6 +144,55 @@ func TestShellBackendCancelLiveProgressSkipsColdStart(t *testing.T) {
 	}
 }
 
+func TestShellBackendUpdateLiveProgressForwardsV040Fields(t *testing.T) {
+	be := NewShellBackend("", time.Second)
+	defer be.StopMicroKernel("test cleanup")
+
+	reqFile := filepath.Join(t.TempDir(), "last_req.json")
+	be.kernel.cmdFactory = func(_ string, _ bool) *exec.Cmd {
+		script := fmt.Sprintf(`while IFS= read -r line; do printf '%%s' "$line" > %q; printf '{"ok":true}\n'; done`, reqFile)
+		return exec.Command("/bin/sh", "-c", script)
+	}
+
+	err := be.UpdateLiveProgress(context.Background(), LiveProgressSpec{
+		Tag:       "agent_live",
+		ID:        9900,
+		State:     "workflow",
+		Title:     "微软积分 · 65%",
+		Text:      "阶段 2/4 · 正在执行必应搜索",
+		ShortText: "积分 65%",
+		SubText:   "任务",
+		Step:      13,
+		Max:       20,
+		Progress:  65,
+		ClickURI:  "http://127.0.0.1:8765/ui",
+		Focus:     true,
+		Ongoing:   true,
+	})
+	if err != nil {
+		t.Fatalf("UpdateLiveProgress failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(reqFile)
+	if err != nil {
+		t.Fatalf("read captured request failed: %v", err)
+	}
+	got := string(raw)
+	for _, want := range []string{
+		`"cmd":"notify_progress"`,
+		`"state":"workflow"`,
+		`"progress":65`,
+		`"click_uri":"http://127.0.0.1:8765/ui"`,
+		`"short_text":"积分 65%"`,
+		`"focus":true`,
+		`"ongoing":true`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected request JSON to contain %s, got: %s", want, got)
+		}
+	}
+}
+
 func TestMicroKernelAppErrorDoesNotKillHealthyJVM(t *testing.T) {
 	mk := NewMicroKernel(nil, 2*time.Second)
 	defer mk.Stop("test cleanup")

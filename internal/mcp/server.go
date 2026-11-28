@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -33,7 +34,7 @@ import (
 
 const (
 	ServerName          = "android-agent"
-	ServerVersion       = "0.3.5"
+	ServerVersion       = "0.4.0"
 	DefaultProtoVersion = "2025-03-26"
 	mcpSessionTTL       = 2 * time.Hour
 )
@@ -49,12 +50,15 @@ func (a *backendIslandAdapter) UpdateLiveProgress(ctx context.Context, u brain.L
 	return a.be.UpdateLiveProgress(ctx, backend.LiveProgressSpec{
 		Tag:       u.Tag,
 		ID:        u.ID,
+		State:     u.State,
 		Title:     u.Title,
 		Text:      u.Text,
 		ShortText: u.ShortText,
 		SubText:   u.SubText,
 		Step:      u.Step,
 		Max:       u.Max,
+		Progress:  u.Progress,
+		ClickURI:  u.ClickURI,
 		Focus:     u.Focus,
 		Ongoing:   u.Ongoing,
 	})
@@ -133,12 +137,25 @@ func NewServer(cfg *config.Config, be backend.DeviceBackend, g *guard.Guard, cdp
 	_ = s.memory.EnsureDefaults()
 	s.agent = brain.NewAgent(cfg.LLM, s, g)
 	s.agent.SetMemoryStore(s.memory)
+	if strings.TrimSpace(cfg.MemoryDir) != "" {
+		s.agent.SetHistoryFile(filepath.Join(filepath.Dir(strings.TrimSpace(cfg.MemoryDir)), "chat_history.json"))
+	}
 	lease := brain.NewDeviceLease()
 	s.agent.SetDeviceLease(lease)
 	s.jobs.SetDeviceLease(lease)
 	s.island = brain.NewIslandController(&backendIslandAdapter{be: be})
 	s.agent.SetEventObserver(s.island.HandleEvent)
+	s.jobs.SetProgressObserver(func(ev brain.WorkflowProgressEvent) {
+		step, total := ev.Step, ev.Total
+		if ev.Pct > 0 || ev.Done {
+			step, total = ev.Pct, 100
+		}
+		s.island.HandleWorkflowProgress(ev.Job, step, total, ev.Stage, ev.Done, ev.Err)
+	})
 	s.scheduler = brain.NewScheduler(cfg.Schedule, g, s.jobs, "", s.runWorkflowJob, logger)
+	s.scheduler.SetPromptRunner(func(ctx context.Context, prompt string) (any, error) {
+		return s.agent.Chat(ctx, prompt)
+	})
 	if u, ok := be.(interface{ IsScreenUnlocked(context.Context) bool }); ok {
 		s.scheduler.SetScreenUnlockChecker(u.IsScreenUnlocked)
 	}
@@ -147,6 +164,7 @@ func NewServer(cfg *config.Config, be backend.DeviceBackend, g *guard.Guard, cdp
 	apiMux.HandleFunc("/mcp", s.handleMCP)
 	apiMux.HandleFunc("/health", s.handleStatus)
 	apiMux.HandleFunc("/api/v1/status", s.handleStatus)
+	apiMux.HandleFunc("/api/v1/bootstrap", s.handleBootstrap)
 	apiMux.HandleFunc("/api/v1/pause", s.handlePause)
 	apiMux.HandleFunc("/api/v1/resume", s.handleResume)
 	apiMux.HandleFunc("/api/v1/jobs/current", s.handleJobCurrent)
@@ -159,8 +177,13 @@ func NewServer(cfg *config.Config, be backend.DeviceBackend, g *guard.Guard, cdp
 	apiMux.HandleFunc("/api/v1/chat/history", s.handleChatHistory)
 	apiMux.HandleFunc("/api/v1/chat/clear", s.handleChatClear)
 	apiMux.HandleFunc("/api/v1/llm/config", s.handleLLMConfig)
+	apiMux.HandleFunc("/api/v1/llm/test", s.handleLLMTest)
 	apiMux.HandleFunc("/api/v1/memory", s.handleMemory)
 	apiMux.HandleFunc("/api/v1/schedule", s.handleSchedule)
+	apiMux.HandleFunc("/api/v1/schedule/run", s.handleScheduleRun)
+	apiMux.HandleFunc("/api/v1/screen/preview", s.handleScreenPreview)
+	apiMux.HandleFunc("/api/v1/screen/action", s.handleScreenAction)
+	apiMux.HandleFunc("/api/v1/island/test", s.handleIslandTest)
 
 	authedAPI := s.authMiddleware(apiMux)
 	rootMux := http.NewServeMux()
@@ -292,6 +315,7 @@ func (s *Server) Close() {
 	}
 	if s.island != nil {
 		s.island.ClearImmediate("server shutdown")
+		s.island.Close()
 	}
 	if s.backend != nil {
 		s.backend.StopMicroKernel("server shutdown")
@@ -616,8 +640,19 @@ func (s *Server) handleJobCancel(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	cancelled := s.jobs.Cancel("manual UI cancel")
-	writeJSON(w, http.StatusOK, map[string]any{"cancelled": cancelled, "job": s.jobs.Status()})
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body)
+	reason := strings.TrimSpace(body.Reason)
+	if reason == "" {
+		reason = "manual UI cancel"
+	}
+	cancelled := s.jobs.Cancel(reason)
+	if s.island != nil && cancelled && !s.agent.IsRunning() {
+		s.island.ClearImmediate("workflow cancelled")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cancelled": cancelled, "job": s.jobs.Status()})
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -774,8 +809,78 @@ func (s *Server) handleChatEvents(w http.ResponseWriter, r *http.Request) {
 			afterSeq = n
 		}
 	}
-	snap := s.agent.ReplayEvents(runID, afterSeq)
-	writeJSON(w, http.StatusOK, snap)
+	waitMs := 0
+	if rawWait := strings.TrimSpace(q.Get("wait_ms")); rawWait != "" {
+		if n, err := strconv.Atoi(rawWait); err == nil && n > 0 {
+			waitMs = n
+			if waitMs > 12000 {
+				waitMs = 12000
+			}
+		}
+	}
+
+	if waitMs <= 0 {
+		writeJSON(w, http.StatusOK, s.agent.ReplayEvents(runID, afterSeq))
+		return
+	}
+
+	snap, ch, unsub, found := s.agent.SubscribeRun(runID, afterSeq)
+	if !found {
+		writeJSON(w, http.StatusOK, snap)
+		return
+	}
+	defer unsub()
+
+	if !snap.Active || snap.Finished || len(snap.Events) > 0 || ch == nil {
+		writeJSON(w, http.StatusOK, snap)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	s.sseMu.Lock()
+	s.nextSSEID++
+	lpID := s.nextSSEID
+	s.sseCancels[lpID] = cancel
+	s.sseMu.Unlock()
+	defer func() {
+		cancel()
+		s.sseMu.Lock()
+		delete(s.sseCancels, lpID)
+		s.sseMu.Unlock()
+	}()
+
+	waitTimer := time.NewTimer(time.Duration(waitMs) * time.Millisecond)
+	defer waitTimer.Stop()
+
+	select {
+	case <-ctx.Done():
+		writeJSON(w, http.StatusOK, s.agent.ReplayEvents(snap.RunID, afterSeq))
+		return
+	case <-waitTimer.C:
+		writeJSON(w, http.StatusOK, s.agent.ReplayEvents(snap.RunID, afterSeq))
+		return
+	case ev, ok := <-ch:
+		if ok && ev.Type != "done" && ev.Type != "cancelled" && ev.Type != "error" {
+			// Coalesce for 35ms to batch rapid streaming token deltas into a single KSU shell response.
+			coalTimer := time.NewTimer(35 * time.Millisecond)
+		coalesceLoop:
+			for {
+				select {
+				case <-ctx.Done():
+					break coalesceLoop
+				case <-coalTimer.C:
+					break coalesceLoop
+				case ev2, ok2 := <-ch:
+					if !ok2 || ev2.Type == "done" || ev2.Type == "cancelled" || ev2.Type == "error" {
+						break coalesceLoop
+					}
+				}
+			}
+			coalTimer.Stop()
+		}
+		writeJSON(w, http.StatusOK, s.agent.ReplayEvents(snap.RunID, afterSeq))
+		return
+	}
 }
 
 func (s *Server) handleChatCancel(w http.ResponseWriter, r *http.Request) {
@@ -793,12 +898,54 @@ func (s *Server) handleChatCancel(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) buildLLMConfigView() map[string]any {
+	c := s.agent.GetConfig()
+	return map[string]any{
+		"provider":       c.Provider,
+		"base_url":       c.BaseURL,
+		"api_key_masked": config.MaskSecret(c.APIKey),
+		"configured":     strings.TrimSpace(c.APIKey) != "" && strings.TrimSpace(c.Model) != "",
+		"model":          c.Model,
+		"max_steps":      c.MaxSteps,
+		"timeout_sec":    c.TimeoutSec,
+	}
+}
+
+func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	files := s.memory.List()
+	totalBytes := 0
+	for _, f := range files {
+		totalBytes += f.Bytes
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":      s.buildStatus(r.Context()),
+		"jobs":        s.jobs.Status(),
+		"saved_turns": s.agent.SavedTurns(),
+		"active_run":  s.agent.ReplayEvents("", 0),
+		"history":     sanitizeChatHistory(s.agent.History()),
+		"llm":         s.buildLLMConfigView(),
+		"schedule":    s.scheduler.Status(),
+		"memory_meta": map[string]any{
+			"files":          files,
+			"total_bytes":    totalBytes,
+			"max_file_bytes": 16 * 1024,
+		},
+	})
+}
+
 func (s *Server) handleChatHistory(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"messages": sanitizeChatHistory(s.agent.History())})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"messages":    sanitizeChatHistory(s.agent.History()),
+		"saved_turns": s.agent.SavedTurns(),
+	})
 }
 
 func (s *Server) handleChatClear(w http.ResponseWriter, r *http.Request) {
@@ -813,16 +960,7 @@ func (s *Server) handleChatClear(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleLLMConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		c := s.agent.GetConfig()
-		writeJSON(w, http.StatusOK, map[string]any{
-			"provider":       c.Provider,
-			"base_url":       c.BaseURL,
-			"api_key_masked": config.MaskSecret(c.APIKey),
-			"configured":     strings.TrimSpace(c.APIKey) != "" && strings.TrimSpace(c.Model) != "",
-			"model":          c.Model,
-			"max_steps":      c.MaxSteps,
-			"timeout_sec":    c.TimeoutSec,
-		})
+		writeJSON(w, http.StatusOK, s.buildLLMConfigView())
 	case http.MethodPost:
 		var body struct {
 			Provider   *string `json:"provider"`
@@ -879,11 +1017,262 @@ func (s *Server) handleLLMConfig(w http.ResponseWriter, r *http.Request) {
 			"provider":       llm.Provider,
 			"base_url":       llm.BaseURL,
 			"api_key_masked": config.MaskSecret(llm.APIKey),
+			"configured":     strings.TrimSpace(llm.APIKey) != "" && strings.TrimSpace(llm.Model) != "",
 			"model":          llm.Model,
+			"max_steps":      llm.MaxSteps,
+			"timeout_sec":    llm.TimeoutSec,
 		})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) handleLLMTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Provider *string `json:"provider"`
+		BaseURL  *string `json:"base_url"`
+		APIKey   *string `json:"api_key"`
+		Model    *string `json:"model"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(io.LimitReader(r.Body, 16*1024)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+			return
+		}
+	}
+
+	llm := s.agent.GetConfig()
+	if body.Provider != nil && strings.TrimSpace(*body.Provider) != "" {
+		llm.Provider = strings.ToLower(strings.TrimSpace(*body.Provider))
+	}
+	if body.BaseURL != nil && strings.TrimSpace(*body.BaseURL) != "" {
+		llm.BaseURL = strings.TrimSpace(*body.BaseURL)
+	}
+	if body.APIKey != nil && strings.TrimSpace(*body.APIKey) != "" {
+		llm.APIKey = strings.TrimSpace(*body.APIKey)
+	}
+	if body.Model != nil && strings.TrimSpace(*body.Model) != "" {
+		llm.Model = strings.TrimSpace(*body.Model)
+	}
+
+	provider := strings.ToLower(strings.TrimSpace(llm.Provider))
+	if provider == "" {
+		provider = "openai"
+	}
+	if provider != "openai" && provider != "gemini" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         false,
+			"elapsed_ms": int64(0),
+			"model":      llm.Model,
+			"provider":   provider,
+			"error":      "provider must be openai or gemini",
+		})
+		return
+	}
+	if strings.TrimSpace(llm.APIKey) == "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         false,
+			"elapsed_ms": int64(0),
+			"model":      llm.Model,
+			"provider":   provider,
+			"error":      "API Key 未配置，请填写密钥后再试",
+		})
+		return
+	}
+	if strings.TrimSpace(llm.Model) == "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         false,
+			"elapsed_ms": int64(0),
+			"model":      "",
+			"provider":   provider,
+			"error":      "Model 未配置，请填写模型名称",
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+
+	t0 := time.Now()
+	preview, err := probeLLMOnce(ctx, provider, llm.BaseURL, llm.APIKey, llm.Model)
+	elapsedMs := time.Since(t0).Milliseconds()
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         false,
+			"elapsed_ms": elapsedMs,
+			"model":      llm.Model,
+			"provider":   provider,
+			"error":      redactSensitiveText(err.Error()),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"elapsed_ms": elapsedMs,
+		"model":      llm.Model,
+		"provider":   provider,
+		"preview":    redactSensitiveText(preview),
+	})
+}
+
+func probeLLMOnce(ctx context.Context, provider, baseURL, apiKey, model string) (string, error) {
+	if provider == "gemini" {
+		base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+		if base == "" {
+			base = "https://generativelanguage.googleapis.com/v1beta"
+		}
+		cleanModel := strings.TrimPrefix(strings.TrimSpace(model), "models/")
+		endpoint := fmt.Sprintf("%s/models/%s:generateContent", base, url.PathEscape(cleanModel))
+		payload, _ := json.Marshal(map[string]any{
+			"contents": []map[string]any{
+				{"role": "user", "parts": []map[string]any{{"text": "Reply OK"}}},
+			},
+			"generationConfig": map[string]any{
+				"maxOutputTokens": 16,
+			},
+		})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-goog-api-key", apiKey)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return "", err
+		}
+		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+		resp.Body.Close()
+		if rerr != nil {
+			return "", rerr
+		}
+		var parsed struct {
+			Candidates []struct {
+				Content struct {
+					Parts []struct {
+						Text string `json:"text"`
+					} `json:"parts"`
+				} `json:"content"`
+			} `json:"candidates"`
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(raw, &parsed)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			if parsed.Error != nil && parsed.Error.Message != "" {
+				return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, parsed.Error.Message)
+			}
+			return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateRunes(strings.TrimSpace(string(raw)), 140))
+		}
+		if parsed.Error != nil && parsed.Error.Message != "" {
+			return "", errors.New(parsed.Error.Message)
+		}
+		var preview string
+		if len(parsed.Candidates) > 0 {
+			for _, p := range parsed.Candidates[0].Content.Parts {
+				if strings.TrimSpace(p.Text) != "" {
+					preview = strings.TrimSpace(p.Text)
+					break
+				}
+			}
+		}
+		if preview == "" {
+			preview = "OK"
+		}
+		return truncateRunes(preview, 64), nil
+	}
+
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		base = "https://api.openai.com/v1"
+	}
+	endpoint := base + "/chat/completions"
+	if strings.HasSuffix(base, "/chat/completions") {
+		endpoint = base
+	}
+
+	sendOpenAIProbe := func(withMaxTokens bool) (int, []byte, error) {
+		bodyMap := map[string]any{
+			"model": model,
+			"messages": []map[string]any{
+				{"role": "user", "content": "Reply OK"},
+			},
+		}
+		if withMaxTokens {
+			bodyMap["max_tokens"] = 16
+		}
+		payload, _ := json.Marshal(bodyMap)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+		if err != nil {
+			return 0, nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, nil, err
+		}
+		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+		resp.Body.Close()
+		return resp.StatusCode, raw, rerr
+	}
+
+	code, raw, err := sendOpenAIProbe(true)
+	if err != nil {
+		return "", err
+	}
+	if code == http.StatusBadRequest && strings.Contains(string(raw), "max_tokens") && ctx.Err() == nil {
+		code, raw, err = sendOpenAIProbe(false)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	var parsed struct {
+		Choices []struct {
+			Message struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(raw, &parsed)
+	if code < 200 || code >= 300 {
+		if parsed.Error != nil && parsed.Error.Message != "" {
+			return "", fmt.Errorf("HTTP %d: %s", code, parsed.Error.Message)
+		}
+		return "", fmt.Errorf("HTTP %d: %s", code, truncateRunes(strings.TrimSpace(string(raw)), 140))
+	}
+	if parsed.Error != nil && parsed.Error.Message != "" {
+		return "", errors.New(parsed.Error.Message)
+	}
+	if len(parsed.Choices) == 0 {
+		return "", errors.New("empty choices from upstream")
+	}
+	preview := strings.TrimSpace(parsed.Choices[0].Message.Content)
+	if preview == "" {
+		preview = strings.TrimSpace(parsed.Choices[0].Message.ReasoningContent)
+	}
+	if preview == "" {
+		preview = "OK"
+	}
+	return truncateRunes(preview, 64), nil
+}
+
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
 }
 
 func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
@@ -943,19 +1332,44 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.scheduler.Status())
 	case http.MethodPost:
+		rawBytes, err := io.ReadAll(io.LimitReader(r.Body, 32*1024))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "failed to read body"})
+			return
+		}
 		var body config.ScheduleConfig
-		if err := json.NewDecoder(io.LimitReader(r.Body, 32*1024)).Decode(&body); err != nil {
+		if err := json.Unmarshal(rawBytes, &body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
 			return
 		}
+
 		for i, e := range body.Entries {
-			job := strings.TrimSpace(e.Job)
-			switch job {
-			case "daily_all", "ms_rewards", "jd_daily":
-			default:
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid job %q", e.Job)})
+			rawType := strings.ToLower(strings.TrimSpace(e.TaskType))
+			if rawType != "" && rawType != "workflow" && rawType != "prompt" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid task_type %q (expected workflow or prompt)", e.TaskType)})
 				return
 			}
+			taskType := e.NormalizedTaskType()
+			promptText := strings.TrimSpace(e.Prompt)
+			job := strings.TrimSpace(e.Job)
+			if taskType == "prompt" {
+				if promptText == "" {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": "prompt is required when task_type is prompt"})
+					return
+				}
+				if job == "" {
+					job = "ai_prompt"
+				}
+			} else {
+				switch job {
+				case "daily_all", "ms_rewards", "jd_daily":
+				default:
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid job %q", e.Job)})
+					return
+				}
+			}
+			body.Entries[i].TaskType = taskType
+			body.Entries[i].Prompt = promptText
 			body.Entries[i].Job = job
 			startStr := strings.TrimSpace(e.WindowStart)
 			endStr := strings.TrimSpace(e.WindowEnd)
@@ -976,7 +1390,11 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 			body.Entries[i].WindowStart = startStr
 			body.Entries[i].WindowEnd = endStr
 			if strings.TrimSpace(e.ID) == "" {
-				body.Entries[i].ID = fmt.Sprintf("job-%d-%s", i+1, job)
+				if taskType == "prompt" {
+					body.Entries[i].ID = fmt.Sprintf("prompt-%d", i+1)
+				} else {
+					body.Entries[i].ID = fmt.Sprintf("job-%d-%s", i+1, job)
+				}
 			} else {
 				body.Entries[i].ID = strings.TrimSpace(e.ID)
 			}
@@ -998,6 +1416,335 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) handleScheduleRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if blocked, reason := s.guard.IsActionBlocked(); blocked {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": reason})
+		return
+	}
+	var body struct {
+		ID      string `json:"id"`
+		EntryID string `json:"entry_id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+		return
+	}
+	entryID := strings.TrimSpace(body.EntryID)
+	if entryID == "" {
+		entryID = strings.TrimSpace(body.ID)
+	}
+	if entryID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "entry_id is required"})
+		return
+	}
+	if err := s.scheduler.TriggerNow(entryID); err != nil {
+		status := http.StatusConflict
+		if strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"entry_id": entryID,
+		"schedule": s.scheduler.Status(),
+	})
+}
+
+func (s *Server) handleScreenPreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if blocked, reason := s.guard.IsActionBlocked(); blocked {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": reason})
+		return
+	}
+	q := r.URL.Query()
+	width := s.cfg.ScreenshotWidth
+	if rawW := strings.TrimSpace(q.Get("width")); rawW != "" {
+		if n, err := strconv.Atoi(rawW); err == nil && n >= 240 && n <= 1440 {
+			width = n
+		}
+	}
+	quality := s.cfg.ScreenshotJPEGQuality
+	if rawQ := strings.TrimSpace(q.Get("quality")); rawQ != "" {
+		if n, err := strconv.Atoi(rawQ); err == nil && n >= 25 && n <= 95 {
+			quality = n
+		}
+	}
+	withTree := q.Get("with_tree") == "1" || strings.EqualFold(q.Get("with_tree"), "true")
+
+	ctx := r.Context()
+	var (
+		wg      sync.WaitGroup
+		shotRes *backend.ScreenshotResult
+		shotErr error
+		fgInfo  backend.ForegroundInfo
+		treeRes *backend.UITreeResult
+	)
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		shotRes, shotErr = s.backend.Screenshot(ctx, width, quality)
+	}()
+	go func() {
+		defer wg.Done()
+		fgInfo, _ = s.backend.ForegroundApp(ctx)
+		if withTree {
+			treeRes, _ = s.backend.UITree(ctx, backend.UITreeOptions{})
+		}
+	}()
+	wg.Wait()
+
+	if shotErr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": shotErr.Error()})
+		return
+	}
+	if shotRes.OrigWidth > 0 && shotRes.OrigHeight > 0 && shotRes.Width > 0 && shotRes.Height > 0 {
+		s.shotMu.Lock()
+		s.lastShot = screenshotMeta{
+			origWidth:  shotRes.OrigWidth,
+			origHeight: shotRes.OrigHeight,
+			width:      shotRes.Width,
+			height:     shotRes.Height,
+			capturedAt: time.Now(),
+		}
+		s.shotMu.Unlock()
+	}
+
+	pkg := fgInfo.Package
+	if pkg == "" && treeRes != nil {
+		pkg = treeRes.Package
+	}
+	out := map[string]any{
+		"ok":             true,
+		"image_url":      "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(shotRes.JPEG),
+		"width":          shotRes.Width,
+		"height":         shotRes.Height,
+		"orig_width":     shotRes.OrigWidth,
+		"orig_height":    shotRes.OrigHeight,
+		"jpeg_bytes":     len(shotRes.JPEG),
+		"capture_method": shotRes.CaptureMethod,
+		"elapsed_ms":     shotRes.ElapsedMs,
+		"package":        pkg,
+		"activity":       fgInfo.Activity,
+		"ui_tree":        "",
+		"node_count":     0,
+		"nodes":          []backend.UINode{},
+	}
+	if treeRes != nil {
+		out["ui_tree"] = treeRes.Text
+		out["node_count"] = treeRes.NodeCount
+		out["tree_elapsed_ms"] = treeRes.ElapsedMs
+		if len(treeRes.Nodes) > 0 {
+			out["nodes"] = treeRes.Nodes
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleScreenAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if blocked, reason := s.guard.IsActionBlocked(); blocked {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": reason})
+		return
+	}
+	if u, ok := s.backend.(interface{ IsScreenUnlocked(context.Context) bool }); ok && !u.IsScreenUnlocked(r.Context()) {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "手机当前处于息屏或锁屏状态，请先解锁屏幕"})
+		return
+	}
+
+	var body struct {
+		Action     string `json:"action"`
+		X          *int   `json:"x"`
+		Y          *int   `json:"y"`
+		X1         *int   `json:"x1"`
+		Y1         *int   `json:"y1"`
+		X2         *int   `json:"x2"`
+		Y2         *int   `json:"y2"`
+		NodeID     int    `json:"node_id"`
+		ID         int    `json:"id"`
+		Keycode    string `json:"keycode"`
+		DurationMs int    `json:"duration_ms"`
+		CoordSpace string `json:"coord_space"`
+		ImageWidth int    `json:"image_width"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+		return
+	}
+
+	ctx := r.Context()
+	action := strings.ToLower(strings.TrimSpace(body.Action))
+	space := strings.TrimSpace(body.CoordSpace)
+	if space == "" {
+		space = "image"
+	}
+
+	switch action {
+	case "tap":
+		if body.X == nil || body.Y == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "x and y are required for tap"})
+			return
+		}
+		px, py, err := s.resolveCoords(ctx, *body.X, *body.Y, space, body.ImageWidth)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		if err := s.backend.Tap(ctx, px, py); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": "tap", "x": px, "y": py})
+
+	case "tap_node":
+		nid := body.NodeID
+		if nid <= 0 {
+			nid = body.ID
+		}
+		if nid <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "positive node_id is required"})
+			return
+		}
+		node, px, py, err := s.backend.TapNode(ctx, nid)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":     true,
+			"action": "tap_node",
+			"id":     nid,
+			"label":  node.Label,
+			"x":      px,
+			"y":      py,
+		})
+
+	case "key":
+		kc := strings.TrimSpace(body.Keycode)
+		if kc == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "keycode is required for key"})
+			return
+		}
+		if err := s.backend.KeyEvent(ctx, kc); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": "key", "keycode": kc})
+
+	case "swipe":
+		sx, sy := body.X, body.Y
+		if sx == nil {
+			sx = body.X1
+		}
+		if sy == nil {
+			sy = body.Y1
+		}
+		if sx == nil || sy == nil || body.X2 == nil || body.Y2 == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "x/y (or x1/y1) and x2/y2 are required for swipe"})
+			return
+		}
+		dur := body.DurationMs
+		if dur <= 0 {
+			dur = 320
+		}
+		px1, py1, err := s.resolveCoords(ctx, *sx, *sy, space, body.ImageWidth)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		px2, py2, err := s.resolveCoords(ctx, *body.X2, *body.Y2, space, body.ImageWidth)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		if err := s.backend.Swipe(ctx, px1, py1, px2, py2, dur); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":          true,
+			"action":      "swipe",
+			"x1":          px1,
+			"y1":          py1,
+			"x2":          px2,
+			"y2":          py2,
+			"duration_ms": dur,
+		})
+
+	case "long_press":
+		if body.X == nil || body.Y == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "x and y are required for long_press"})
+			return
+		}
+		dur := body.DurationMs
+		if dur <= 0 {
+			dur = 700
+		}
+		px, py, err := s.resolveCoords(ctx, *body.X, *body.Y, space, body.ImageWidth)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		if err := s.backend.LongPress(ctx, px, py, dur); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": "long_press", "x": px, "y": py, "duration_ms": dur})
+
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("unsupported screen action %q", body.Action)})
+	}
+}
+
+func (s *Server) handleIslandTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if blocked, reason := s.guard.IsActionBlocked(); blocked {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": reason})
+		return
+	}
+	var body struct {
+		State string `json:"state"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+			return
+		}
+	}
+	state := strings.ToLower(strings.TrimSpace(body.State))
+	if state == "" {
+		state = "thinking"
+	}
+
+	switch state {
+	case "thinking", "acting", "workflow", "confirm", "done", "stopped", "error":
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid island state %q (expected thinking, acting, workflow, confirm, or done)", body.State)})
+		return
+	}
+
+	if err := s.island.PreviewDemo(r.Context(), state); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": state})
 }
 
 // --- Standard MCP Streamable HTTP (2025-03-26) ---
@@ -1542,10 +2289,95 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 
 	case "phone_launch_app":
 		pkg := getString(args, "package", "")
+		if s.isGuardedPackage(pkg) {
+			return textErrorResult(fmt.Sprintf("package %q is restricted by game-guard", pkg))
+		}
 		if err := s.backend.LaunchApp(ctx, pkg); err != nil {
 			return textErrorResult(err.Error())
 		}
 		return textJSONResult(map[string]any{"ok": true, "package": pkg}, false)
+
+	case "phone_open_deeplink":
+		uriStr := strings.TrimSpace(getString(args, "uri", ""))
+		if uriStr == "" {
+			return textErrorResult("uri is required")
+		}
+		pkg := strings.TrimSpace(getString(args, "package", ""))
+		if s.isGuardedPackage(pkg) {
+			return textErrorResult(fmt.Sprintf("package %q is restricted by game-guard", pkg))
+		}
+		if err := s.backend.OpenDeepLink(ctx, uriStr, pkg); err != nil {
+			return textErrorResult(err.Error())
+		}
+		return textJSONResult(map[string]any{"ok": true, "uri": uriStr, "package": pkg}, false)
+
+	case "phone_tap_and_type":
+		text := getString(args, "text", "")
+		if text == "" {
+			return textErrorResult("text is required")
+		}
+		method := getString(args, "method", "auto")
+		submit := getBool(args, "submit", false)
+		waitMs := getInt(args, "wait_ms", 350)
+		if waitMs < 0 {
+			waitMs = 0
+		} else if waitMs > 2000 {
+			waitMs = 2000
+		}
+
+		nodeID := getInt(args, "node_id", 0)
+		if nodeID <= 0 {
+			nodeID = getInt(args, "id", 0)
+		}
+
+		var px, py int
+		if nodeID > 0 {
+			_, tx, ty, err := s.backend.TapNode(ctx, nodeID)
+			if err != nil {
+				return textErrorResult(err.Error())
+			}
+			px, py = tx, ty
+		} else {
+			x, okX := getIntStrict(args, "x")
+			y, okY := getIntStrict(args, "y")
+			if !okX || !okY {
+				return textErrorResult("either node_id > 0 or (x, y) integer coordinates are required")
+			}
+			tx, ty, err := s.resolveCoords(ctx, x, y, getString(args, "coord_space", "physical"), getInt(args, "image_width", 0))
+			if err != nil {
+				return textErrorResult(err.Error())
+			}
+			if err := s.backend.Tap(ctx, tx, ty); err != nil {
+				return textErrorResult(err.Error())
+			}
+			px, py = tx, ty
+		}
+
+		if waitMs > 0 {
+			timer := time.NewTimer(time.Duration(waitMs) * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return textErrorResult(ctx.Err().Error())
+			case <-timer.C:
+			}
+		}
+		if blocked, reason := s.guard.IsActionBlocked(); blocked {
+			return textErrorResult(reason)
+		}
+		used, err := s.backend.InputText(ctx, text, method, submit)
+		if err != nil {
+			return textErrorResult(err.Error())
+		}
+		return textJSONResult(map[string]any{
+			"ok":        true,
+			"node_id":   nodeID,
+			"x":         px,
+			"y":         py,
+			"method":    used,
+			"length":    len([]rune(text)),
+			"submitted": submit,
+		}, false)
 
 	case "cdp_list_sockets":
 		return textJSONResult(map[string]any{
@@ -1729,6 +2561,25 @@ func redactSensitiveText(s string) string {
 	return s
 }
 
+func (s *Server) isGuardedPackage(pkg string) bool {
+	pkg = strings.ToLower(strings.TrimSpace(pkg))
+	if pkg == "" {
+		return false
+	}
+	s.cfgMu.RLock()
+	var pkgs []string
+	if s.cfg != nil {
+		pkgs = s.cfg.GuardPackages
+	}
+	s.cfgMu.RUnlock()
+	for _, gp := range pkgs {
+		if strings.EqualFold(strings.TrimSpace(gp), pkg) {
+			return true
+		}
+	}
+	return false
+}
+
 func sanitizeChatHistory(msgs []brain.ChatMessage) []brain.ChatMessage {
 	if len(msgs) == 0 {
 		return msgs
@@ -1743,7 +2594,7 @@ func sanitizeChatHistory(msgs []brain.ChatMessage) []brain.ChatMessage {
 				if tc.Args != nil {
 					argsCopy := make(map[string]any, len(tc.Args))
 					for k, v := range tc.Args {
-						if (tc.Name == "phone_input_text" || tc.Name == "phone_clipboard_set") && k == "text" {
+						if (tc.Name == "phone_input_text" || tc.Name == "phone_tap_and_type" || tc.Name == "phone_clipboard_set") && k == "text" {
 							argsCopy[k] = "[REDACTED]"
 						} else {
 							argsCopy[k] = v
@@ -1826,7 +2677,7 @@ func (s *Server) ExecuteTool(ctx context.Context, name string, args map[string]a
 				s.logger("brain tool %s: ok (len=%d, redacted)", name, len([]rune(parsed.Text)))
 			}
 		}
-	case "phone_input_text", "phone_clipboard_set":
+	case "phone_input_text", "phone_tap_and_type", "phone_clipboard_set":
 		rawInput := getString(args, "text", "")
 		if rawInput != "" && strings.Contains(outText, rawInput) {
 			outText = strings.ReplaceAll(outText, rawInput, "[REDACTED]")
@@ -2030,6 +2881,37 @@ func toolDefinitions() []map[string]any {
 					"package": map[string]any{"type": "string"},
 				},
 				"required": []string{"package"},
+			},
+		},
+		{
+			"name":        "phone_open_deeplink",
+			"description": "Open an Android deep link or URL intent directly (e.g. openapp.jdmobile://..., imeituan://..., https://...) with an optional target package.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"uri":     map[string]any{"type": "string", "description": "Deep link URI or URL to open"},
+					"package": map[string]any{"type": "string", "description": "Optional target Android package name"},
+				},
+				"required": []string{"uri"},
+			},
+		},
+		{
+			"name":        "phone_tap_and_type",
+			"description": "Composite single-step action: tap an input field (by node_id from phone_ui_tree or x/y coordinates), wait ~350ms for focus/IME, and type UTF-8/Chinese text (optionally pressing ENTER to submit).",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"node_id":     map[string]any{"type": "integer", "description": "Input element [id] from phone_ui_tree (preferred)"},
+					"x":           map[string]any{"type": "integer", "description": "Fallback X coordinate when node_id is not used"},
+					"y":           map[string]any{"type": "integer", "description": "Fallback Y coordinate when node_id is not used"},
+					"coord_space": map[string]any{"type": "string", "enum": []string{"physical", "image"}, "description": "Coordinate space for x/y (default physical)"},
+					"image_width": map[string]any{"type": "integer", "description": "Reference screenshot width when coord_space='image'"},
+					"text":        map[string]any{"type": "string", "description": "Text to enter into the field"},
+					"method":      map[string]any{"type": "string", "enum": []string{"auto", "clipboard", "input"}, "description": "Input method (default auto)"},
+					"submit":      map[string]any{"type": "boolean", "description": "Send ENTER/search after typing (default false)"},
+					"wait_ms":     map[string]any{"type": "integer", "description": "Focus settle delay in ms between tap and typing (default 350)"},
+				},
+				"required": []string{"text"},
 			},
 		},
 		{

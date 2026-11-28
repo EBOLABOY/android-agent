@@ -26,21 +26,25 @@ const (
 )
 
 type ScheduleEntryState struct {
-	ID            string `json:"id"`
-	Job           string `json:"job"`
-	Enabled       bool   `json:"enabled"`
-	WindowStart   string `json:"window_start"`
-	WindowEnd     string `json:"window_end"`
-	DeferOnGame   bool   `json:"defer_on_game"`
-	NextRunAt     string `json:"next_run_at,omitempty"`
-	LastRunDate   string `json:"last_run_date,omitempty"`
-	LastState     string `json:"last_state,omitempty"`
-	LastMessage   string `json:"last_message,omitempty"`
+	ID          string `json:"id"`
+	TaskType    string `json:"task_type"`
+	Job         string `json:"job"`
+	Prompt      string `json:"prompt,omitempty"`
+	Enabled     bool   `json:"enabled"`
+	WindowStart string `json:"window_start"`
+	WindowEnd   string `json:"window_end"`
+	DeferOnGame bool   `json:"defer_on_game"`
+	NextRunAt   string `json:"next_run_at,omitempty"`
+	LastRunDate string `json:"last_run_date,omitempty"`
+	LastState   string `json:"last_state,omitempty"`
+	LastMessage string `json:"last_message,omitempty"`
 }
 
 type ScheduleHistoryItem struct {
 	EntryID     string  `json:"entry_id"`
+	TaskType    string  `json:"task_type,omitempty"`
 	Job         string  `json:"job"`
+	Prompt      string  `json:"prompt,omitempty"`
 	State       string  `json:"state"` // "completed" | "failed" | "deferred" | "skipped"
 	Message     string  `json:"message,omitempty"`
 	TriggeredAt string  `json:"triggered_at"`
@@ -68,6 +72,9 @@ type entryRuntime struct {
 // JobRunFunc executes a scheduled job by name inside a JobManager worker.
 type JobRunFunc func(ctx context.Context, jobName string, logFn func(string)) (any, error)
 
+// PromptRunFunc executes a custom scheduled natural-language AI prompt turn.
+type PromptRunFunc func(ctx context.Context, prompt string) (any, error)
+
 // Scheduler runs lightweight randomized daily cron jobs while respecting game-guard pauses.
 type Scheduler struct {
 	mu             sync.Mutex
@@ -75,6 +82,7 @@ type Scheduler struct {
 	guard          *guard.Guard
 	jobs           *JobManager
 	runJob         JobRunFunc
+	promptRunner   PromptRunFunc
 	historyPath    string
 	logger         func(string, ...any)
 	screenUnlocked func(context.Context) bool
@@ -131,6 +139,35 @@ func (s *Scheduler) SetScreenUnlockChecker(fn func(context.Context) bool) {
 	s.mu.Lock()
 	s.screenUnlocked = fn
 	s.mu.Unlock()
+}
+
+// SetPromptRunner binds the autonomous AI Agent executor used when ScheduleEntry.TaskType == "prompt".
+func (s *Scheduler) SetPromptRunner(fn func(ctx context.Context, prompt string) (any, error)) {
+	s.mu.Lock()
+	s.promptRunner = fn
+	s.mu.Unlock()
+}
+
+func normalizeScheduleEntry(idx int, e config.ScheduleEntry) config.ScheduleEntry {
+	e.TaskType = e.NormalizedTaskType()
+	e.Job = strings.TrimSpace(e.Job)
+	e.Prompt = strings.TrimSpace(e.Prompt)
+	e.ID = strings.TrimSpace(e.ID)
+	if e.ID == "" {
+		if e.TaskType == "prompt" {
+			e.ID = fmt.Sprintf("prompt-%d", idx+1)
+		} else {
+			job := e.Job
+			if job == "" {
+				job = "workflow"
+			}
+			e.ID = fmt.Sprintf("job-%d-%s", idx+1, job)
+		}
+	}
+	if e.TaskType == "prompt" && e.Job == "" {
+		e.Job = "ai_prompt"
+	}
+	return e
 }
 
 func (s *Scheduler) loadHistory() {
@@ -222,30 +259,23 @@ func (s *Scheduler) UpdateConfig(cfg config.ScheduleConfig) {
 	prev := s.runtimes
 	s.cfg = cfg
 	s.runtimes = make(map[string]*entryRuntime, len(cfg.Entries))
-	now := time.Now()
+	now := s.now()
 	today := now.Format("2006-01-02")
-	for i, e := range cfg.Entries {
-		id := strings.TrimSpace(e.ID)
-		if id == "" {
-			id = fmt.Sprintf("job-%d-%s", i+1, e.Job)
-		}
-		e.ID = id
+	normalized := make([]config.ScheduleEntry, len(cfg.Entries))
+	for i, raw := range cfg.Entries {
+		e := normalizeScheduleEntry(i, raw)
+		normalized[i] = e
 		rt := &entryRuntime{entry: e, plannedDate: today}
-		if old, ok := prev[id]; ok {
+		if old, ok := prev[e.ID]; ok {
 			rt.lastRunDate = old.lastRunDate
 			rt.lastState = old.lastState
 			rt.lastMessage = old.lastMessage
 		}
 		// Force re-randomization of today's window if user edited the window.
 		rt.nextRunAt, rt.windowEndTime = s.pickRandomTrigger(now, e.WindowStart, e.WindowEnd)
-		s.runtimes[id] = rt
+		s.runtimes[e.ID] = rt
 	}
-	s.cfg.Entries = append([]config.ScheduleEntry(nil), cfg.Entries...)
-	for i, e := range s.cfg.Entries {
-		if strings.TrimSpace(e.ID) == "" {
-			s.cfg.Entries[i].ID = fmt.Sprintf("job-%d-%s", i+1, e.Job)
-		}
-	}
+	s.cfg.Entries = normalized
 	s.mu.Unlock()
 
 	if s.wakeCh != nil {
@@ -259,18 +289,15 @@ func (s *Scheduler) UpdateConfig(cfg config.ScheduleConfig) {
 func (s *Scheduler) syncRuntimesLocked(now time.Time) {
 	today := now.Format("2006-01-02")
 	activeIDs := make(map[string]struct{}, len(s.cfg.Entries))
-	for i, e := range s.cfg.Entries {
-		id := strings.TrimSpace(e.ID)
-		if id == "" {
-			id = fmt.Sprintf("job-%d-%s", i+1, e.Job)
-		}
-		e.ID = id
-		activeIDs[id] = struct{}{}
+	for i, raw := range s.cfg.Entries {
+		e := normalizeScheduleEntry(i, raw)
+		s.cfg.Entries[i] = e
+		activeIDs[e.ID] = struct{}{}
 
-		rt, ok := s.runtimes[id]
+		rt, ok := s.runtimes[e.ID]
 		if !ok {
 			rt = &entryRuntime{entry: e}
-			s.runtimes[id] = rt
+			s.runtimes[e.ID] = rt
 		} else {
 			rt.entry = e
 		}
@@ -451,6 +478,37 @@ func isNonRetryableScheduleError(err error) bool {
 		strings.Contains(low, "login_required")
 }
 
+// TriggerNow immediately launches any configured schedule entry by ID (used by /ui [立即试跑]),
+// bypassing daily window/enabled gating while still enforcing Game Guard and single-flight locks.
+func (s *Scheduler) TriggerNow(entryID string) error {
+	entryID = strings.TrimSpace(entryID)
+	if entryID == "" {
+		return errors.New("entry_id is required")
+	}
+	if s.guard != nil {
+		if blocked, reason := s.guard.IsActionBlocked(); blocked {
+			return fmt.Errorf("agent guard active: %s", reason)
+		}
+	}
+
+	s.mu.Lock()
+	now := s.now()
+	today := now.Format("2006-01-02")
+	s.syncRuntimesLocked(now)
+	rt := s.runtimes[entryID]
+	if rt == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("schedule entry %q not found", entryID)
+	}
+	if rt.lastState == "running" {
+		s.mu.Unlock()
+		return fmt.Errorf("schedule entry %q is already running", entryID)
+	}
+	s.mu.Unlock()
+
+	return s.startEntryExecution(rt, now, today, true)
+}
+
 func (s *Scheduler) triggerEntry(ctx context.Context, rt *entryRuntime, now time.Time, today string) {
 	if s.guard != nil {
 		if blocked, reason := s.guard.IsActionBlocked(); blocked {
@@ -461,7 +519,9 @@ func (s *Scheduler) triggerEntry(ctx context.Context, rt *entryRuntime, now time
 				rt.lastMessage = reason
 				s.recordHistoryLocked(ScheduleHistoryItem{
 					EntryID:     rt.entry.ID,
+					TaskType:    rt.entry.NormalizedTaskType(),
 					Job:         rt.entry.Job,
+					Prompt:      rt.entry.Prompt,
 					State:       "deferred",
 					Message:     reason,
 					TriggeredAt: now.Format(time.RFC3339),
@@ -473,7 +533,9 @@ func (s *Scheduler) triggerEntry(ctx context.Context, rt *entryRuntime, now time
 				rt.lastMessage = reason
 				s.recordHistoryLocked(ScheduleHistoryItem{
 					EntryID:     rt.entry.ID,
+					TaskType:    rt.entry.NormalizedTaskType(),
 					Job:         rt.entry.Job,
+					Prompt:      rt.entry.Prompt,
 					State:       "skipped",
 					Message:     reason,
 					TriggeredAt: now.Format(time.RFC3339),
@@ -500,7 +562,9 @@ func (s *Scheduler) triggerEntry(ctx context.Context, rt *entryRuntime, now time
 			rt.lastMessage = "screen locked or off; deferred"
 			s.recordHistoryLocked(ScheduleHistoryItem{
 				EntryID:     rt.entry.ID,
+				TaskType:    rt.entry.NormalizedTaskType(),
 				Job:         rt.entry.Job,
+				Prompt:      rt.entry.Prompt,
 				State:       "deferred",
 				Message:     rt.lastMessage,
 				TriggeredAt: now.Format(time.RFC3339),
@@ -512,7 +576,9 @@ func (s *Scheduler) triggerEntry(ctx context.Context, rt *entryRuntime, now time
 			rt.lastMessage = "screen remained locked past window end"
 			s.recordHistoryLocked(ScheduleHistoryItem{
 				EntryID:     rt.entry.ID,
+				TaskType:    rt.entry.NormalizedTaskType(),
 				Job:         rt.entry.Job,
+				Prompt:      rt.entry.Prompt,
 				State:       "skipped",
 				Message:     rt.lastMessage,
 				TriggeredAt: now.Format(time.RFC3339),
@@ -523,28 +589,70 @@ func (s *Scheduler) triggerEntry(ctx context.Context, rt *entryRuntime, now time
 		return
 	}
 
-	if s.jobs == nil || s.runJob == nil {
-		return
+	_ = s.startEntryExecution(rt, now, today, false)
+}
+
+func (s *Scheduler) startEntryExecution(rt *entryRuntime, now time.Time, today string, manual bool) error {
+	s.mu.Lock()
+	entry := rt.entry
+	taskType := entry.NormalizedTaskType()
+	entryID := entry.ID
+	jobName := entry.Job
+	prompt := strings.TrimSpace(entry.Prompt)
+	promptRunner := s.promptRunner
+	runJob := s.runJob
+	jobs := s.jobs
+
+	if taskType == "prompt" {
+		if prompt == "" {
+			err := fmt.Errorf("schedule entry %q has empty prompt", entryID)
+			if !manual {
+				rt.lastRunDate = today
+				rt.lastState = "failed"
+				rt.lastMessage = err.Error()
+			}
+			s.mu.Unlock()
+			return err
+		}
+		if promptRunner == nil {
+			err := errors.New("prompt runner is not configured")
+			if !manual {
+				rt.lastRunDate = today
+				rt.lastState = "failed"
+				rt.lastMessage = err.Error()
+			}
+			s.mu.Unlock()
+			return err
+		}
+	} else {
+		if jobs == nil || runJob == nil {
+			s.mu.Unlock()
+			return errors.New("workflow job runner is not configured")
+		}
 	}
 
-	// Mark today's attempt before starting to prevent duplicate concurrent launches on next tick.
-	s.mu.Lock()
-	rt.lastRunDate = today
+	prevRunDate := rt.lastRunDate
+	prevState := rt.lastState
+	prevMessage := rt.lastMessage
+
+	if !manual {
+		rt.lastRunDate = today
+		rt.lastMessage = "started by heartbeat scheduler"
+	} else {
+		if s.cfg.Enabled && entry.Enabled && !now.Before(rt.nextRunAt) && now.Before(rt.windowEndTime.Add(30*time.Minute)) {
+			rt.lastRunDate = today
+		}
+		rt.lastMessage = "triggered manually"
+	}
 	rt.lastState = "running"
-	rt.lastMessage = "started by heartbeat scheduler"
-	jobName := rt.entry.Job
-	entryID := rt.entry.ID
 	s.mu.Unlock()
 
-	_, err := s.jobs.Start("cron:"+jobName, func(jctx context.Context, logFn func(string)) (any, error) {
-		started := time.Now()
-		res, runErr := s.runJob(jctx, jobName, logFn)
+	onComplete := func(started time.Time, res any, runErr error) {
 		elapsed := float64(int(time.Since(started).Seconds()*10)) / 10
-
 		s.mu.Lock()
 		var histState string
 		if runErr != nil {
-			if !isNonRetryableScheduleError(runErr) && rt.retryCount < maxScheduleRetries {
+			if !manual && !isNonRetryableScheduleError(runErr) && rt.retryCount < maxScheduleRetries {
 				rt.retryCount++
 				rt.lastRunDate = ""
 				baseTime := now
@@ -563,12 +671,18 @@ func (s *Scheduler) triggerEntry(ctx context.Context, rt *entryRuntime, now time
 		} else {
 			rt.retryCount = 0
 			rt.lastState = "completed"
-			rt.lastMessage = fmt.Sprintf("completed in %.1fs", elapsed)
+			msg := fmt.Sprintf("completed in %.1fs", elapsed)
+			if chatRes, ok := res.(*ChatTurnResult); ok && chatRes != nil && strings.TrimSpace(chatRes.Reply) != "" {
+				msg = fmt.Sprintf("completed in %.1fs: %s", elapsed, truncateSummaryRunes(chatRes.Reply, 42))
+			}
+			rt.lastMessage = msg
 			histState = "completed"
 		}
 		s.recordHistoryLocked(ScheduleHistoryItem{
 			EntryID:     entryID,
+			TaskType:    taskType,
 			Job:         jobName,
+			Prompt:      prompt,
 			State:       histState,
 			Message:     rt.lastMessage,
 			TriggeredAt: started.Format(time.RFC3339),
@@ -582,19 +696,54 @@ func (s *Scheduler) triggerEntry(ctx context.Context, rt *entryRuntime, now time
 			default:
 			}
 		}
-		return res, runErr
-	})
-	if err != nil {
-		// Busy with manual job or chat turn: retry in 5 minutes cleanly.
-		s.mu.Lock()
-		rt.lastRunDate = ""
-		rt.nextRunAt = now.Add(scheduleRetryBackoff)
-		rt.lastState = "deferred"
-		rt.lastMessage = err.Error()
-		s.mu.Unlock()
-	} else {
-		s.logger("schedule: triggered %s (%s)", entryID, jobName)
 	}
+
+	var startErr error
+	if taskType == "prompt" {
+		worker := func(jctx context.Context, logFn func(string)) (any, error) {
+			started := time.Now()
+			if logFn != nil {
+				logFn("[阶段 1/1] 执行定时 AI 指令: " + truncateSummaryRunes(prompt, 44))
+			}
+			res, runErr := promptRunner(jctx, prompt)
+			onComplete(started, res, runErr)
+			return res, runErr
+		}
+		if jobs != nil {
+			_, startErr = jobs.startPromptJob("cron:prompt:"+entryID, worker)
+		} else {
+			go func() {
+				_, _ = worker(context.Background(), nil)
+			}()
+		}
+	} else {
+		_, startErr = jobs.Start("cron:"+jobName, func(jctx context.Context, logFn func(string)) (any, error) {
+			started := time.Now()
+			res, runErr := runJob(jctx, jobName, logFn)
+			onComplete(started, res, runErr)
+			return res, runErr
+		})
+	}
+
+	if startErr != nil {
+		s.mu.Lock()
+		if manual {
+			rt.lastRunDate = prevRunDate
+			rt.lastState = prevState
+			rt.lastMessage = prevMessage
+		} else {
+			// Busy with manual job or chat turn: retry in 5 minutes cleanly.
+			rt.lastRunDate = ""
+			rt.nextRunAt = now.Add(scheduleRetryBackoff)
+			rt.lastState = "deferred"
+			rt.lastMessage = startErr.Error()
+		}
+		s.mu.Unlock()
+		return startErr
+	}
+
+	s.logger("schedule: triggered %s (%s:%s)", entryID, taskType, jobName)
+	return nil
 }
 
 func (s *Scheduler) Status() SchedulerStatus {
@@ -607,7 +756,9 @@ func (s *Scheduler) Status() SchedulerStatus {
 		rt := s.runtimes[e.ID]
 		st := ScheduleEntryState{
 			ID:          e.ID,
+			TaskType:    e.NormalizedTaskType(),
 			Job:         e.Job,
+			Prompt:      e.Prompt,
 			Enabled:     e.Enabled,
 			WindowStart: e.WindowStart,
 			WindowEnd:   e.WindowEnd,

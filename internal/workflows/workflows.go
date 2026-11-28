@@ -175,6 +175,8 @@ type Runner struct {
 	log           LogFunc
 	unfreezeDelay time.Duration
 	cdpSendFn     func(ctx context.Context, socketSel, targetID, method string, params map[string]any) (json.RawMessage, error)
+	stageBase     int
+	stageTotal    int
 }
 
 func NewRunner(be backend.DeviceBackend, cdpClient *cdp.Client, g *guard.Guard, imageWidth int, logFn LogFunc) *Runner {
@@ -196,6 +198,22 @@ func NewRunner(be backend.DeviceBackend, cdpClient *cdp.Client, g *guard.Guard, 
 
 func (r *Runner) logf(format string, args ...any) {
 	r.log(fmt.Sprintf(format, args...))
+}
+
+func (r *Runner) logStage(prefix string, step, total int, stage string) {
+	if r.stageTotal > 0 {
+		r.logf("[阶段 %d/%d] %s", r.stageBase+step, r.stageTotal, stage)
+		return
+	}
+	r.logf("[%s %d/%d] %s", prefix, step, total, stage)
+}
+
+func shortStageTitle(s string, maxRunes int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) > maxRunes {
+		return string(r[:maxRunes-1]) + "…"
+	}
+	return string(r)
 }
 
 func (r *Runner) checkGuard(ctx context.Context) error {
@@ -1113,6 +1131,7 @@ func (r *Runner) readBingRewardsDOM(ctx context.Context, rTID string, refresh bo
 }
 
 func (r *Runner) runBingCheckinAndRead(ctx context.Context, count int, report *MSRewardsReport) error {
+	r.logStage("阶段", 3, 4, "Bing 每日签入")
 	rTID, err := r.ensureBingRewardsWebView(ctx)
 	if err != nil {
 		return err
@@ -1150,9 +1169,11 @@ func (r *Runner) runBingCheckinAndRead(ctx context.Context, count int, report *M
 	if domMid != nil && IsReadToEarnFull(domMid.ReadToEarn) {
 		report.BingReadAfter = domMid.ReadToEarn
 		report.AfterPoints = domMid.Points
+		r.logStage("阶段", 4, 4, fmt.Sprintf("阅读新闻 (%s)", domMid.ReadToEarn))
 		r.logf("[Bing] Read-to-Earn already %s, skipping read loop", domMid.ReadToEarn)
 		return nil
 	}
+	r.logStage("阶段", 4, 4, fmt.Sprintf("阅读新闻 (0/%d)", count))
 
 	// Switch back to Bing Home news feed and read pure-text MSN /ar- articles via Shadow DOM
 	if err := r.tapImage(ctx, 86, 1515); err != nil {
@@ -1275,6 +1296,7 @@ func (r *Runner) runBingCheckinAndRead(ctx context.Context, count int, report *M
 				return err
 			}
 			report.BingReadOK++
+			r.logStage("阶段", 4, 4, fmt.Sprintf("阅读新闻 (%d/%d) %s", report.BingReadOK, count, shortStageTitle(it.Title, 18)))
 			r.logf("[Bing] Read article #%d: %s", report.BingReadOK, it.Title)
 			if err := r.backend.KeyEvent(ctx, "BACK"); err != nil {
 				return err
@@ -1319,7 +1341,7 @@ func (r *Runner) RunMSRewards(ctx context.Context, opts MSRewardsOptions) (*MSRe
 	}
 
 	if !opts.SkipEdge {
-		r.logf("[MS] Starting Edge CDP workflow...")
+		r.logStage("阶段", 1, 4, "检查 Edge Daily Set")
 		tid, err := r.ensureEdgeTarget(ctx)
 		if err != nil {
 			return rep, err
@@ -1338,6 +1360,10 @@ func (r *Runner) RunMSRewards(ctx context.Context, opts MSRewardsOptions) (*MSRe
 			return rep, err
 		}
 		rep.InteractiveTasks = append(rep.InteractiveTasks, manual...)
+
+		if nTasks := len(before.DailyCards) + len(before.ExploreCards); nTasks > 0 {
+			r.logStage("阶段", 1, 4, fmt.Sprintf("完成 Edge 日常与浏览任务 (%d 项)", nTasks))
+		}
 
 		interactiveRe := regexp.MustCompile(`(?i)问答|测验|quiz|poll|投票|选择`)
 		for _, card := range before.DailyCards {
@@ -1410,6 +1436,7 @@ func (r *Runner) RunMSRewards(ctx context.Context, opts MSRewardsOptions) (*MSRe
 			if mid.BingSearchCap != nil && *mid.BingSearchCap > 0 {
 				capV = *mid.BingSearchCap
 			}
+			r.logStage("阶段", 2, 4, fmt.Sprintf("执行必应搜索 (%d/%d)", cur, capV))
 			if cur >= capV {
 				rep.SearchStatus = "already_completed"
 			} else {
@@ -1438,6 +1465,13 @@ func (r *Runner) RunMSRewards(ctx context.Context, opts MSRewardsOptions) (*MSRe
 					for k := 0; k < need; k++ {
 						q := pool[idx]
 						idx++
+						if k > 0 && need > 0 {
+							estCur := cur + (k*rem)/need
+							if estCur > capV {
+								estCur = capV
+							}
+							r.logStage("阶段", 2, 4, fmt.Sprintf("执行必应搜索 (%d/%d)", estCur, capV))
+						}
 						if err := r.doBingSearch(ctx, tid, q, opts.SearchIntervalSec); err != nil {
 							return rep, err
 						}
@@ -1457,6 +1491,7 @@ func (r *Runner) RunMSRewards(ctx context.Context, opts MSRewardsOptions) (*MSRe
 					}
 					newCur := *chk.BingSearchCurrent
 					mid = chk
+					r.logStage("阶段", 2, 4, fmt.Sprintf("执行必应搜索 (%d/%d)", newCur, capV))
 					if newCur <= cur {
 						rep.SearchStatus = fmt.Sprintf("cooldown_detected_at_%d/%d", newCur, capV)
 						break
@@ -1467,6 +1502,8 @@ func (r *Runner) RunMSRewards(ctx context.Context, opts MSRewardsOptions) (*MSRe
 					rep.SearchStatus = "completed"
 				}
 			}
+		} else {
+			r.logStage("阶段", 2, 4, "检查必应搜索进度")
 		}
 		rep.AfterPoints = mid.AvailablePoints
 		rep.TodayPoints = mid.TodayPoints
@@ -1816,6 +1853,7 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 		return rep, err
 	}
 
+	r.logStage("JD", 1, 3, "领京豆签到")
 	tid, err := r.ensureJDFarmOpen(ctx)
 	if err != nil {
 		return rep, err
@@ -1907,6 +1945,7 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 	}
 
 	// Safe 6s browse tasks
+	r.logStage("JD", 2, 3, "东东农场任务")
 	drawerOpen, err := r.openTaskDrawer(ctx, tid)
 	if err != nil {
 		return rep, err
@@ -2066,6 +2105,7 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 			}
 			rep.DrawerClaims += cn2
 			rep.BrowseRuns++
+			r.logStage("JD", 2, 3, fmt.Sprintf("东东农场任务 (已完成 %d 项) %s", rep.BrowseRuns, shortStageTitle(wantPrefix, 16)))
 			r.logf("[JD Browse #%d] %s", rep.BrowseRuns, wantPrefix)
 		}
 		if err := r.closeTaskDrawer(ctx, tid); err != nil {
@@ -2087,6 +2127,7 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 	}
 
 	// Watering: supports "tasks" (milestone only), "all" (pour until <10g or harvest), and "fixed" (up to MaxWaterRound clicks).
+	r.logStage("JD", 3, 3, "阶梯浇水")
 	switch opts.WaterMode {
 	case "tasks":
 		for cycle := 0; cycle < 6; cycle++ {
@@ -2164,6 +2205,7 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 					break
 				}
 				rep.WaterRounds++
+				r.logStage("JD", 3, 3, fmt.Sprintf("阶梯浇水 (%d/%d)", rep.WaterRounds, opts.MaxWaterRound))
 				if err := r.jitterSleep(ctx, 1.5, 2.3); err != nil {
 					return rep, err
 				}
@@ -2216,6 +2258,7 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 				break
 			}
 			rep.WaterRounds++
+			r.logStage("JD", 3, 3, fmt.Sprintf("阶梯浇水 (%d/%d)", rep.WaterRounds, opts.MaxWaterRound))
 			if err := r.jitterSleep(ctx, 1.5, 2.3); err != nil {
 				return rep, err
 			}
@@ -2274,6 +2317,7 @@ func (r *Runner) RunJDDaily(ctx context.Context, opts JDDailyOptions) (*JDDailyR
 
 	// 天天刮京豆
 	if !opts.SkipBean {
+		r.logStage("JD", 3, 3, "天天刮京豆")
 		bTID := r.findJDTarget(ctx, "4E1fFrgX1eGtWTc5KBNFzXMrh6xn", "")
 		if bTID == "" {
 			_ = r.backend.OpenDeepLink(ctx, jdDeepLink(beanURL), JDPkg)
@@ -2352,6 +2396,12 @@ type DailyAllReport struct {
 func (r *Runner) RunDailyAll(ctx context.Context) (*DailyAllReport, error) {
 	t0 := time.Now()
 	out := &DailyAllReport{}
+	defer func() {
+		r.stageBase = 0
+		r.stageTotal = 0
+	}()
+	r.stageBase = 0
+	r.stageTotal = 7
 	msRep, msErr := r.RunMSRewards(ctx, MSRewardsOptions{SearchIntervalSec: 6.0, ReadCount: 10})
 	out.MSRewards = msRep
 	if msErr != nil {
@@ -2360,6 +2410,8 @@ func (r *Runner) RunDailyAll(ctx context.Context) (*DailyAllReport, error) {
 	}
 	var jdErr error
 	if ctx.Err() == nil {
+		r.stageBase = 4
+		r.stageTotal = 7
 		var jdRep *JDDailyReport
 		jdRep, jdErr = r.RunJDDaily(ctx, JDDailyOptions{BrowseSec: 8.5, MaxBrowse: 24, WaterMode: "tasks"})
 		out.JDDaily = jdRep

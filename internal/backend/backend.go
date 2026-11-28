@@ -26,12 +26,15 @@ type ScreenInfo struct {
 type LiveProgressSpec struct {
 	Tag       string
 	ID        int
+	State     string
 	Title     string
 	Text      string
 	ShortText string
 	SubText   string
 	Step      int
 	Max       int
+	Progress  int
+	ClickURI  string
 	Focus     bool
 	Ongoing   bool
 }

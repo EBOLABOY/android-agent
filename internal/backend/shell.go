@@ -1043,7 +1043,13 @@ func (b *ShellBackend) PostNotification(ctx context.Context, tag, title, text st
 	}
 	cctx, cancel := b.withTimeout(ctx)
 	defer cancel()
-	out, err := exec.CommandContext(cctx, "/system/bin/cmd", "notification", "post", "-S", "bigtext", "-t", title, tag, text).CombinedOutput()
+	cmd := exec.CommandContext(cctx, "/system/bin/cmd", "notification", "post", "-S", "bigtext", "-t", title, tag, text)
+	if os.Geteuid() == 0 {
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Credential: &syscall.Credential{Uid: 2000, Gid: 2000},
+		}
+	}
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("post notification failed: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
@@ -1062,12 +1068,15 @@ func (b *ShellBackend) UpdateLiveProgress(ctx context.Context, spec LiveProgress
 		Cmd:       "notify_progress",
 		Tag:       spec.Tag,
 		ID:        spec.ID,
+		State:     spec.State,
 		Title:     spec.Title,
 		Text:      spec.Text,
 		ShortText: spec.ShortText,
 		SubText:   spec.SubText,
 		Step:      spec.Step,
 		Max:       spec.Max,
+		Progress:  spec.Progress,
+		ClickURI:  spec.ClickURI,
 		Focus:     &focus,
 		Ongoing:   &ongoing,
 	})

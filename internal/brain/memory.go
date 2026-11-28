@@ -27,6 +27,8 @@ type MemoryFile struct {
 	Description string `json:"description"`
 	Content     string `json:"content"`
 	Bytes       int    `json:"bytes"`
+	Runes       int    `json:"runes,omitempty"`
+	MaxBytes    int    `json:"max_bytes,omitempty"`
 	UpdatedAt   string `json:"updated_at,omitempty"`
 	AIWritable  bool   `json:"ai_writable"`
 }
@@ -85,6 +87,16 @@ type MemoryStore struct {
 
 func NewMemoryStore(dir string) *MemoryStore {
 	return &MemoryStore{dir: strings.TrimSpace(dir)}
+}
+
+// Dir returns the configured directory backing this MemoryStore.
+func (m *MemoryStore) Dir() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.dir
 }
 
 func findMemorySpec(name string) (memorySpec, bool) {
@@ -146,6 +158,8 @@ func (m *MemoryStore) List() []MemoryFile {
 			Description: spec.Description,
 			Content:     content,
 			Bytes:       len(content),
+			Runes:       utf8.RuneCountInString(content),
+			MaxBytes:    maxMemoryFileBytes,
 			UpdatedAt:   updatedAt,
 			AIWritable:  spec.AIWritable,
 		})

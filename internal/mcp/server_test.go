@@ -33,6 +33,8 @@ type fakeBackend struct {
 	lastTap          [2]int
 	lastSwipe        [4]int
 	lastText         string
+	lastKey          string
+	lastDeepLink     [2]string
 	clip             string
 	shotOrigW        int
 	shotOrigH        int
@@ -92,7 +94,12 @@ func (f *fakeBackend) Swipe(_ context.Context, x1, y1, x2, y2, _ int) error {
 	f.mu.Unlock()
 	return nil
 }
-func (f *fakeBackend) KeyEvent(_ context.Context, _ string) error        { return nil }
+func (f *fakeBackend) KeyEvent(_ context.Context, kc string) error {
+	f.mu.Lock()
+	f.lastKey = kc
+	f.mu.Unlock()
+	return nil
+}
 func (f *fakeBackend) InputText(_ context.Context, text, _ string, _ bool) (string, error) {
 	f.mu.Lock()
 	f.lastText = text
@@ -115,7 +122,12 @@ func (f *fakeBackend) ForegroundApp(_ context.Context) (backend.ForegroundInfo, 
 	return backend.ForegroundInfo{Package: "com.miui.home", Activity: ".launcher.Launcher"}, nil
 }
 func (f *fakeBackend) LaunchApp(_ context.Context, _ string) error                   { return nil }
-func (f *fakeBackend) OpenDeepLink(_ context.Context, _, _ string) error        { return nil }
+func (f *fakeBackend) OpenDeepLink(_ context.Context, uri, pkg string) error {
+	f.mu.Lock()
+	f.lastDeepLink = [2]string{uri, pkg}
+	f.mu.Unlock()
+	return nil
+}
 func (f *fakeBackend) PostNotification(_ context.Context, _, _, _ string) error { return nil }
 func (f *fakeBackend) UpdateLiveProgress(_ context.Context, spec backend.LiveProgressSpec) error {
 	f.mu.Lock()
@@ -976,8 +988,8 @@ func TestV034LandscapeCoordsStrictOriginHostScheduleToolSpecsAndSessions(t *test
 	// 1. ToolSpecs() hides agent_pause and agent_resume from in-process LLM brain
 	specs := srv.ToolSpecs()
 	defs := toolDefinitions()
-	if len(defs) != 26 {
-		t.Fatalf("expected 26 total MCP tools, got %d", len(defs))
+	if len(defs) != 28 {
+		t.Fatalf("expected 28 total MCP tools, got %d", len(defs))
 	}
 	if len(specs) != len(defs)-2 {
 		t.Fatalf("expected ToolSpecs() to hide 2 pause/resume tools (%d), got %d", len(defs)-2, len(specs))
@@ -1205,3 +1217,328 @@ func TestV034LandscapeCoordsStrictOriginHostScheduleToolSpecsAndSessions(t *test
 		t.Fatalf("expected run_jd_daily to reject when s.jobs already busy, got %v", busyJD)
 	}
 }
+
+type lockableBackend struct {
+	*fakeBackend
+	mu       sync.Mutex
+	unlocked bool
+}
+
+func (l *lockableBackend) IsScreenUnlocked(_ context.Context) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.unlocked
+}
+
+func TestV040BootstrapLongPollScreenRemoteLLMTestIslandAndCompositeTools(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := config.Default()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.BearerToken = "tok-v040-secret-abc"
+	cfg.PauseFlagPath = ""
+	cfg.MemoryDir = filepath.Join(tmpDir, "memory")
+	cfg.CDPSocket = "nonexistent_test_cdp_socket_040"
+
+	llmGate := make(chan struct{}, 2)
+	llmRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(llmRelease) }) }
+	defer closeRelease()
+
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(raw), "Reply OK") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"OK"}}]}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		select {
+		case llmGate <- struct{}{}:
+		default:
+		}
+		select {
+		case <-llmRelease:
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"极速\"}}]}\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		time.Sleep(10 * time.Millisecond)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"长轮询\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer llmSrv.Close()
+
+	cfg.LLM = config.LLMConfig{
+		Provider:   "openai",
+		BaseURL:    llmSrv.URL,
+		APIKey:     "sk-v040-test-key",
+		Model:      "v040-fast-model",
+		MaxSteps:   10,
+		TimeoutSec: 5,
+	}
+
+	fb := &fakeBackend{}
+	lb := &lockableBackend{fakeBackend: fb, unlocked: true}
+	det := &testDetector{}
+	g := guard.New(guard.Options{Packages: []string{"com.tencent.tmgp.sgame"}, PollInterval: time.Second, Detector: det})
+	srv := NewServer(cfg, lb, g, cdp.NewClient(cfg.CDPSocket), nil)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	defer srv.Close()
+	baseURL := "http://" + srv.Addr()
+
+	doJSON := func(method, path string, body any) (int, map[string]any) {
+		var rdr io.Reader
+		if body != nil {
+			b, _ := json.Marshal(body)
+			rdr = bytes.NewReader(b)
+		}
+		req, err := http.NewRequest(method, baseURL+path, rdr)
+		if err != nil {
+			t.Fatalf("new req %s %s: %v", method, path, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do %s %s: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode, out
+	}
+
+	// 1. 1-RTT GET /api/v1/bootstrap
+	code, boot := doJSON(http.MethodGet, "/api/v1/bootstrap", nil)
+	if code != http.StatusOK {
+		t.Fatalf("bootstrap expected 200, got %d: %+v", code, boot)
+	}
+	for _, key := range []string{"status", "jobs", "saved_turns", "history", "llm", "schedule", "memory_meta"} {
+		if _, ok := boot[key]; !ok {
+			t.Fatalf("bootstrap missing key %q: %+v", key, boot)
+		}
+	}
+	stMap, _ := boot["status"].(map[string]any)
+	if stMap["version"] != "0.4.0" {
+		t.Fatalf("expected version 0.4.0 in bootstrap status, got %v", stMap["version"])
+	}
+
+	// 2. POST /api/v1/llm/test
+	code, llmTest := doJSON(http.MethodPost, "/api/v1/llm/test", map[string]any{})
+	if code != http.StatusOK || llmTest["ok"] != true || llmTest["preview"] != "OK" {
+		t.Fatalf("unexpected /api/v1/llm/test response: code=%d body=%+v", code, llmTest)
+	}
+
+	// 3. GET /api/v1/screen/preview?with_tree=1 & POST /api/v1/screen/action
+	code, prev := doJSON(http.MethodGet, "/api/v1/screen/preview?with_tree=1", nil)
+	if code != http.StatusOK || prev["ok"] != true {
+		t.Fatalf("screen preview failed: code=%d body=%+v", code, prev)
+	}
+	imgURL, _ := prev["image_url"].(string)
+	if !strings.HasPrefix(imgURL, "data:image/jpeg;base64,") || prev["package"] != "com.miui.home" {
+		t.Fatalf("unexpected screen preview payload: pkg=%v len=%d", prev["package"], len(imgURL))
+	}
+	if int(prev["node_count"].(float64)) < 2 {
+		t.Fatalf("expected >=2 purified UI nodes in preview, got %v", prev["node_count"])
+	}
+
+	// Tap in 720x1600 image space -> scaled to 1080x2400 physical space
+	code, tapAct := doJSON(http.MethodPost, "/api/v1/screen/action", map[string]any{
+		"action": "tap", "x": 360, "y": 800, "coord_space": "image",
+	})
+	if code != http.StatusOK || tapAct["ok"] != true || fb.lastTap != [2]int{540, 1200} {
+		t.Fatalf("screen action tap failed: code=%d out=%+v lastTap=%v", code, tapAct, fb.lastTap)
+	}
+	// Tap UI node directly from Screen tab inspector
+	code, nodeAct := doJSON(http.MethodPost, "/api/v1/screen/action", map[string]any{
+		"action": "tap_node", "node_id": 2,
+	})
+	if code != http.StatusOK || nodeAct["ok"] != true {
+		t.Fatalf("screen action tap_node failed: code=%d out=%+v", code, nodeAct)
+	}
+	// Key & swipe actions
+	code, _ = doJSON(http.MethodPost, "/api/v1/screen/action", map[string]any{"action": "key", "keycode": "HOME"})
+	if code != http.StatusOK || fb.lastKey != "HOME" {
+		t.Fatalf("screen action key failed: code=%d lastKey=%q", code, fb.lastKey)
+	}
+	code, _ = doJSON(http.MethodPost, "/api/v1/screen/action", map[string]any{
+		"action": "swipe", "x": 360, "y": 1200, "x2": 360, "y2": 400, "coord_space": "image",
+	})
+	if code != http.StatusOK || fb.lastSwipe != [4]int{540, 1800, 540, 600} {
+		t.Fatalf("screen action swipe failed: code=%d lastSwipe=%v", code, fb.lastSwipe)
+	}
+
+	// Lockscreen gate blocks remote screen actions
+	lb.mu.Lock()
+	lb.unlocked = false
+	lb.mu.Unlock()
+	code, _ = doJSON(http.MethodPost, "/api/v1/screen/action", map[string]any{"action": "tap", "x": 100, "y": 100})
+	if code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when screen is locked, got %d", code)
+	}
+	lb.mu.Lock()
+	lb.unlocked = true
+	lb.mu.Unlock()
+
+	// 4. POST /api/v1/island/test across states
+	for _, st := range []string{"thinking", "acting", "workflow", "confirm", "done"} {
+		code, isl := doJSON(http.MethodPost, "/api/v1/island/test", map[string]any{"state": st})
+		if code != http.StatusOK || isl["ok"] != true {
+			t.Fatalf("island test %q failed: code=%d body=%+v", st, code, isl)
+		}
+	}
+
+	// 5. Composite MCP tools: phone_open_deeplink & phone_tap_and_type (+ privacy redaction)
+	dlRes := srv.callTool(context.Background(), "phone_open_deeplink", map[string]any{
+		"uri":     "openapp.jdmobile://virtual",
+		"package": "com.jingdong.app.mall",
+	})
+	if dlRes["isError"] == true || fb.lastDeepLink != [2]string{"openapp.jdmobile://virtual", "com.jingdong.app.mall"} {
+		t.Fatalf("phone_open_deeplink failed: %+v lastDeepLink=%v", dlRes, fb.lastDeepLink)
+	}
+	blockedDL := srv.callTool(context.Background(), "phone_open_deeplink", map[string]any{
+		"uri":     "sgame://launch",
+		"package": "com.tencent.tmgp.sgame",
+	})
+	if blockedDL["isError"] != true {
+		t.Fatalf("expected guarded package deeplink to be rejected, got %+v", blockedDL)
+	}
+
+	ttOut := srv.ExecuteTool(context.Background(), "phone_tap_and_type", map[string]any{
+		"node_id": 1,
+		"text":    "sk-secretvalue12345678",
+		"submit":  true,
+		"wait_ms": 20,
+	})
+	if ttOut.IsError || fb.lastText != "sk-secretvalue12345678" {
+		t.Fatalf("phone_tap_and_type failed: out=%+v lastText=%q", ttOut, fb.lastText)
+	}
+	if strings.Contains(ttOut.Text, "sk-secretvalue12345678") {
+		t.Fatalf("phone_tap_and_type leaked secret in ToolOutput: %q", ttOut.Text)
+	}
+
+	// 6. Schedule prompt task validation + /api/v1/jobs/cancel
+	code, schedOut := doJSON(http.MethodPost, "/api/v1/schedule", map[string]any{
+		"enabled": true,
+		"entries": []map[string]any{
+			{"id": "morning-all", "task_type": "workflow", "job": "daily_all", "enabled": true, "window_start": "08:00", "window_end": "09:30", "defer_on_game": true},
+			{"id": "noon-ai", "task_type": "prompt", "prompt": "检查京东待收货快递进度并记录到记忆", "enabled": true, "window_start": "12:00", "window_end": "13:00", "defer_on_game": true},
+		},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("expected multi-entry workflow+prompt schedule to succeed, got %d %+v", code, schedOut)
+	}
+
+	// 7. Long-polling GET /api/v1/chat/events?wait_ms=...
+	code, startChat := doJSON(http.MethodPost, "/api/v1/chat/stream", map[string]any{
+		"message": "测试长轮询合并唤醒",
+		"async":   true,
+	})
+	if code != http.StatusAccepted {
+		t.Fatalf("expected 202 async chat start, got %d %+v", code, startChat)
+	}
+	runID, _ := startChat["run_id"].(string)
+	<-llmGate
+
+	// Drain initial run_start / thinking events first so after_seq catches up to current LastSeq
+	_, initialSnap := doJSON(http.MethodGet, fmt.Sprintf("/api/v1/chat/events?run_id=%s&after_seq=0", runID), nil)
+	curSeq := int(initialSnap["last_seq"].(float64))
+
+	// Trigger release 120ms after starting a 3000ms long-poll; verify long-poll wakes promptly (<800ms) with batched deltas!
+	go func() {
+		time.Sleep(120 * time.Millisecond)
+		closeRelease()
+	}()
+	tPoll := time.Now()
+	code, lpSnap := doJSON(http.MethodGet, fmt.Sprintf("/api/v1/chat/events?run_id=%s&after_seq=%d&wait_ms=3000", runID, curSeq), nil)
+	pollElapsed := time.Since(tPoll)
+	if code != http.StatusOK {
+		t.Fatalf("long-poll failed: %d %+v", code, lpSnap)
+	}
+	if pollElapsed < 100*time.Millisecond || pollElapsed > 1200*time.Millisecond {
+		t.Fatalf("expected long-poll to wake around ~130-250ms, took %v (snap=%+v)", pollElapsed, lpSnap)
+	}
+	evs, _ := lpSnap["events"].([]any)
+	if len(evs) == 0 {
+		t.Fatalf("expected batched events from long-poll wakeup, got %+v", lpSnap)
+	}
+
+	// Wait for the async chat turn to finish and verify SavedTurns persistence in bootstrap & chat/history
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !srv.agent.IsRunning() {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	code, histOut := doJSON(http.MethodGet, "/api/v1/chat/history", nil)
+	if code != http.StatusOK {
+		t.Fatalf("chat/history failed: %d %+v", code, histOut)
+	}
+	savedTurns, _ := histOut["saved_turns"].([]any)
+	if len(savedTurns) == 0 {
+		t.Fatalf("expected non-empty saved_turns after completed chat run, got %+v", histOut)
+	}
+	code, bootAfter := doJSON(http.MethodGet, "/api/v1/bootstrap", nil)
+	if code != http.StatusOK || len(bootAfter["saved_turns"].([]any)) == 0 {
+		t.Fatalf("expected saved_turns in bootstrap, got code=%d %+v", code, bootAfter)
+	}
+
+	// 8. POST /api/v1/schedule/run -> TriggerNow on custom AI prompt entry ("noon-ai")
+	code, runPrompt := doJSON(http.MethodPost, "/api/v1/schedule/run", map[string]any{"entry_id": "noon-ai"})
+	if code != http.StatusOK || runPrompt["ok"] != true {
+		t.Fatalf("expected /api/v1/schedule/run on noon-ai to succeed, got %d %+v", code, runPrompt)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(srv.agent.SavedTurns()) >= 2 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if len(srv.agent.SavedTurns()) < 2 {
+		t.Fatalf("expected scheduled prompt run to persist a second SavedTurn, got %d", len(srv.agent.SavedTurns()))
+	}
+
+	// 9. Workflow progress observer drives IslandController ("workflow" state + progress_pct)
+	_, err := srv.jobs.Start("ms_rewards", func(_ context.Context, logFn func(string)) (any, error) {
+		logFn("[阶段 2/4] 执行必应每日搜索 (65/100)")
+		return map[string]any{"ok": true}, nil
+	})
+	if err != nil {
+		t.Fatalf("srv.jobs.Start failed: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.jobs.Status().State == "completed" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(260 * time.Millisecond) // allow IslandController coalescer flush
+	fb.mu.Lock()
+	foundWorkflowIsland := false
+	for _, u := range fb.liveUpdates {
+		if u.State == "workflow" && u.Progress > 0 {
+			foundWorkflowIsland = true
+			break
+		}
+	}
+	fb.mu.Unlock()
+	if !foundWorkflowIsland {
+		t.Fatalf("expected workflow progress observer to drive IslandController workflow state")
+	}
+}
+

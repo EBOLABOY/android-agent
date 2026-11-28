@@ -76,11 +76,14 @@ type kernelRequest struct {
 	MaxNodes  int    `json:"max_nodes,omitempty"`
 	Tag       string `json:"tag,omitempty"`
 	ID        int    `json:"id,omitempty"`
+	State     string `json:"state,omitempty"`
 	Title     string `json:"title,omitempty"`
 	ShortText string `json:"short_text,omitempty"`
 	SubText   string `json:"sub_text,omitempty"`
 	Step      int    `json:"step,omitempty"`
 	Max       int    `json:"max,omitempty"`
+	Progress  int    `json:"progress,omitempty"`
+	ClickURI  string `json:"click_uri,omitempty"`
 	Focus     *bool  `json:"focus,omitempty"`
 	Ongoing   *bool  `json:"ongoing,omitempty"`
 }

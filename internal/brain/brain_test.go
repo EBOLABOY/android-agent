@@ -3,9 +3,13 @@ package brain
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -890,5 +894,226 @@ func TestHistoryCompactionRedactionAndConfirmationNegation(t *testing.T) {
 		if !replyNeedsConfirmation(s) {
 			t.Fatalf("missed positive in replyNeedsConfirmation(%q)", s)
 		}
+	}
+}
+
+type richTraceExec struct{}
+
+func (richTraceExec) ToolSpecs() []ToolSpec {
+	return []ToolSpec{
+		{Name: "phone_ui_tree", Description: "tree", Parameters: map[string]any{"type": "object"}},
+		{Name: "phone_input_text", Description: "input", Parameters: map[string]any{"type": "object"}},
+		{Name: "phone_screenshot", Description: "shot", Parameters: map[string]any{"type": "object"}},
+	}
+}
+
+func (richTraceExec) ExecuteTool(_ context.Context, name string, _ map[string]any) ToolOutput {
+	switch name {
+	case "phone_ui_tree":
+		return ToolOutput{Text: "pkg=com.jingdong.app.mall\n[1] Button \"签到\"\n[2] Text \"首页\""}
+	case "phone_input_text":
+		return ToolOutput{Text: "typed secret-passcode-889900"}
+	case "phone_screenshot":
+		return ToolOutput{Text: "captured", ImageJPEG: make([]byte, 4096)}
+	default:
+		return ToolOutput{Text: "ok"}
+	}
+}
+
+func TestAgentSavedTurnsPersistenceHydrationRedactionAndClear(t *testing.T) {
+	histFile := filepath.Join(t.TempDir(), "data", "chat_history.json")
+	var round atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := round.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{
+						"role": "assistant",
+						"tool_calls": []map[string]any{
+							{"id": "t1", "type": "function", "function": map[string]any{"name": "phone_ui_tree", "arguments": `{}`}},
+							{"id": "t2", "type": "function", "function": map[string]any{"name": "phone_input_text", "arguments": `{"text":"secret-passcode-889900"}`}},
+							{"id": "t3", "type": "function", "function": map[string]any{"name": "phone_screenshot", "arguments": `{}`}},
+						},
+					},
+				}},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": fmt.Sprintf("第 %d 轮已完成检查。", n),
+				},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	ag := NewAgent(config.LLMConfig{
+		Provider: "openai",
+		BaseURL:  srv.URL,
+		APIKey:   "sk-test",
+		Model:    "gpt-test",
+		MaxSteps: 6,
+	}, richTraceExec{}, nil)
+	ag.SetHistoryFile(histFile)
+
+	res, err := ag.Chat(context.Background(), "检查京东页面并输入口令")
+	if err != nil {
+		t.Fatalf("Chat failed: %v", err)
+	}
+	if len(res.ToolTrace) != 3 {
+		t.Fatalf("expected 3 tool steps, got %+v", res.ToolTrace)
+	}
+	if res.ToolTrace[0].Label != "读取页面结构" || res.ToolTrace[1].Label != "输入文本" || res.ToolTrace[2].Label != "屏幕快照" {
+		t.Fatalf("unexpected crisp labels in ToolTrace: %+v", res.ToolTrace)
+	}
+
+	info, err := os.Stat(histFile)
+	if err != nil {
+		t.Fatalf("expected chat_history.json created: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("expected 0600 permissions on chat_history.json, got %o", info.Mode().Perm())
+	}
+	rawBytes, err := os.ReadFile(histFile)
+	if err != nil {
+		t.Fatalf("read chat_history.json: %v", err)
+	}
+	if strings.Contains(string(rawBytes), "889900") || strings.Contains(string(rawBytes), "secret-passcode") {
+		t.Fatalf("sensitive input leaked into chat_history.json:\n%s", string(rawBytes))
+	}
+
+	// Push >40 turns to verify 40-turn cap and 12-exchange hydration cap on reload.
+	for i := 0; i < 44; i++ {
+		if _, err := ag.Chat(context.Background(), fmt.Sprintf("后续提问 #%d", i+1)); err != nil {
+			t.Fatalf("Chat #%d failed: %v", i+1, err)
+		}
+	}
+	if got := len(ag.SavedTurns()); got != 40 {
+		t.Fatalf("expected SavedTurns capped at 40, got %d", got)
+	}
+
+	// Simulate daemon restart with a fresh Agent reading chat_history.json.
+	agReload := NewAgent(config.LLMConfig{Provider: "openai", BaseURL: srv.URL, APIKey: "sk-test", Model: "gpt-test"}, richTraceExec{}, nil)
+	agReload.SetHistoryFile(histFile)
+	reloadedTurns := agReload.SavedTurns()
+	if len(reloadedTurns) != 40 {
+		t.Fatalf("expected 40 reloaded turns, got %d", len(reloadedTurns))
+	}
+	hydrated := agReload.History()
+	if len(hydrated) != 24 { // 12 user+assistant exchanges
+		t.Fatalf("expected 24 hydrated LLM messages (12 exchanges), got %d", len(hydrated))
+	}
+	if hydrated[len(hydrated)-2].Text != "后续提问 #44" {
+		t.Fatalf("expected latest exchange hydrated, got %+v", hydrated[len(hydrated)-2])
+	}
+
+	// ClearHistory must wipe RAM history, SavedTurns, and chat_history.json on disk.
+	agReload.ClearHistory()
+	if len(agReload.History()) != 0 || len(agReload.SavedTurns()) != 0 {
+		t.Fatalf("expected empty history & SavedTurns after ClearHistory")
+	}
+	agAfterClear := NewAgent(config.LLMConfig{}, richTraceExec{}, nil)
+	agAfterClear.SetHistoryFile(histFile)
+	if len(agAfterClear.SavedTurns()) != 0 || len(agAfterClear.History()) != 0 {
+		t.Fatalf("expected persisted chat_history.json cleared on disk, got turns=%d", len(agAfterClear.SavedTurns()))
+	}
+}
+
+func TestJobManagerProgressObserverRecentLogsAndCancel(t *testing.T) {
+	jm := NewJobManager()
+	var obsMu sync.Mutex
+	var events []WorkflowProgressEvent
+	jm.SetProgressObserver(func(ev WorkflowProgressEvent) {
+		obsMu.Lock()
+		events = append(events, ev)
+		obsMu.Unlock()
+	})
+
+	doneCh := make(chan struct{})
+	_, err := jm.Start("ms_rewards", func(ctx context.Context, logFn func(string)) (any, error) {
+		defer close(doneCh)
+		logFn("[阶段 1/4] 检查 Edge Daily Set")
+		for i := 1; i <= 85; i++ {
+			logFn(fmt.Sprintf("detail line #%d", i))
+		}
+		logFn("[阶段 2/4] 执行必应搜索 (120/200)")
+		jm.AppendLog("[阶段 3/4] Bing 每日签入")
+		logFn("[阶段 4/4] 阅读新闻 (18/30)")
+		jm.UpdateProgress(4, 4, 95, "阅读新闻收尾")
+		return map[string]any{"ok": true}, nil
+	})
+	if err != nil {
+		t.Fatalf("jm.Start failed: %v", err)
+	}
+	<-doneCh
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && jm.Status().State == "running" {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	st := jm.Status()
+	if st.State != "completed" || st.ProgressPct != 100 || st.Step != 4 || st.TotalSteps != 4 {
+		t.Fatalf("unexpected completed JobStatus: %+v", st)
+	}
+	if len(st.RecentLogs) != 80 {
+		t.Fatalf("expected RecentLogs ring buffer capped at 80 lines, got %d", len(st.RecentLogs))
+	}
+	if !strings.Contains(st.RecentLogs[len(st.RecentLogs)-1], "completed") {
+		t.Fatalf("expected newest completion log at tail of RecentLogs, got %q", st.RecentLogs[len(st.RecentLogs)-1])
+	}
+
+	obsMu.Lock()
+	evs := append([]WorkflowProgressEvent(nil), events...)
+	obsMu.Unlock()
+	var sawSearch40, sawUpdate95, sawDone100 bool
+	for _, ev := range evs {
+		if ev.Step == 2 && ev.Total == 4 && ev.Pct == 40 && strings.Contains(ev.Stage, "120/200") {
+			sawSearch40 = true
+		}
+		if ev.Pct == 95 && ev.Stage == "阅读新闻收尾" {
+			sawUpdate95 = true
+		}
+		if ev.Done && ev.Pct == 100 && ev.Err == "" {
+			sawDone100 = true
+		}
+	}
+	if !sawSearch40 || !sawUpdate95 || !sawDone100 {
+		t.Fatalf("missing expected progress events: search40=%v update95=%v done100=%v events=%+v", sawSearch40, sawUpdate95, sawDone100, evs)
+	}
+
+	// Test immediate Cancel() marking status "cancelled" and cancelling ctx immediately.
+	started := make(chan struct{})
+	ctxDoneObserved := make(chan error, 1)
+	_, err = jm.Start("jd_daily", func(ctx context.Context, logFn func(string)) (any, error) {
+		logFn("[JD 1/3] 领京豆签到")
+		close(started)
+		<-ctx.Done()
+		ctxDoneObserved <- ctx.Err()
+		return nil, ctx.Err()
+	})
+	if err != nil {
+		t.Fatalf("second jm.Start failed: %v", err)
+	}
+	<-started
+	if !jm.Cancel() {
+		t.Fatal("expected jm.Cancel() to return true for running job")
+	}
+	// Status MUST be "cancelled" immediately after Cancel() returns!
+	cancelSnap := jm.Status()
+	if cancelSnap.State != "cancelled" || cancelSnap.CurrentStage != "已取消" {
+		t.Fatalf("expected immediate State=cancelled on Cancel(), got %+v", cancelSnap)
+	}
+	select {
+	case cerr := <-ctxDoneObserved:
+		if cerr != context.Canceled {
+			t.Fatalf("expected context.Canceled inside job, got %v", cerr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for workflow context cancellation")
 	}
 }

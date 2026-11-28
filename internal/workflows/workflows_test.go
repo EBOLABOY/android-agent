@@ -209,3 +209,42 @@ func TestTapNodeByLabelsPrefersRewardsNode(t *testing.T) {
 		t.Fatalf("expected TapNode(7), got %v", be.tappedNode)
 	}
 }
+
+func TestWorkflowStructuredStageLogs(t *testing.T) {
+	be := &fakeBackend{launchErr: errors.New("stop early after stage marker")}
+	var msLogs []string
+	rMS := NewRunner(be, nil, nil, 720, func(line string) {
+		msLogs = append(msLogs, line)
+	})
+	_, _ = rMS.RunMSRewards(context.Background(), MSRewardsOptions{})
+	if len(msLogs) == 0 || !strings.Contains(msLogs[0], "[阶段 1/4] 检查 Edge Daily Set") {
+		t.Fatalf("expected [阶段 1/4] marker in RunMSRewards, got %v", msLogs)
+	}
+
+	var jdLogs []string
+	rJD := NewRunner(be, nil, nil, 720, func(line string) {
+		jdLogs = append(jdLogs, line)
+	})
+	_, _ = rJD.RunJDDaily(context.Background(), JDDailyOptions{})
+	if len(jdLogs) == 0 || !strings.Contains(jdLogs[0], "[JD 1/3] 领京豆签到") {
+		t.Fatalf("expected [JD 1/3] marker in RunJDDaily, got %v", jdLogs)
+	}
+
+	var allLogs []string
+	rAll := NewRunner(be, nil, nil, 720, func(line string) {
+		allLogs = append(allLogs, line)
+	})
+	_, _ = rAll.RunDailyAll(context.Background())
+	var sawStage1Of7, sawStage5Of7 bool
+	for _, l := range allLogs {
+		if strings.Contains(l, "[阶段 1/7] 检查 Edge Daily Set") {
+			sawStage1Of7 = true
+		}
+		if strings.Contains(l, "[阶段 5/7] 领京豆签到") {
+			sawStage5Of7 = true
+		}
+	}
+	if !sawStage1Of7 || !sawStage5Of7 {
+		t.Fatalf("expected monotonic [阶段 1/7] and [阶段 5/7] markers in RunDailyAll, got %v", allLogs)
+	}
+}
