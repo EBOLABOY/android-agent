@@ -593,6 +593,243 @@ func (c *Client) SendCommand(ctx context.Context, targetID, method string, param
 	}
 }
 
+// NetworkRecord captures sanitized metadata for a passively observed CDP network call.
+// Only header names (never cookie/authorization values or bodies) are retained.
+type NetworkRecord struct {
+	RequestID          string   `json:"request_id,omitempty"`
+	Method             string   `json:"method"`
+	URL                string   `json:"url"`
+	ResourceType       string   `json:"resource_type,omitempty"`
+	Status             int      `json:"status,omitempty"`
+	MimeType           string   `json:"mime_type,omitempty"`
+	RequestHeaderNames []string `json:"request_header_names,omitempty"`
+}
+
+// ObserveNetworkOptions controls passive CDP Network event capture.
+type ObserveNetworkOptions struct {
+	Duration  time.Duration
+	Reload    bool
+	MaxEvents int
+}
+
+// ObserveNetwork attaches to a CDP target, enables Network events passively for opts.Duration
+// (optionally reloading the page), correlates request/response metadata without reading secrets,
+// and cleanly disables Network observation before closing the WebSocket.
+func (c *Client) ObserveNetwork(ctx context.Context, targetID string, opts ObserveNetworkOptions) ([]NetworkRecord, error) {
+	dur := opts.Duration
+	if dur <= 0 {
+		dur = 4 * time.Second
+	}
+	if dur > 15*time.Second {
+		dur = 15 * time.Second
+	}
+	maxEvents := opts.MaxEvents
+	if maxEvents <= 0 {
+		maxEvents = 80
+	}
+	if maxEvents > 200 {
+		maxEvents = 200
+	}
+
+	targets, err := c.ListTargets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var chosen *Target
+	for i := range targets {
+		if targetID != "" && targets[i].ID == targetID {
+			chosen = &targets[i]
+			break
+		}
+		if targetID == "" && targets[i].Type == "page" {
+			chosen = &targets[i]
+			break
+		}
+	}
+	if chosen == nil && targetID == "" && len(targets) > 0 {
+		chosen = &targets[0]
+	}
+	if chosen == nil {
+		return nil, fmt.Errorf("no matching CDP target found (target_id=%q)", targetID)
+	}
+	wsPath := ""
+	if chosen.WebSocketDebuggerURL != "" {
+		if u, err := url.Parse(chosen.WebSocketDebuggerURL); err == nil && u.RequestURI() != "" {
+			wsPath = u.RequestURI()
+		}
+	}
+	if wsPath == "" {
+		wsPath = "/devtools/page/" + chosen.ID
+	}
+
+	obsCtx, cancel := context.WithTimeout(ctx, dur+3*time.Second)
+	defer cancel()
+
+	conn, err := c.dial(obsCtx)
+	if err != nil {
+		if errors.Is(err, ErrTargetFrozen) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	defer conn.Close()
+
+	windowEnd := time.Now().Add(dur)
+	_ = conn.SetDeadline(windowEnd.Add(1500 * time.Millisecond))
+
+	stopWatch := make(chan struct{})
+	go func() {
+		select {
+		case <-obsCtx.Done():
+			_ = conn.SetDeadline(time.Now())
+		case <-stopWatch:
+		}
+	}()
+	defer close(stopWatch)
+
+	br, err := wsHandshake(conn, wsPath)
+	if err != nil {
+		return nil, fmt.Errorf("cdp websocket handshake: %w", err)
+	}
+
+	sendCmd := func(method string, params map[string]any) error {
+		payload := map[string]any{
+			"id":     c.nextID.Add(1),
+			"method": method,
+		}
+		if params != nil {
+			payload["params"] = params
+		}
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		return wsWriteFrame(conn, 0x1, raw)
+	}
+
+	if err := sendCmd("Network.enable", map[string]any{
+		"maxTotalBufferSize":    1000000,
+		"maxResourceBufferSize": 500000,
+	}); err != nil {
+		return nil, fmt.Errorf("cdp Network.enable: %w", err)
+	}
+	if opts.Reload {
+		_ = sendCmd("Page.reload", map[string]any{"ignoreCache": false})
+	}
+
+	recordsByID := make(map[string]*NetworkRecord)
+	order := make([]string, 0, 32)
+	readCtx, readCancel := context.WithDeadline(obsCtx, windowEnd)
+	defer readCancel()
+
+	for len(order) < maxEvents {
+		if time.Now().After(windowEnd) {
+			break
+		}
+		_ = conn.SetReadDeadline(windowEnd)
+		opcode, msg, err := wsReadFrameCtx(readCtx, conn, br)
+		if err != nil {
+			// Window deadline reached cleanly -> return all observed records.
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				break
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				break
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			break
+		}
+		switch opcode {
+		case 0x8:
+			goto done
+		case 0x9:
+			_ = wsWriteFrame(conn, 0xA, msg)
+			continue
+		case 0xA:
+			continue
+		case 0x1, 0x2:
+			var ev struct {
+				Method string          `json:"method"`
+				Params json.RawMessage `json:"params"`
+			}
+			if err := json.Unmarshal(msg, &ev); err != nil || ev.Method == "" {
+				continue
+			}
+			switch ev.Method {
+			case "Network.requestWillBeSent":
+				var p struct {
+					RequestID string `json:"requestId"`
+					Type      string `json:"type"`
+					Request   struct {
+						URL     string         `json:"url"`
+						Method  string         `json:"method"`
+						Headers map[string]any `json:"headers"`
+					} `json:"request"`
+				}
+				if err := json.Unmarshal(ev.Params, &p); err != nil || p.RequestID == "" || p.Request.URL == "" {
+					continue
+				}
+				hdrNames := make([]string, 0, len(p.Request.Headers))
+				for k := range p.Request.Headers {
+					hdrNames = append(hdrNames, k)
+				}
+				sort.Strings(hdrNames)
+				rec, ok := recordsByID[p.RequestID]
+				if !ok {
+					rec = &NetworkRecord{RequestID: p.RequestID}
+					recordsByID[p.RequestID] = rec
+					order = append(order, p.RequestID)
+				}
+				rec.Method = p.Request.Method
+				rec.URL = p.Request.URL
+				rec.ResourceType = p.Type
+				rec.RequestHeaderNames = hdrNames
+			case "Network.responseReceived":
+				var p struct {
+					RequestID string `json:"requestId"`
+					Type      string `json:"type"`
+					Response  struct {
+						URL      string `json:"url"`
+						Status   int    `json:"status"`
+						MimeType string `json:"mimeType"`
+					} `json:"response"`
+				}
+				if err := json.Unmarshal(ev.Params, &p); err != nil || p.RequestID == "" {
+					continue
+				}
+				rec, ok := recordsByID[p.RequestID]
+				if !ok {
+					rec = &NetworkRecord{RequestID: p.RequestID, Method: "GET", URL: p.Response.URL}
+					recordsByID[p.RequestID] = rec
+					order = append(order, p.RequestID)
+				}
+				if rec.ResourceType == "" && p.Type != "" {
+					rec.ResourceType = p.Type
+				}
+				if rec.URL == "" {
+					rec.URL = p.Response.URL
+				}
+				rec.Status = p.Response.Status
+				rec.MimeType = p.Response.MimeType
+			}
+		}
+	}
+
+done:
+	_ = conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+	_ = sendCmd("Network.disable", nil)
+
+	out := make([]NetworkRecord, 0, len(order))
+	for _, id := range order {
+		if r := recordsByID[id]; r != nil && r.URL != "" {
+			out = append(out, *r)
+		}
+	}
+	return out, nil
+}
+
 func wsHandshake(conn net.Conn, path string) (*bufio.Reader, error) {
 	keyBytes := make([]byte, 16)
 	if _, err := rand.Read(keyBytes); err != nil {

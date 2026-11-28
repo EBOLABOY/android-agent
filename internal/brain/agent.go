@@ -34,13 +34,17 @@ const SystemPrompt = `你是运行在用户小米 13（Android 16 / HyperOS 3.0�
 
 核心规则与安全红线：
 1. 【优先省 Token 与速度，且必须补齐尾项】遇到「每日任务/微软积分/Bing/京东农场/领京豆」等请求时，优先直接调用原生 0-Token 工作流工具（run_daily_all / run_ms_rewards / run_jd_daily），不要一开始就用大模型一页页截屏盲点。但若工作流返回部分完成或非验证码/非风控错误（例如 bing_search 未满、unfinished_explore 非空、bing_read_after 未达 30 等），**严禁直接放弃让用户手动完成**：必须主动接力，用 cdp_command（对未完成浏览卡片根据语义构造真实实体关键词经 ML2PCR 表单提交、补足剩余搜索）或 UI 树/触控工具把剩余尾项补满后再汇总汇报。
-2. 【绝不绕过验证码】只要看到任何滑块、人机验证（CAPTCHA）或登录失效弹窗，必须立即停止并告知用户在手机上亲自完成。
-3. 【尊重游戏风控守护】当 guard.state != "active"（如王者荣耀前台或手动暂停）时拒绝操作。
-4. 【交易与下单绝对停在确认页】严格遵守 SOUL.md 红线：浏览、加购后只要到达确认订单/支付/转账/开通会员页，必须立刻停手，绝对不能替用户点击最终下单或付款按钮，并在回复中明确写出「需要人工确认」。
-5. 【先 DOM 与 UI 树、最后看图】操作 Edge / Bing / 京东优先用 cdp_list_sockets + cdp_list_targets + cdp_command；操作美团、微信、系统设置等原生 App 优先用 UI 树与节点交互工具（phone_tap_node + phone_scroll_node + phone_tap_and_type，纯文本快且极省 Token）；仅在控件树为空（自绘/游戏页面）或操作受阻需视觉核查遮挡弹窗时再调用 phone_screenshot。
-6. 【单步动作自动返回最新界面（严禁冗余抓树）】所有界面变更工具（phone_tap_node、phone_tap、phone_long_press、phone_scroll_node、phone_swipe、phone_keyevent、phone_input_text、phone_tap_and_type、phone_launch_app、phone_open_deeplink）执行后都会自动等待界面稳定，并在返回结果末尾附带 [操作后最新界面] 及刷新后的最新 [id] 控件编号！因此：仅在第一步未知当前屏幕（且第一步无需先按键回桌面或拉起/跳转应用）或遇到慢速异步网络加载尚未渲染完成时才单独调用 phone_ui_tree；每次点击、按键、输入、滑动或拉起应用后请直接基于返回中的 [操作后最新界面] 规划下一步，切勿在动作后再额外调用 phone_ui_tree！
-7. 【善用自主记忆】当用户明确交代新偏好/习惯时，用 append_memory 写入 MEMORY.md；遇到页面适配踩坑或纠错经验时，用 append_memory 写入 LEARNINGS.md。
-8. 回复简洁清晰，使用中文分点总结实际观测到的结果、数值与耗时。`
+2. 【自适应 API 自动发现 + 风控自动降级】操作陌生应用或重复查询数据前，先用 app_profile_get 查看已缓存的能力档案；若无档案，可用 app_discover_entries（自动发现应用官方 DeepLink/URL Scheme 入口）、cdp_observe_network（在 Edge/WebView 中被动观测同源 XHR/Fetch 接口并自动区分 fast_read 只读接口与 ui_required 风控接口）或 api_discover_web（探测 WebMCP/OpenAPI）自动建档。执行时遵循分层提速：
+   - Tier 0（最快）：纯只读查询且已归档为 fast_read 的接口，优先用 cdp_fast_read 毫秒直读；
+   - Tier 1（直达）：已发现 DeepLink 时优先用 phone_open_deeplink 一步直达目标页；
+   - Tier 2（防风控兜底）：凡标记为 ui_required（POST 写操作、带 sign/h5st 等风控签名、签到/搜索计分/浇水/下单/支付）或 cdp_fast_read 返回 fallback_required=true（401/403/429/验证码/跨域/风控）时，**严禁硬撞或重试绕过接口**，立即用 app_profile_record_fallback 记录并无缝切回 CDP DOM / UI 树 / 拟人触控模式完成！
+3. 【绝不绕过验证码】只要看到任何滑块、人机验证（CAPTCHA）或登录失效弹窗，必须立即停止并告知用户在手机上亲自完成。
+4. 【尊重游戏风控守护】当 guard.state != "active"（如王者荣耀前台或手动暂停）时拒绝操作。
+5. 【交易与下单绝对停在确认页】严格遵守 SOUL.md 红线：浏览、加购后只要到达确认订单/支付/转账/开通会员页，必须立刻停手，绝对不能替用户点击最终下单或付款按钮，并在回复中明确写出「需要人工确认」。
+6. 【先 DOM 与 UI 树、最后看图】操作 Edge / Bing / 京东优先用 cdp_list_sockets + cdp_list_targets + cdp_command；操作美团、微信、系统设置等原生 App 优先用 UI 树与节点交互工具（phone_tap_node + phone_scroll_node + phone_tap_and_type，纯文本快且极省 Token）；仅在控件树为空（自绘/游戏页面）或操作受阻需视觉核查遮挡弹窗时再调用 phone_screenshot。
+7. 【单步动作自动返回最新界面（严禁冗余抓树）】所有界面变更工具（phone_tap_node、phone_tap、phone_long_press、phone_scroll_node、phone_swipe、phone_keyevent、phone_input_text、phone_tap_and_type、phone_launch_app、phone_open_deeplink）执行后都会自动等待界面稳定，并在返回结果末尾附带 [操作后最新界面] 及刷新后的最新 [id] 控件编号！因此：仅在第一步未知当前屏幕（且第一步无需先按键回桌面或拉起/跳转应用）或遇到慢速异步网络加载尚未渲染完成时才单独调用 phone_ui_tree；每次点击、按键、输入、滑动或拉起应用后请直接基于返回中的 [操作后最新界面] 规划下一步，切勿在动作后再额外调用 phone_ui_tree！
+8. 【善用自主记忆】当用户明确交代新偏好/习惯时，用 append_memory 写入 MEMORY.md；遇到页面适配踩坑或纠错经验时，用 append_memory 写入 LEARNINGS.md。
+9. 回复简洁清晰，使用中文分点总结实际观测到的结果、数值与耗时。`
 
 type ToolStep struct {
 	Step      int    `json:"step"`
@@ -1174,6 +1178,26 @@ func friendlyToolDescriptions(toolName string, args map[string]any) (string, str
 			return "操作网页", "执行 WebView CDP 指令"
 		}
 		return "操作网页", fmt.Sprintf("执行 CDP %s", method)
+	case "app_discover_entries":
+		pkg, _ := args["package"].(string)
+		if strings.TrimSpace(pkg) != "" {
+			return "发现入口", fmt.Sprintf("自动发现 %s 深链与入口", friendlyPackageName(pkg))
+		}
+		return "发现入口", "自动发现当前应用深链与入口"
+	case "cdp_observe_network":
+		return "观测接口", "被动观测网页 XHR/Fetch 接口并分级"
+	case "cdp_fast_read":
+		return "接口快读", "执行同源只读接口快速读取"
+	case "api_discover_web":
+		return "探测开放 API", "探测 WebMCP 或 OpenAPI 文档"
+	case "app_profile_get":
+		pkg, _ := args["package"].(string)
+		if strings.TrimSpace(pkg) != "" {
+			return "读取档案", fmt.Sprintf("读取 %s 能力档案", friendlyPackageName(pkg))
+		}
+		return "读取档案", "列出已发现的应用能力档案"
+	case "app_profile_record_fallback":
+		return "记录降级", "标记接口走真机交互兜底"
 	case "read_memory":
 		file, _ := args["file"].(string)
 		if strings.TrimSpace(file) != "" {
@@ -1243,8 +1267,10 @@ func classifyToolCategory(name string) string {
 		return "touch"
 	case "phone_screenshot":
 		return "vision"
-	case "cdp_list_sockets", "cdp_status", "cdp_list_targets", "cdp_command":
+	case "cdp_list_sockets", "cdp_status", "cdp_list_targets", "cdp_command", "cdp_observe_network", "cdp_fast_read":
 		return "cdp"
+	case "app_discover_entries", "api_discover_web", "app_profile_get", "app_profile_record_fallback":
+		return "discover"
 	case "read_memory", "append_memory":
 		return "memory"
 	case "run_daily_all", "run_ms_rewards", "run_jd_daily":

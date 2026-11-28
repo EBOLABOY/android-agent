@@ -2301,7 +2301,7 @@ svg.ic.lg {
           <div class="telemetry-grid">
             <div class="tele-cell">
               <span class="tele-k">引擎版本</span>
-              <span id="teleVersion" class="tele-v num">v0.4.2</span>
+              <span id="teleVersion" class="tele-v num">v0.5.0</span>
               <span id="teleUptime" class="tele-sub num">hybrid-layered-v2</span>
             </div>
             <div class="tele-cell">
@@ -4477,7 +4477,7 @@ function applyStatusTelemetry(st) {
   }
 
   document.getElementById('teleGuardSub').textContent = st?.guard?.reason || '王者荣耀进程存活零暴露保护';
-  document.getElementById('teleVersion').textContent = 'v' + (st?.version || '0.4.2');
+  document.getElementById('teleVersion').textContent = 'v' + (st?.version || '0.5.0');
   const upMin = st?.uptime_sec ? Math.floor(st.uptime_sec / 60) + 'm' : '就绪';
   document.getElementById('teleUptime').textContent = `${st?.backend || 'hybrid-v2'} · 运行 ${upMin}`;
 

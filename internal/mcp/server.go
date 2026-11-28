@@ -27,6 +27,7 @@ import (
 	"android-agent/internal/brain"
 	"android-agent/internal/cdp"
 	"android-agent/internal/config"
+	"android-agent/internal/discover"
 	"android-agent/internal/guard"
 	"android-agent/internal/webui"
 	"android-agent/internal/workflows"
@@ -34,7 +35,7 @@ import (
 
 const (
 	ServerName          = "android-agent"
-	ServerVersion       = "0.4.2"
+	ServerVersion       = "0.5.0"
 	DefaultProtoVersion = "2025-03-26"
 	mcpSessionTTL       = 2 * time.Hour
 )
@@ -88,6 +89,7 @@ type Server struct {
 	cdp        *cdp.Client
 	runner     *workflows.Runner
 	memory     *brain.MemoryStore
+	profiles   *discover.ProfileStore
 	agent      *brain.Agent
 	island     *brain.IslandController
 	jobs       *brain.JobManager
@@ -144,6 +146,11 @@ func NewServer(cfg *config.Config, be backend.DeviceBackend, g *guard.Guard, cdp
 	})
 	s.memory = brain.NewMemoryStore(cfg.MemoryDir)
 	_ = s.memory.EnsureDefaults()
+	profilesDir := "/data/adb/android_agent/app_profiles"
+	if strings.TrimSpace(cfg.MemoryDir) != "" {
+		profilesDir = filepath.Join(filepath.Dir(strings.TrimSpace(cfg.MemoryDir)), "app_profiles")
+	}
+	s.profiles = discover.NewProfileStore(profilesDir)
 	s.agent = brain.NewAgent(cfg.LLM, s, g)
 	s.agent.SetMemoryStore(s.memory)
 	if strings.TrimSpace(cfg.MemoryDir) != "" {
@@ -188,6 +195,7 @@ func NewServer(cfg *config.Config, be backend.DeviceBackend, g *guard.Guard, cdp
 	apiMux.HandleFunc("/api/v1/llm/config", s.handleLLMConfig)
 	apiMux.HandleFunc("/api/v1/llm/test", s.handleLLMTest)
 	apiMux.HandleFunc("/api/v1/memory", s.handleMemory)
+	apiMux.HandleFunc("/api/v1/profiles", s.handleProfiles)
 	apiMux.HandleFunc("/api/v1/schedule", s.handleSchedule)
 	apiMux.HandleFunc("/api/v1/schedule/run", s.handleScheduleRun)
 	apiMux.HandleFunc("/api/v1/screen/preview", s.handleScreenPreview)
@@ -930,6 +938,7 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	for _, f := range files {
 		totalBytes += f.Bytes
 	}
+	profilesList, _ := s.profiles.List()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":      s.buildStatus(r.Context()),
 		"jobs":        s.jobs.Status(),
@@ -938,12 +947,52 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 		"history":     sanitizeChatHistory(s.agent.History()),
 		"llm":         s.buildLLMConfigView(),
 		"schedule":    s.scheduler.Status(),
+		"profiles":    profilesList,
 		"memory_meta": map[string]any{
 			"files":          files,
 			"total_bytes":    totalBytes,
 			"max_file_bytes": 16 * 1024,
 		},
 	})
+}
+
+func (s *Server) handleProfiles(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		pkg := strings.TrimSpace(r.URL.Query().Get("package"))
+		if pkg == "" {
+			list, err := s.profiles.List()
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"profiles": list})
+			return
+		}
+		p, err := s.profiles.Get(pkg)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		if p == nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "profile not found", "package": pkg})
+			return
+		}
+		writeJSON(w, http.StatusOK, p)
+	case http.MethodDelete:
+		pkg := strings.TrimSpace(r.URL.Query().Get("package"))
+		if pkg == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "package query parameter required"})
+			return
+		}
+		if err := s.profiles.Delete(pkg); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": pkg})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 }
 
 func (s *Server) handleChatHistory(w http.ResponseWriter, r *http.Request) {
@@ -2514,9 +2563,366 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		}
 		return textJSONResult(map[string]any{"ok": true, "file": file}, false)
 
+	case "app_discover_entries":
+		pkg := strings.TrimSpace(getString(args, "package", ""))
+		if pkg == "" && s.backend != nil {
+			if fg, err := s.backend.ForegroundApp(ctx); err == nil {
+				pkg = strings.TrimSpace(fg.Package)
+			}
+		}
+		if pkg == "" {
+			return textErrorResult("package is required (or open target app in foreground)")
+		}
+		if s.isGuardedPackage(pkg) {
+			return textErrorResult(fmt.Sprintf("refusing to inspect guarded game package %q", pkg))
+		}
+		schemes, links, err := discover.DiscoverAndroidEntries(ctx, pkg, nil)
+		if err != nil {
+			return textErrorResult(err.Error())
+		}
+		prof, perr := s.profiles.MergeDeepLinks(pkg, schemes, links)
+		return textJSONResult(map[string]any{
+			"ok":              true,
+			"package":         pkg,
+			"schemes":         schemes,
+			"deeplinks_count": len(links),
+			"deeplinks":       links,
+			"profile_saved":   perr == nil && prof != nil,
+		}, false)
+
+	case "cdp_observe_network":
+		socketSel := getString(args, "socket", "")
+		targetID := getString(args, "target_id", "")
+		durSec := getInt(args, "duration_sec", 4)
+		if durSec < 1 {
+			durSec = 1
+		}
+		if durSec > 15 {
+			durSec = 15
+		}
+		reload := getBool(args, "reload", false)
+		client, err := s.cdp.ForSocket(socketSel)
+		if err != nil {
+			return textErrorResult(err.Error())
+		}
+		recs, err := client.ObserveNetwork(ctx, targetID, cdp.ObserveNetworkOptions{
+			Duration: time.Duration(durSec) * time.Second,
+			Reload:   reload,
+		})
+		if err != nil {
+			return textErrorResult(err.Error())
+		}
+		obs := make([]discover.ObservedRequest, 0, len(recs))
+		for _, r := range recs {
+			obs = append(obs, discover.ObservedRequest{
+				Method:             r.Method,
+				URL:                r.URL,
+				ResourceType:       r.ResourceType,
+				Status:             r.Status,
+				MimeType:           r.MimeType,
+				RequestHeaderNames: r.RequestHeaderNames,
+			})
+		}
+		readAPIs, riskActions, skipped := discover.ClassifyObservedNetwork(obs)
+		profileKey := strings.TrimSpace(getString(args, "package", ""))
+		if profileKey == "" {
+			profileKey = deriveProfileKey(socketSel, readAPIs, riskActions)
+		}
+		saved := false
+		if profileKey != "" && (len(readAPIs) > 0 || len(riskActions) > 0) {
+			if _, err := s.profiles.MergeEndpoints(profileKey, readAPIs, riskActions); err == nil {
+				saved = true
+			}
+		}
+		return textJSONResult(map[string]any{
+			"ok":             true,
+			"profile_key":    profileKey,
+			"profile_saved":  saved,
+			"observed_total": len(recs),
+			"skipped":        skipped,
+			"read_apis":      readAPIs,
+			"risk_actions":   riskActions,
+		}, false)
+
+	case "cdp_fast_read":
+		rawURL := strings.TrimSpace(getString(args, "url", ""))
+		socketSel := getString(args, "socket", "")
+		targetID := getString(args, "target_id", "")
+		profileKey := strings.TrimSpace(getString(args, "package", ""))
+		maxBytes := getInt(args, "max_bytes", 4096)
+		if maxBytes < 256 {
+			maxBytes = 256
+		}
+		if maxBytes > 16384 {
+			maxBytes = 16384
+		}
+		client, err := s.cdp.ForSocket(socketSel)
+		if err != nil {
+			return textJSONResult(map[string]any{
+				"ok":                false,
+				"fallback_required": true,
+				"fallback_mode":     "ui_cdp",
+				"reason":            err.Error(),
+			}, false)
+		}
+		// Inspect current page origin before allowing same-origin read-only GET fetch.
+		pageURL := ""
+		if rawLoc, lerr := client.SendCommand(ctx, targetID, "Runtime.evaluate", map[string]any{
+			"expression":    "location.href",
+			"returnByValue": true,
+		}); lerr == nil {
+			var env struct {
+				Result struct {
+					Value string `json:"value"`
+				} `json:"result"`
+			}
+			if json.Unmarshal(rawLoc, &env) == nil {
+				pageURL = env.Result.Value
+			}
+		}
+		cleanURL, verr := discover.CheckFastReadURL(rawURL, pageURL)
+		if verr != nil {
+			if profileKey != "" {
+				_, _ = s.profiles.RecordFallback(profileKey, rawURL, verr.Error(), 0)
+			}
+			return textJSONResult(map[string]any{
+				"ok":                false,
+				"fallback_required": true,
+				"fallback_mode":     "ui_cdp",
+				"reason":            verr.Error(),
+			}, false)
+		}
+		uJSON, _ := json.Marshal(cleanURL)
+		js := fmt.Sprintf(`(async () => {
+		  const t0 = Date.now();
+		  const resp = await fetch(%s, {method: "GET", credentials: "include", headers: {"Accept": "application/json, text/plain, */*"}});
+		  const ct = resp.headers.get("content-type") || "";
+		  const text = await resp.text();
+		  return {status: resp.status, ok: resp.ok, contentType: ct, elapsedMs: Date.now() - t0, body: text.slice(0, %d), totalLen: text.length};
+		})()`, string(uJSON), maxBytes)
+		rawEval, err := client.SendCommand(ctx, targetID, "Runtime.evaluate", map[string]any{
+			"expression":    js,
+			"awaitPromise":  true,
+			"returnByValue": true,
+		})
+		if err != nil {
+			if profileKey != "" {
+				_, _ = s.profiles.RecordFallback(profileKey, cleanURL, err.Error(), 0)
+			}
+			return textJSONResult(map[string]any{
+				"ok":                false,
+				"fallback_required": true,
+				"fallback_mode":     "ui_cdp",
+				"reason":            err.Error(),
+			}, false)
+		}
+		var env struct {
+			Result struct {
+				Value struct {
+					Status      int    `json:"status"`
+					OK          bool   `json:"ok"`
+					ContentType string `json:"contentType"`
+					ElapsedMs   int64  `json:"elapsedMs"`
+					Body        string `json:"body"`
+					TotalLen    int    `json:"totalLen"`
+				} `json:"value"`
+			} `json:"result"`
+			ExceptionDetails json.RawMessage `json:"exceptionDetails"`
+		}
+		if err := json.Unmarshal(rawEval, &env); err != nil || (len(env.ExceptionDetails) > 0 && string(env.ExceptionDetails) != "null") {
+			reason := "in-page fetch failed or blocked by CORS/CSP"
+			if profileKey != "" {
+				_, _ = s.profiles.RecordFallback(profileKey, cleanURL, reason, 0)
+			}
+			return textJSONResult(map[string]any{
+				"ok":                false,
+				"fallback_required": true,
+				"fallback_mode":     "ui_cdp",
+				"reason":            reason,
+			}, false)
+		}
+		val := env.Result.Value
+		safeBody := redactSensitiveText(val.Body)
+		if !val.OK || val.Status == 401 || val.Status == 403 || val.Status == 429 || val.Status >= 500 || workflows.CheckCaptcha(val.Body) != nil {
+			reason := fmt.Sprintf("HTTP %d or risk/captcha gate detected", val.Status)
+			if workflows.CheckCaptcha(val.Body) != nil {
+				reason = "CAPTCHA / risk verification detected in response"
+			}
+			if profileKey != "" {
+				_, _ = s.profiles.RecordFallback(profileKey, cleanURL, reason, val.Status)
+			}
+			preview := safeBody
+			if len(preview) > 400 {
+				preview = preview[:400]
+			}
+			return textJSONResult(map[string]any{
+				"ok":                false,
+				"status":            val.Status,
+				"fallback_required": true,
+				"fallback_mode":     "ui_cdp",
+				"reason":            reason,
+				"body_preview":      preview,
+			}, false)
+		}
+		return textJSONResult(map[string]any{
+			"ok":           true,
+			"status":       val.Status,
+			"content_type": val.ContentType,
+			"elapsed_ms":   val.ElapsedMs,
+			"truncated":    val.TotalLen > len(val.Body),
+			"body":         safeBody,
+		}, false)
+
+	case "api_discover_web":
+		baseURL := strings.TrimSpace(getString(args, "base_url", ""))
+		socketSel := getString(args, "socket", "")
+		targetID := getString(args, "target_id", "")
+		profileKey := strings.TrimSpace(getString(args, "package", ""))
+		var found []discover.OpenAPISummary
+
+		if baseURL != "" {
+			spec, err := discover.DiscoverWebOpenAPI(ctx, baseURL, nil)
+			if err == nil && spec != nil {
+				found = append(found, *spec)
+				if profileKey == "" {
+					if u, perr := url.Parse(baseURL); perr == nil && u.Hostname() != "" {
+						profileKey = strings.ToLower(u.Hostname())
+					}
+				}
+			} else if socketSel == "" && targetID == "" {
+				return textErrorResult(err.Error())
+			}
+		}
+		if baseURL == "" || getBool(args, "check_webmcp", false) {
+			if client, err := s.cdp.ForSocket(socketSel); err == nil {
+				rawRes, rerr := client.SendCommand(ctx, targetID, "Runtime.evaluate", map[string]any{
+					"expression": `(async () => {
+					  const out = {href: location.href, host: location.hostname, webmcpTools: [], specLinks: []};
+					  try {
+					    const mc = navigator.modelContext;
+					    if (mc && typeof mc.getTools === "function") {
+					      const list = await mc.getTools();
+					      for (const t of (list || []).slice(0, 40)) {
+					        if (t && t.name) out.webmcpTools.push(t.name + (t.description ? " - " + String(t.description).slice(0, 80) : ""));
+					      }
+					    }
+					  } catch (e) {}
+					  for (const l of Array.from(document.querySelectorAll('link[rel*="openapi"], link[rel*="swagger"], link[type*="openapi"]'))) {
+					    if (l.href) out.specLinks.push(l.href);
+					  }
+					  return out;
+					})()`,
+					"awaitPromise":  true,
+					"returnByValue": true,
+				})
+				if rerr == nil {
+					var env struct {
+						Result struct {
+							Value struct {
+								Href        string   `json:"href"`
+								Host        string   `json:"host"`
+								WebMCPTools []string `json:"webmcpTools"`
+								SpecLinks   []string `json:"specLinks"`
+							} `json:"value"`
+						} `json:"result"`
+					}
+					if json.Unmarshal(rawRes, &env) == nil {
+						v := env.Result.Value
+						if profileKey == "" && v.Host != "" {
+							profileKey = strings.ToLower(v.Host)
+						}
+						if len(v.WebMCPTools) > 0 {
+							found = append(found, discover.OpenAPISummary{
+								SpecURL:   v.Href,
+								Kind:      "webmcp",
+								Title:     v.Host + " WebMCP",
+								Endpoints: v.WebMCPTools,
+							})
+						}
+						for _, sl := range v.SpecLinks {
+							if spec, serr := discover.DiscoverWebOpenAPI(ctx, sl, nil); serr == nil && spec != nil {
+								found = append(found, *spec)
+							}
+						}
+					}
+				}
+			}
+		}
+		saved := false
+		if profileKey != "" {
+			for _, sp := range found {
+				if _, err := s.profiles.MergeOpenAPI(profileKey, sp); err == nil {
+					saved = true
+				}
+			}
+		}
+		return textJSONResult(map[string]any{
+			"ok":            true,
+			"profile_key":   profileKey,
+			"profile_saved": saved,
+			"specs":         found,
+		}, false)
+
+	case "app_profile_get":
+		pkg := strings.TrimSpace(getString(args, "package", ""))
+		if pkg == "" {
+			list, err := s.profiles.List()
+			if err != nil {
+				return textErrorResult(err.Error())
+			}
+			return textJSONResult(map[string]any{"profiles": list}, false)
+		}
+		prof, err := s.profiles.Get(pkg)
+		if err != nil {
+			return textErrorResult(err.Error())
+		}
+		if prof == nil {
+			return textJSONResult(map[string]any{
+				"found":   false,
+				"package": pkg,
+				"hint":    "No cached profile yet; call app_discover_entries (for native DeepLinks) or cdp_observe_network (for WebView/Edge JSON APIs).",
+			}, false)
+		}
+		return textJSONResult(map[string]any{"found": true, "profile": prof}, false)
+
+	case "app_profile_record_fallback":
+		pkg := strings.TrimSpace(getString(args, "package", ""))
+		target := strings.TrimSpace(getString(args, "target", ""))
+		reason := strings.TrimSpace(getString(args, "reason", ""))
+		status := getInt(args, "status", 0)
+		if pkg == "" || reason == "" {
+			return textErrorResult("package and reason are required")
+		}
+		prof, err := s.profiles.RecordFallback(pkg, target, reason, status)
+		if err != nil {
+			return textErrorResult(err.Error())
+		}
+		return textJSONResult(map[string]any{"ok": true, "package": prof.Package, "fallbacks_count": len(prof.FallbackHistory)}, false)
+
 	default:
 		return textErrorResult(fmt.Sprintf("unknown tool: %s", name))
 	}
+}
+
+func deriveProfileKey(socketSel string, readAPIs, riskActions []discover.DiscoveredEndpoint) string {
+	sel := strings.TrimPrefix(strings.TrimSpace(socketSel), "@")
+	if sel != "" && !strings.EqualFold(sel, "webview") && !strings.HasPrefix(sel, "chrome_devtools") && !strings.HasPrefix(sel, "webview_devtools") {
+		if k, err := discover.ValidateProfileKey(sel); err == nil {
+			return k
+		}
+	}
+	for _, list := range [][]discover.DiscoveredEndpoint{readAPIs, riskActions} {
+		for _, ep := range list {
+			host := strings.ToLower(strings.TrimSpace(ep.Host))
+			if idx := strings.IndexByte(host, ':'); idx > 0 {
+				host = host[:idx]
+			}
+			if k, err := discover.ValidateProfileKey(host); err == nil {
+				return k
+			}
+		}
+	}
+	return ""
 }
 
 func (s *Server) runWorkflowViaJobs(ctx context.Context, jobName string) (any, error) {
@@ -3112,6 +3518,83 @@ func toolDefinitions() []map[string]any {
 					"entry": map[string]any{"type": "string", "description": "Concise Chinese/English note to remember"},
 				},
 				"required": []string{"file", "entry"},
+			},
+		},
+		{
+			"name":        "app_discover_entries",
+			"description": "Auto-discover an installed Android app's official exported DeepLinks, URL Schemes, and App Links via dumpsys package (zero hooks) and cache them in its persistent App Profile.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"package": map[string]any{"type": "string", "description": "Android package name (e.g. com.jingdong.app.mall); omits to inspect current foreground app"},
+				},
+			},
+		},
+		{
+			"name":        "cdp_observe_network",
+			"description": "Passively observe same-page XHR/Fetch JSON endpoints via CDP Network events (no secret/cookie extraction), classify them into fast_read vs ui_required (signed/POST/risk-gated), and save into the persistent App Profile.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"socket":       map[string]any{"type": "string", "description": "Optional CDP socket selector (empty for Edge/Chrome, or package name like com.microsoft.bing / com.jingdong.app.mall)"},
+					"target_id":    map[string]any{"type": "string", "description": "Optional CDP page target ID"},
+					"duration_sec": map[string]any{"type": "integer", "description": "Passive observation window in seconds (default 4, max 15)"},
+					"reload":       map[string]any{"type": "boolean", "description": "Trigger soft page reload to capture initial data-loading API calls (default false)"},
+					"package":      map[string]any{"type": "string", "description": "Optional profile key/package name to store discovered endpoints under"},
+				},
+			},
+		},
+		{
+			"name":        "cdp_fast_read",
+			"description": "Execute a fast (~50ms) strictly GET-only same-origin read inside the active Edge/WebView page context (reusing live page session without exporting cookies). Returns fallback_required=true and demotes the endpoint if blocked/401/403/429/risk-gated.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"url":       map[string]any{"type": "string", "description": "Same-origin http(s) GET URL to read"},
+					"socket":    map[string]any{"type": "string", "description": "Optional CDP socket selector"},
+					"target_id": map[string]any{"type": "string", "description": "Optional CDP target ID"},
+					"package":   map[string]any{"type": "string", "description": "Optional profile key to record auto-fallback demotion on failure"},
+					"max_bytes": map[string]any{"type": "integer", "description": "Max response bytes to return (default 4096, max 16384)"},
+				},
+				"required": []string{"url"},
+			},
+		},
+		{
+			"name":        "api_discover_web",
+			"description": "Discover official WebMCP tools (navigator.modelContext) on the current CDP page or standard OpenAPI/Swagger/MCP specs on a given base_url, caching them into the App Profile.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"base_url":     map[string]any{"type": "string", "description": "Optional HTTP(S) service/site base URL or OpenAPI JSON URL to probe"},
+					"socket":       map[string]any{"type": "string", "description": "Optional CDP socket selector for WebMCP inspection"},
+					"target_id":    map[string]any{"type": "string", "description": "Optional CDP target ID"},
+					"check_webmcp": map[string]any{"type": "boolean", "description": "Also inspect active CDP page for WebMCP tools"},
+					"package":      map[string]any{"type": "string", "description": "Optional profile key to save discovered specs under"},
+				},
+			},
+		},
+		{
+			"name":        "app_profile_get",
+			"description": "Read cached auto-discovered App Capability Profile (DeepLinks, fast_read APIs, risk-gated ui_required actions, OpenAPI/WebMCP specs, fallback history), or list all discovered profiles when package is omitted.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"package": map[string]any{"type": "string", "description": "Package or host key (omit to list all cached profiles)"},
+				},
+			},
+		},
+		{
+			"name":        "app_profile_record_fallback",
+			"description": "Record that a discovered API endpoint/action triggered risk-control or failed and must stay on UI/CDP mode, demoting it out of fast_read.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"package": map[string]any{"type": "string", "description": "App package or host key"},
+					"target":  map[string]any{"type": "string", "description": "Endpoint URL/path or action name"},
+					"reason":  map[string]any{"type": "string", "description": "Why UI/CDP fallback is required (e.g. HTTP 403 risk gate, signed parameter)"},
+					"status":  map[string]any{"type": "integer", "description": "Optional HTTP status code"},
+				},
+				"required": []string{"package", "reason"},
 			},
 		},
 	}

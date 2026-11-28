@@ -988,8 +988,8 @@ func TestV034LandscapeCoordsStrictOriginHostScheduleToolSpecsAndSessions(t *test
 	// 1. ToolSpecs() hides agent_pause and agent_resume from in-process LLM brain
 	specs := srv.ToolSpecs()
 	defs := toolDefinitions()
-	if len(defs) != 28 {
-		t.Fatalf("expected 28 total MCP tools, got %d", len(defs))
+	if len(defs) != 34 {
+		t.Fatalf("expected 34 total MCP tools, got %d", len(defs))
 	}
 	if len(specs) != len(defs)-2 {
 		t.Fatalf("expected ToolSpecs() to hide 2 pause/resume tools (%d), got %d", len(defs)-2, len(specs))
@@ -1331,8 +1331,8 @@ func TestV040BootstrapLongPollScreenRemoteLLMTestIslandAndCompositeTools(t *test
 		}
 	}
 	stMap, _ := boot["status"].(map[string]any)
-	if stMap["version"] != "0.4.2" {
-		t.Fatalf("expected version 0.4.2 in bootstrap status, got %v", stMap["version"])
+	if stMap["version"] != "0.5.0" {
+		t.Fatalf("expected version 0.5.0 in bootstrap status, got %v", stMap["version"])
 	}
 
 	// 2. POST /api/v1/llm/test
@@ -1556,8 +1556,8 @@ func TestV041AutoObserveExecuteToolAndDefaults(t *testing.T) {
 	if defCfg.LLM.MaxSteps != 80 {
 		t.Fatalf("expected default LLM.MaxSteps=80, got %d", defCfg.LLM.MaxSteps)
 	}
-	if ServerVersion != "0.4.2" {
-		t.Fatalf("expected ServerVersion=0.4.2, got %q", ServerVersion)
+	if ServerVersion != "0.5.0" {
+		t.Fatalf("expected ServerVersion=0.5.0, got %q", ServerVersion)
 	}
 
 	defCfg.ListenAddr = "127.0.0.1:0"
@@ -1605,4 +1605,106 @@ func TestV041AutoObserveExecuteToolAndDefaults(t *testing.T) {
 		t.Fatalf("expected error tool output not to append [操作后最新界面], got %+v", outErr)
 	}
 }
+
+func TestV050AdaptiveDiscoveryProfilesAndFastReadFallback(t *testing.T) {
+	cfg := config.Default()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.BearerToken = "tok-v050-discover"
+	cfg.PauseFlagPath = ""
+	cfg.MemoryDir = filepath.Join(t.TempDir(), "memory")
+	cfg.CDPSocket = "nonexistent_test_cdp_socket_050"
+
+	fb := &fakeBackend{}
+	det := &testDetector{}
+	g := guard.New(guard.Options{Packages: []string{"com.tencent.tmgp.sgame"}, PollInterval: time.Second, Detector: det})
+	srv := NewServer(cfg, fb, g, cdp.NewClient(cfg.CDPSocket), nil)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("srv.Start: %v", err)
+	}
+	defer srv.Close()
+
+	// 1. All 6 discovery/adaptive tools must be exposed to the in-process brain.
+	specs := srv.ToolSpecs()
+	wantTools := map[string]bool{
+		"app_discover_entries":        false,
+		"cdp_observe_network":         false,
+		"cdp_fast_read":               false,
+		"api_discover_web":            false,
+		"app_profile_get":             false,
+		"app_profile_record_fallback": false,
+	}
+	for _, sp := range specs {
+		if _, ok := wantTools[sp.Name]; ok {
+			wantTools[sp.Name] = true
+		}
+	}
+	for name, seen := range wantTools {
+		if !seen {
+			t.Fatalf("expected v0.5.0 tool %q in ToolSpecs()", name)
+		}
+	}
+
+	// 2. api_discover_web discovers an OpenAPI spec from a local HTTP service and persists profile.
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/openapi.json" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"openapi":"3.0.0","info":{"title":"Home NAS","version":"2.0"},"paths":{"/api/v1/status":{"get":{"summary":"System status"}}}}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer apiSrv.Close()
+
+	outDisc := srv.ExecuteTool(context.Background(), "api_discover_web", map[string]any{
+		"base_url": apiSrv.URL,
+		"package":  "home.nas.local",
+	})
+	if outDisc.IsError || !strings.Contains(outDisc.Text, "Home NAS") || !strings.Contains(outDisc.Text, `"profile_saved":true`) {
+		t.Fatalf("unexpected api_discover_web output: %+v", outDisc)
+	}
+
+	// 3. app_profile_get returns the cached profile, and app_profile_record_fallback records fallback.
+	outGet := srv.ExecuteTool(context.Background(), "app_profile_get", map[string]any{"package": "home.nas.local"})
+	if outGet.IsError || !strings.Contains(outGet.Text, `"found":true`) || !strings.Contains(outGet.Text, "/api/v1/status") {
+		t.Fatalf("unexpected app_profile_get output: %+v", outGet)
+	}
+	outFB := srv.ExecuteTool(context.Background(), "app_profile_record_fallback", map[string]any{
+		"package": "home.nas.local",
+		"target":  "/api/v1/checkin",
+		"reason":  "HTTP 403 risk gate",
+		"status":  403,
+	})
+	if outFB.IsError || !strings.Contains(outFB.Text, `"fallbacks_count":1`) {
+		t.Fatalf("unexpected app_profile_record_fallback output: %+v", outFB)
+	}
+
+	// 4. cdp_fast_read returns structured fallback_required=true when CDP is unavailable.
+	outFast := srv.ExecuteTool(context.Background(), "cdp_fast_read", map[string]any{
+		"url":     "https://rewards.bing.com/api/points",
+		"package": "com.microsoft.emmx",
+	})
+	if outFast.IsError || !strings.Contains(outFast.Text, `"fallback_required":true`) || !strings.Contains(outFast.Text, `"fallback_mode":"ui_cdp"`) {
+		t.Fatalf("expected structured fallback_required=true from cdp_fast_read, got %+v", outFast)
+	}
+
+	// 5. Guarded game package must be refused by app_discover_entries.
+	outGuarded := srv.ExecuteTool(context.Background(), "app_discover_entries", map[string]any{"package": "com.tencent.tmgp.sgame"})
+	if !outGuarded.IsError || !strings.Contains(outGuarded.Text, "guarded game") {
+		t.Fatalf("expected guarded game package to be refused, got %+v", outGuarded)
+	}
+
+	// 6. HTTP GET /api/v1/profiles lists profiles and DELETE removes it cleanly.
+	req, _ := http.NewRequest(http.MethodGet, "http://"+srv.Addr()+"/api/v1/profiles", nil)
+	req.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/v1/profiles: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "home.nas.local") {
+		t.Fatalf("unexpected GET /api/v1/profiles: status=%d body=%s", resp.StatusCode, string(body))
+	}
+}
+
 
