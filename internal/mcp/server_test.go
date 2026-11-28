@@ -1331,8 +1331,8 @@ func TestV040BootstrapLongPollScreenRemoteLLMTestIslandAndCompositeTools(t *test
 		}
 	}
 	stMap, _ := boot["status"].(map[string]any)
-	if stMap["version"] != "0.4.1" {
-		t.Fatalf("expected version 0.4.1 in bootstrap status, got %v", stMap["version"])
+	if stMap["version"] != "0.4.2" {
+		t.Fatalf("expected version 0.4.2 in bootstrap status, got %v", stMap["version"])
 	}
 
 	// 2. POST /api/v1/llm/test
@@ -1556,8 +1556,8 @@ func TestV041AutoObserveExecuteToolAndDefaults(t *testing.T) {
 	if defCfg.LLM.MaxSteps != 80 {
 		t.Fatalf("expected default LLM.MaxSteps=80, got %d", defCfg.LLM.MaxSteps)
 	}
-	if ServerVersion != "0.4.1" {
-		t.Fatalf("expected ServerVersion=0.4.1, got %q", ServerVersion)
+	if ServerVersion != "0.4.2" {
+		t.Fatalf("expected ServerVersion=0.4.2, got %q", ServerVersion)
 	}
 
 	defCfg.ListenAddr = "127.0.0.1:0"

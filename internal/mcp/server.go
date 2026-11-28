@@ -34,7 +34,7 @@ import (
 
 const (
 	ServerName          = "android-agent"
-	ServerVersion       = "0.4.1"
+	ServerVersion       = "0.4.2"
 	DefaultProtoVersion = "2025-03-26"
 	mcpSessionTTL       = 2 * time.Hour
 )

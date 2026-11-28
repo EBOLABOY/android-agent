@@ -155,10 +155,11 @@ func TestSchedulerRandomWindowDeferOnGameAndRun(t *testing.T) {
 		return map[string]any{"ok": true}, nil
 	}, nil)
 
-	// Force deterministic midpoint trigger for test
+	// Force deterministic clock & midpoint trigger for test
 	sched.mu.Lock()
 	rt := sched.runtimes["daily-all"]
 	baseDay := time.Date(2026, 11, 26, 8, 25, 0, 0, time.Local)
+	sched.nowFn = func() time.Time { return baseDay }
 	rt.plannedDate = baseDay.Format("2006-01-02")
 	rt.nextRunAt = baseDay
 	rt.windowEndTime = time.Date(2026, 11, 26, 9, 0, 0, 0, time.Local)

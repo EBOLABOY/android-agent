@@ -131,6 +131,17 @@ type topicRule struct {
 }
 
 var exploreTopicRules = []topicRule{
+	{regexp.MustCompile(`(?i)词汇|单词|含义|词义|词典|vocabulary|meaning\s+of\s+a\s+word|definition|dictionary|synonym`), "serendipity definition"},
+	{regexp.MustCompile(`(?i)现在几点|时区|时间区域|what\s+time|time\s*zone|world\s+clock`), "what time is it in Tokyo"},
+	{regexp.MustCompile(`(?i)汇率|货币|兑换率|currency|exchange\s+rate|convert.*usd`), "usd to jpy exchange rate today"},
+	{regexp.MustCompile(`(?i)计算器|换算|单位转换|calculator|convert\s+units`), "100 fahrenheit to celsius"},
+	{regexp.MustCompile(`(?i)床垫|睡得更好|睡眠|失眠|mattress|sleep\s+better|insomnia`), "best memory foam mattress reviews"},
+	{regexp.MustCompile(`(?i)经济|通胀|利率|economy|inflation|gdp`), "us inflation rate latest report"},
+	{regexp.MustCompile(`(?i)优惠码|折扣|省钱|coupon|promo\s+code|save\s+more`), "best online shopping coupon codes"},
+	{regexp.MustCompile(`(?i)附近.*活动|活动.*附近|演出|音乐会|events\s+near\s+me|concert|festival`), "upcoming weekend events near me"},
+	{regexp.MustCompile(`(?i)天文|太空|宇宙|行星|space|astronomy|planet|nasa`), "james webb space telescope latest discoveries"},
+	{regexp.MustCompile(`(?i)历史|博物馆|history|historical|museum`), "history of the silk road"},
+	{regexp.MustCompile(`(?i)外语|学英语|学日语|language|learn\s+spanish|learn\s+french`), "common japanese phrases for travelers"},
 	{regexp.MustCompile(`(?i)video\s*games?|videogames?|gaming|电子游戏|主机游戏|电竞|游戏`), "Minecraft"},
 	{regexp.MustCompile(`(?i)邮轮|启航|cruise`), "best caribbean cruise deals and destinations"},
 	{regexp.MustCompile(`(?i)航班|机票|短途旅行|假期|flight|travel|trip|vacation`), "flights from Los Angeles to Tokyo"},
@@ -290,7 +301,29 @@ func MapExploreQuery(cardText string) string {
 	return "popular travel destinations"
 }
 
+func SearchQueryBatchCount(cur, capV int) int {
+	rem := capV - cur
+	if rem <= 0 {
+		return 0
+	}
+	need := (rem+4)/5 + 16
+	if need < 28 {
+		need = 28
+	}
+	maxCap := len(SearchQueryPool) + 36
+	if need > maxCap {
+		need = maxCap
+	}
+	return need
+}
+
 func altExploreQuery(cardText string) string {
+	if regexp.MustCompile(`(?i)词汇|单词|含义|词义|词典|vocabulary|meaning\s+of\s+a\s+word|definition|dictionary`).MatchString(cardText) {
+		return "ephemeral meaning"
+	}
+	if regexp.MustCompile(`(?i)现在几点|时区|时间区域|what\s+time|time\s*zone|world\s+clock`).MatchString(cardText) {
+		return "time in London"
+	}
 	if regexp.MustCompile(`(?i)歌词|lyrics|song`).MatchString(cardText) {
 		return "周杰伦 稻香 歌词"
 	}
@@ -606,19 +639,20 @@ type MSRewardsOptions struct {
 }
 
 type MSRewardsReport struct {
-	BeforePoints     string   `json:"before_points,omitempty"`
-	AfterPoints      string   `json:"after_points,omitempty"`
-	TodayPoints      string   `json:"today_points,omitempty"`
-	DailyProgress    string   `json:"daily_progress,omitempty"`
-	ExploreProgress  string   `json:"explore_progress,omitempty"`
-	BingSearch       string   `json:"bing_search,omitempty"`
-	SearchStatus     string   `json:"search_status,omitempty"`
-	SearchesCount    int      `json:"searches_executed,omitempty"`
-	InteractiveTasks []string `json:"interactive_tasks,omitempty"`
-	BingCheckin      string   `json:"bing_checkin,omitempty"`
-	BingReadOK       int      `json:"bing_read_ok"`
-	BingReadAfter    string   `json:"bing_read_after,omitempty"`
-	StoppedReason    string   `json:"stopped_reason,omitempty"`
+	BeforePoints      string   `json:"before_points,omitempty"`
+	AfterPoints       string   `json:"after_points,omitempty"`
+	TodayPoints       string   `json:"today_points,omitempty"`
+	DailyProgress     string   `json:"daily_progress,omitempty"`
+	ExploreProgress   string   `json:"explore_progress,omitempty"`
+	UnfinishedExplore []string `json:"unfinished_explore,omitempty"`
+	BingSearch        string   `json:"bing_search,omitempty"`
+	SearchStatus      string   `json:"search_status,omitempty"`
+	SearchesCount     int      `json:"searches_executed,omitempty"`
+	InteractiveTasks  []string `json:"interactive_tasks,omitempty"`
+	BingCheckin       string   `json:"bing_checkin,omitempty"`
+	BingReadOK        int      `json:"bing_read_ok"`
+	BingReadAfter     string   `json:"bing_read_after,omitempty"`
+	StoppedReason     string   `json:"stopped_reason,omitempty"`
 }
 
 type earnCard struct {
@@ -650,7 +684,7 @@ func (r *Runner) ensureEdgeTarget(ctx context.Context) (string, error) {
 		return "", err
 	}
 	var targets []cdp.Target
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 14; i++ {
 		if err := r.sleepCtx(ctx, 1*time.Second); err != nil {
 			return "", err
 		}
@@ -1145,10 +1179,27 @@ func (r *Runner) runBingCheckinAndRead(ctx context.Context, count int, report *M
 	var clicked string
 	if err := r.evalJS(ctx, BingPkg, rTID, `(() => {
 	  const title = Array.from(document.querySelectorAll(".title, div, span")).find(e => (e.innerText || "").trim() === "签入");
-	  let cards = Array.from(document.querySelectorAll(".check-in-card")).filter(c => c.getBoundingClientRect().width > 0);
-	  if (!cards.length && title) { title.scrollIntoView({block: "center"}); title.click(); }
-	  cards = Array.from(document.querySelectorAll(".check-in-card"));
-	  const active = cards.filter(c => !c.querySelector(".inActive"));
+	  let activeEl = document.querySelector(".check-in-card .streak-card-wrapper.active");
+	  if (!activeEl && title) {
+	    title.scrollIntoView({block: "center"});
+	    title.click();
+	    activeEl = document.querySelector(".check-in-card .streak-card-wrapper.active");
+	  }
+	  if (activeEl) {
+	    activeEl.scrollIntoView({block: "center"});
+	    const inner = activeEl.querySelector(".circle-container, .streak-card") || activeEl;
+	    const card = activeEl.closest(".check-in-card");
+	    inner.click();
+	    activeEl.click();
+	    if (card) card.click();
+	    return (card ? card.innerText : activeEl.innerText || "").replace(/\s+/g, " ").trim();
+	  }
+	  // Fall back to first 7 check-in cards (row 1: 签入) only — never rows 2/3 (搜索/每日活动).
+	  const row1 = Array.from(document.querySelectorAll(".check-in-card")).slice(0, 7);
+	  if (row1.some(c => c.querySelector(".streak-card-wrapper.checked"))) {
+	    return "already_checked";
+	  }
+	  const active = row1.filter(c => !c.querySelector(".inActive"));
 	  if (!active.length) return "";
 	  const target = active[active.length - 1];
 	  target.scrollIntoView({block: "center"});
@@ -1175,29 +1226,27 @@ func (r *Runner) runBingCheckinAndRead(ctx context.Context, count int, report *M
 	}
 	r.logStage("阶段", 4, 4, fmt.Sprintf("阅读新闻 (0/%d)", count))
 
-	// Switch back to Bing Home news feed and read pure-text MSN /ar- articles via Shadow DOM
-	if err := r.tapImage(ctx, 86, 1515); err != nil {
+	// Switch back to Bing Home news feed and wait for MSN feed WebView (with native UI fallback).
+	fTID, err := r.returnToBingHomeFeed(ctx)
+	if err != nil {
 		return err
 	}
-	if err := r.sleepCtx(ctx, 700*time.Millisecond); err != nil {
-		return err
-	}
-	if err := r.tapImage(ctx, 86, 1515); err != nil {
-		return err
-	}
-	if err := r.sleepCtx(ctx, 900*time.Millisecond); err != nil {
-		return err
-	}
-	if err := r.jitterSwipe(ctx, 260, 1350, 260, 320, 220, 140, 440); err != nil {
-		return err
-	}
-	if err := r.sleepCtx(ctx, 800*time.Millisecond); err != nil {
-		return err
-	}
-
-	fTID, _ := r.findBingTargets(ctx)
 	if fTID == "" {
-		return errors.New("Bing MSN feed WebView target not found")
+		r.logf("[Bing] MSN feed WebView target not found; falling back to native UI/swipe read-to-earn")
+		if err := r.runBingReadNativeFallback(ctx, count, report); err != nil {
+			return err
+		}
+		if rTID2, err := r.ensureBingRewardsWebView(ctx); err != nil {
+			return err
+		} else if rTID2 != "" {
+			if domEnd, err := r.readBingRewardsDOM(ctx, rTID2, true); err == nil {
+				report.BingReadAfter = domEnd.ReadToEarn
+				if domEnd.Points != "" {
+					report.AfterPoints = domEnd.Points
+				}
+			}
+		}
+		return nil
 	}
 
 	seen := make(map[string]bool)
@@ -1328,12 +1377,174 @@ func (r *Runner) runBingCheckinAndRead(ctx context.Context, count int, report *M
 	return nil
 }
 
+var bingNonArticleRe = regexp.MustCompile(`(?i)^(首页|Home|应用|Apps|标签页|Tabs|Rewards|奖励|搜索|问任何问题|返回|Back|关闭|Close|分享|Share|刷新|Refresh|广告|Ad|Sponsored)$|视频|Video|短剧|直播|广告|Sponsored|播放|Play`)
+
+func isBingNewsHeadlineNode(n backend.UINode, screenW, screenH int) bool {
+	if !n.Clickable {
+		return false
+	}
+	lbl := strings.TrimSpace(n.Label)
+	if len([]rune(lbl)) < 10 {
+		return false
+	}
+	if bingNonArticleRe.MatchString(lbl) {
+		return false
+	}
+	if screenW > 0 && screenH > 0 {
+		cx := (n.Bounds[0] + n.Bounds[2]) / 2
+		cy := (n.Bounds[1] + n.Bounds[3]) / 2
+		// Avoid top bar, bottom nav bar, and top-right floating window region.
+		if cy < int(float64(screenH)*0.22) || cy > int(float64(screenH)*0.84) {
+			return false
+		}
+		if cx > int(float64(screenW)*0.68) && cy < int(float64(screenH)*0.30) {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *Runner) returnToBingHomeFeed(ctx context.Context) (string, error) {
+	if tapped, err := r.tapNodeByLabels(ctx, "首页", "Home"); err != nil {
+		return "", err
+	} else if !tapped {
+		if err := r.tapImage(ctx, 86, 1515); err != nil {
+			return "", err
+		}
+		if err := r.sleepCtx(ctx, 700*time.Millisecond); err != nil {
+			return "", err
+		}
+		if err := r.tapImage(ctx, 86, 1515); err != nil {
+			return "", err
+		}
+	}
+	if err := r.sleepCtx(ctx, 900*time.Millisecond); err != nil {
+		return "", err
+	}
+	if err := r.jitterSwipe(ctx, 260, 1350, 260, 320, 220, 140, 440); err != nil {
+		return "", err
+	}
+	for i := 0; i < 6; i++ {
+		if err := r.sleepCtx(ctx, 700*time.Millisecond); err != nil {
+			return "", err
+		}
+		if fTID, _ := r.findBingTargets(ctx); fTID != "" {
+			return fTID, nil
+		}
+		if i == 2 {
+			// If Bing Rewards was presented as a modal overlay, BACK returns cleanly to Bing Home.
+			if err := r.backend.KeyEvent(ctx, "BACK"); err != nil {
+				return "", err
+			}
+			if err := r.sleepCtx(ctx, 800*time.Millisecond); err != nil {
+				return "", err
+			}
+			if fg, err := r.backend.ForegroundApp(ctx); err == nil && fg.Package != "" && fg.Package != BingPkg && fg.Package != "com.server.auditor.ssh.client" {
+				if err := r.backend.LaunchApp(ctx, BingPkg); err != nil {
+					return "", err
+				}
+				if err := r.sleepCtx(ctx, 1200*time.Millisecond); err != nil {
+					return "", err
+				}
+			}
+			if err := r.jitterSwipe(ctx, 260, 1350, 260, 320, 220, 140, 440); err != nil {
+				return "", err
+			}
+		}
+	}
+	return "", nil
+}
+
+func (r *Runner) runBingReadNativeFallback(ctx context.Context, count int, report *MSRewardsReport) error {
+	seen := make(map[string]bool)
+	maxAttempts := count * 3
+	if maxAttempts < 16 {
+		maxAttempts = 16
+	}
+	scr, _ := r.backend.ScreenInfo(ctx)
+	for attempt := 0; attempt < maxAttempts && report.BingReadOK < count; attempt++ {
+		if err := r.checkGuard(ctx); err != nil {
+			return err
+		}
+		tappedTitle := ""
+		if tree, err := r.backend.UITree(ctx, backend.UITreeOptions{}); err == nil && tree != nil {
+			for _, n := range tree.Nodes {
+				if !isBingNewsHeadlineNode(n, scr.Width, scr.Height) {
+					continue
+				}
+				key := strings.ToLower(strings.TrimSpace(n.Label))
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				if _, _, _, err := r.backend.TapNode(ctx, n.ID); err != nil {
+					return err
+				}
+				tappedTitle = strings.TrimSpace(n.Label)
+				break
+			}
+		}
+		if tappedTitle == "" {
+			// Safe left-mid tap avoiding top-right floating window.
+			if err := r.tapImage(ctx, 260, 780); err != nil {
+				return err
+			}
+			tappedTitle = fmt.Sprintf("新闻 #%d", report.BingReadOK+1)
+		}
+		if err := r.jitterSleep(ctx, 1.5, 2.2); err != nil {
+			return err
+		}
+		if fg, err := r.backend.ForegroundApp(ctx); err == nil && fg.Package != "" && fg.Package != BingPkg && fg.Package != "com.server.auditor.ssh.client" {
+			if err := r.backend.KeyEvent(ctx, "BACK"); err != nil {
+				return err
+			}
+			if err := r.sleepCtx(ctx, 600*time.Millisecond); err != nil {
+				return err
+			}
+			if err := r.backend.LaunchApp(ctx, BingPkg); err != nil {
+				return err
+			}
+			if err := r.sleepCtx(ctx, 900*time.Millisecond); err != nil {
+				return err
+			}
+			continue
+		}
+		for fl := 0; fl < 3; fl++ {
+			if err := r.jitterSwipe(ctx, 260, 1340, 260, 200, 125, 140, 440); err != nil {
+				return err
+			}
+			if err := r.jitterSleep(ctx, 0.22, 0.42); err != nil {
+				return err
+			}
+		}
+		if err := r.jitterSleep(ctx, 0.45, 0.90); err != nil {
+			return err
+		}
+		report.BingReadOK++
+		r.logStage("阶段", 4, 4, fmt.Sprintf("阅读新闻 (%d/%d) %s", report.BingReadOK, count, shortStageTitle(tappedTitle, 18)))
+		r.logf("[Bing Native] Read article #%d: %s", report.BingReadOK, tappedTitle)
+		if err := r.backend.KeyEvent(ctx, "BACK"); err != nil {
+			return err
+		}
+		if err := r.jitterSleep(ctx, 0.7, 1.1); err != nil {
+			return err
+		}
+		if err := r.jitterSwipe(ctx, 260, 1340, 260, 300, 220, 140, 440); err != nil {
+			return err
+		}
+		if err := r.jitterSleep(ctx, 0.7, 1.1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *Runner) RunMSRewards(ctx context.Context, opts MSRewardsOptions) (*MSRewardsReport, error) {
 	if opts.SearchIntervalSec <= 0 {
 		opts.SearchIntervalSec = 6.0
 	}
 	if opts.ReadCount <= 0 {
-		opts.ReadCount = 10
+		opts.ReadCount = 11
 	}
 	rep := &MSRewardsReport{}
 	if err := r.checkGuard(ctx); err != nil {
@@ -1440,7 +1651,7 @@ func (r *Runner) RunMSRewards(ctx context.Context, opts MSRewardsOptions) (*MSRe
 			if cur >= capV {
 				rep.SearchStatus = "already_completed"
 			} else {
-				pool, err := r.buildFreshSearchQueries(ctx, tid, 28)
+				pool, err := r.buildFreshSearchQueries(ctx, tid, SearchQueryBatchCount(cur, capV))
 				if err != nil {
 					return rep, err
 				}
@@ -1509,6 +1720,16 @@ func (r *Runner) RunMSRewards(ctx context.Context, opts MSRewardsOptions) (*MSRe
 		rep.TodayPoints = mid.TodayPoints
 		rep.DailyProgress = mid.DailyProgress
 		rep.ExploreProgress = mid.ExploreProgress
+		for _, c := range mid.ExploreCards {
+			entry := strings.TrimSpace(c.Text)
+			if entry == "" {
+				continue
+			}
+			if h := strings.TrimSpace(c.Href); h != "" {
+				entry += " (" + h + ")"
+			}
+			rep.UnfinishedExplore = append(rep.UnfinishedExplore, entry)
+		}
 		if mid.BingSearchCurrent != nil && mid.BingSearchCap != nil {
 			rep.BingSearch = fmt.Sprintf("%d/%d", *mid.BingSearchCurrent, *mid.BingSearchCap)
 		}

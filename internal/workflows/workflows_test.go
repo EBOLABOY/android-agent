@@ -145,6 +145,46 @@ func TestExploreRulesReadToEarnAndURL(t *testing.T) {
 	if !IsReadToEarnFull("30") || !IsReadToEarnFull("30/30") || IsReadToEarnFull("21/30") {
 		t.Fatal("IsReadToEarnFull failed to match 30 and 30/30 properly")
 	}
+	if got := MapExploreQuery("扩展你的词汇量 在必应上搜索你不理解的单词含义 +10 已激活"); got != "serendipity definition" {
+		t.Fatalf("expected vocabulary query, got %q", got)
+	}
+	if got := altExploreQuery("Expand your vocabulary"); got != "ephemeral meaning" {
+		t.Fatalf("expected vocabulary alt query, got %q", got)
+	}
+	if got := MapExploreQuery("现在几点？ 在必应上搜索，查看不同时间区域的时间。 +10 已激活"); got != "what time is it in Tokyo" {
+		t.Fatalf("expected world clock query, got %q", got)
+	}
+	if got := altExploreQuery("What time is it? time zone"); got != "time in London" {
+		t.Fatalf("expected world clock alt query, got %q", got)
+	}
+}
+
+func TestSearchQueryBatchCountAndBingHeadlineFilter(t *testing.T) {
+	if got := SearchQueryBatchCount(200, 200); got != 0 {
+		t.Fatalf("expected 0 when already capped, got %d", got)
+	}
+	if got := SearchQueryBatchCount(45, 200); got < 45 {
+		t.Fatalf("expected >=45 queries for 45/200 (31+ searches needed), got %d", got)
+	}
+	if got := SearchQueryBatchCount(0, 200); got < 56 {
+		t.Fatalf("expected >=56 queries for 0/200 (40 searches + headroom), got %d", got)
+	}
+	if got := SearchQueryBatchCount(185, 200); got < 28 {
+		t.Fatalf("expected >=28 minimum batch count, got %d", got)
+	}
+
+	good := backend.UINode{ID: 1, Label: "How solid state batteries are transforming EV range in 2026", Clickable: true, Bounds: [4]int{60, 800, 980, 920}}
+	if !isBingNewsHeadlineNode(good, 1080, 2400) {
+		t.Fatal("expected valid news headline node to pass filter")
+	}
+	video := backend.UINode{ID: 2, Label: "Watch Video: Amazing highlights from last night", Clickable: true, Bounds: [4]int{60, 800, 980, 920}}
+	if isBingNewsHeadlineNode(video, 1080, 2400) {
+		t.Fatal("expected video node to be filtered out")
+	}
+	floatOverlay := backend.UINode{ID: 3, Label: "Floating SSH Terminal Window Status Bar Text", Clickable: true, Bounds: [4]int{760, 560, 1060, 660}}
+	if isBingNewsHeadlineNode(floatOverlay, 1080, 2400) {
+		t.Fatal("expected top-right floating window node to be filtered out")
+	}
 }
 
 func TestRunDailyAllReturnsErrorOnSubWorkflowFailure(t *testing.T) {
